@@ -6,8 +6,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
 use tasker_config::{ensure_data_dir, PathOverrides, TaskerConfig, TaskerPaths};
+
+mod bootstrap;
+mod worker;
 
 #[derive(Debug, Parser)]
 #[command(name = "tasker")]
@@ -202,17 +204,6 @@ struct WorkOptions {
     retry_hold_seconds: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct BootstrapFrontMatter {
-    title: String,
-    priority: Option<String>,
-    state: Option<String>,
-    acceptance_criteria: Option<Vec<String>>,
-    validation_items: Option<Vec<String>>,
-    tags: Option<Vec<String>>,
-    review_required: Option<bool>,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -364,7 +355,7 @@ async fn task(paths: &TaskerPaths, db_path_overridden: bool, command: TaskComman
             if !bootstrap {
                 anyhow::bail!("task create currently requires --bootstrap");
             }
-            let input = parse_bootstrap_task_file(&queue, &file)?;
+            let input = bootstrap::parse_bootstrap_task_file(&queue, &file)?;
             let detail =
                 tasker_db::create_task(&pool, &input, &tasker_db::Actor::operator(actor)).await?;
             println!("created Task: {}", detail.task.identifier);
@@ -386,7 +377,7 @@ async fn task(paths: &TaskerPaths, db_path_overridden: bool, command: TaskComman
                 actor,
             } => {
                 let input = tasker_db::UpdateRequirementStatus {
-                    status: normalize_label(&status),
+                    status: bootstrap::normalize_label(&status),
                     waiver_reason,
                 };
                 let detail = tasker_db::update_acceptance_criterion_status(
@@ -412,7 +403,7 @@ async fn task(paths: &TaskerPaths, db_path_overridden: bool, command: TaskComman
                 actor,
             } => {
                 let input = tasker_db::UpdateRequirementStatus {
-                    status: normalize_label(&status),
+                    status: bootstrap::normalize_label(&status),
                     waiver_reason,
                 };
                 let detail = tasker_db::update_validation_item_status(
@@ -495,59 +486,33 @@ async fn work(paths: &TaskerPaths, db_path_overridden: bool, options: WorkOption
     if !options.once {
         anyhow::bail!("tasker work currently requires --once");
     }
-    if options.launcher != "fake" {
-        anyhow::bail!("only the fake Agent Launcher is available in this milestone");
-    }
     let pool = open_pool(paths, db_path_overridden).await?;
-    let actor = tasker_db::Actor {
-        kind: "worker_agent".to_string(),
-        id: options.actor.clone(),
-        display_name: options.actor.clone(),
-    };
-    let claim = tasker_db::claim_next(
+    let outcome = worker::run_worker_once(
         &pool,
-        &tasker_db::ClaimNextInput {
-            queue_key: options.queue.clone(),
-            worker_id: options.actor.clone(),
-            launcher_kind: options.launcher.clone(),
+        worker::WorkOnceRequest {
+            queue: options.queue,
+            launcher: options.launcher,
+            actor: options.actor,
+            fake_outcome: options.fake_outcome,
             lease_seconds: options.lease_seconds,
-        },
-        &actor,
-    )
-    .await?;
-
-    let Some(claimed) = claim else {
-        println!("no eligible Tasks found for Task Queue {}", options.queue);
-        return Ok(());
-    };
-
-    println!(
-        "claimed Task {} with Agent Run {}",
-        claimed.task.task.identifier, claimed.run.id
-    );
-    tasker_db::heartbeat_run(&pool, &claimed.run.id, options.lease_seconds, &actor).await?;
-    let fake_note = format!(
-        "Fake Agent Launcher processed Task {} in Agent Run {}.\nOutcome: {}\n",
-        claimed.task.task.identifier, claimed.run.id, options.fake_outcome
-    );
-    tasker_db::update_workpad_note(&pool, &claimed.task.task.identifier, &fake_note, &actor)
-        .await?;
-    let finished = tasker_db::finish_run(
-        &pool,
-        &claimed.run.id,
-        &tasker_db::FinishRunInput {
-            outcome: options.fake_outcome,
-            failure_reason: None,
             retry_hold_seconds: options.retry_hold_seconds,
         },
-        &actor,
     )
     .await?;
-    println!(
-        "finished Agent Run {} with outcome {}",
-        finished.id,
-        finished.outcome.unwrap_or_else(|| "unknown".to_string())
-    );
+
+    match outcome {
+        worker::WorkOnceOutcome::NoEligibleTask { queue } => {
+            println!("no eligible Tasks found for Task Queue {queue}");
+        }
+        worker::WorkOnceOutcome::Finished {
+            task_identifier,
+            run_id,
+            outcome,
+        } => {
+            println!("claimed Task {task_identifier} with Agent Run {run_id}");
+            println!("finished Agent Run {run_id} with outcome {outcome}");
+        }
+    }
     Ok(())
 }
 
@@ -583,40 +548,6 @@ async fn open_pool(paths: &TaskerPaths, db_path_overridden: bool) -> Result<sqlx
     let pool = tasker_db::connect(&config.database.path).await?;
     tasker_db::run_migrations(&pool).await?;
     Ok(pool)
-}
-
-fn parse_bootstrap_task_file(queue_key: &str, file: &Path) -> Result<tasker_db::CreateTask> {
-    let text =
-        fs::read_to_string(file).with_context(|| format!("failed to read {}", file.display()))?;
-    let (front_matter, brief) = split_front_matter(&text)?;
-    let front_matter: BootstrapFrontMatter = serde_yaml::from_str(front_matter)
-        .with_context(|| format!("failed to parse YAML front matter in {}", file.display()))?;
-
-    Ok(tasker_db::CreateTask {
-        queue_key: queue_key.to_string(),
-        title: front_matter.title,
-        brief: brief.trim().to_string(),
-        priority: normalize_label(front_matter.priority.as_deref().unwrap_or("normal")),
-        state: normalize_label(front_matter.state.as_deref().unwrap_or("ready")),
-        review_required: front_matter.review_required.unwrap_or(false),
-        acceptance_criteria: front_matter.acceptance_criteria.unwrap_or_default(),
-        validation_items: front_matter.validation_items.unwrap_or_default(),
-        tags: front_matter.tags.unwrap_or_default(),
-    })
-}
-
-fn split_front_matter(text: &str) -> Result<(&str, &str)> {
-    let Some(after_start) = text.strip_prefix("---\n") else {
-        anyhow::bail!("bootstrap task file must start with YAML front matter delimited by ---");
-    };
-    let Some((front_matter, body)) = after_start.split_once("\n---\n") else {
-        anyhow::bail!("bootstrap task file must close YAML front matter with ---");
-    };
-    Ok((front_matter, body))
-}
-
-fn normalize_label(value: &str) -> String {
-    value.trim().to_ascii_lowercase().replace([' ', '-'], "_")
 }
 
 fn print_task_detail(detail: &tasker_db::TaskDetail) {
@@ -946,7 +877,7 @@ Implement Bootstrap Task Creation.
         )
         .expect("write task file");
 
-        let parsed = parse_bootstrap_task_file("TASK", &task_file).expect("parse");
+        let parsed = bootstrap::parse_bootstrap_task_file("TASK", &task_file).expect("parse");
 
         assert_eq!(parsed.queue_key, "TASK");
         assert_eq!(parsed.priority, "normal");
@@ -956,7 +887,7 @@ Implement Bootstrap Task Creation.
 
     #[test]
     fn bootstrap_parser_requires_front_matter() {
-        let error = split_front_matter("title: Missing delimiters")
+        let error = bootstrap::parse_bootstrap_task("TASK", "inline", "title: Missing delimiters")
             .expect_err("missing front matter fails");
 
         assert!(error.to_string().contains("must start"));
