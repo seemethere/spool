@@ -33,6 +33,11 @@ struct Cli {
 enum Command {
     /// Initialize Tasker local config, data directory, and database.
     Init,
+    /// Manage Task Queues.
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommand,
+    },
     /// Start the Tasker Service.
     Serve {
         /// Override the service bind address.
@@ -41,6 +46,41 @@ enum Command {
     },
     /// Show the Tasker CLI version.
     Version,
+}
+
+#[derive(Debug, Subcommand)]
+enum QueueCommand {
+    /// Create an Operator-managed Task Queue.
+    Create {
+        /// Short stable Task Queue Key used in Task Identifiers.
+        #[arg(long)]
+        key: String,
+        /// Human-readable Task Queue name.
+        #[arg(long)]
+        name: String,
+        /// Managed Source Repository path for Local Worktree Delivery.
+        #[arg(long)]
+        managed_source_repository: PathBuf,
+        /// Main Branch for Local Worktree Delivery.
+        #[arg(long)]
+        main_branch: String,
+        /// Worktree Root where Local Worktrees are created.
+        #[arg(long)]
+        worktree_root: PathBuf,
+        /// Branch Template used to derive Task Branch names.
+        #[arg(long)]
+        branch_template: String,
+        /// Keep completed Local Worktrees for debugging.
+        #[arg(long, default_value_t = false)]
+        done_worktree_retention: bool,
+        /// Operator actor display name for audit attribution.
+        #[arg(long, default_value = "local-operator")]
+        actor: String,
+    },
+    /// Show a Task Queue by key.
+    Show { key: String },
+    /// List Task Queues.
+    List,
 }
 
 #[tokio::main]
@@ -55,6 +95,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Init) => init(&paths, db_path_overridden).await,
+        Some(Command::Queue { command }) => queue(&paths, db_path_overridden, command).await,
         Some(Command::Serve { bind }) => serve(&paths, bind, db_path_overridden).await,
         Some(Command::Version) => {
             println!("{}", env!("CARGO_PKG_VERSION"));
@@ -103,6 +144,55 @@ async fn init(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
     Ok(())
 }
 
+async fn queue(paths: &TaskerPaths, db_path_overridden: bool, command: QueueCommand) -> Result<()> {
+    let pool = open_pool(paths, db_path_overridden).await?;
+
+    match command {
+        QueueCommand::Create {
+            key,
+            name,
+            managed_source_repository,
+            main_branch,
+            worktree_root,
+            branch_template,
+            done_worktree_retention,
+            actor,
+        } => {
+            println!(
+                "warning: Local Worktree Delivery may mutate Managed Source Repository {}",
+                managed_source_repository.display()
+            );
+            let input = tasker_db::CreateTaskQueue {
+                key,
+                name,
+                managed_source_repository: managed_source_repository.display().to_string(),
+                main_branch,
+                worktree_root: worktree_root.display().to_string(),
+                branch_template,
+                done_worktree_retention,
+            };
+            let queue =
+                tasker_db::create_task_queue(&pool, &input, &tasker_db::Actor::operator(actor))
+                    .await?;
+            print_queue(&queue);
+        }
+        QueueCommand::Show { key } => {
+            let queue = tasker_db::get_task_queue(&pool, &key)
+                .await?
+                .with_context(|| format!("Task Queue {key} not found"))?;
+            print_queue(&queue);
+        }
+        QueueCommand::List => {
+            let queues = tasker_db::list_task_queues(&pool).await?;
+            for queue in queues {
+                println!("{}\t{}", queue.key, queue.name);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn serve(
     paths: &TaskerPaths,
     bind: Option<SocketAddr>,
@@ -125,6 +215,30 @@ async fn serve(
     tasker_db::run_migrations(&pool).await?;
 
     tasker_server::serve(bind_addr, env!("CARGO_PKG_VERSION"), pool).await
+}
+
+async fn open_pool(paths: &TaskerPaths, db_path_overridden: bool) -> Result<sqlx::SqlitePool> {
+    let mut config = TaskerConfig::load_or_default(paths)?;
+    if db_path_overridden {
+        config.database.path = paths.db_path.clone();
+    }
+    let pool = tasker_db::connect(&config.database.path).await?;
+    tasker_db::run_migrations(&pool).await?;
+    Ok(pool)
+}
+
+fn print_queue(queue: &tasker_db::TaskQueue) {
+    println!("key: {}", queue.key);
+    println!("name: {}", queue.name);
+    println!("delivery backend: {}", queue.delivery_backend);
+    println!(
+        "managed source repository: {}",
+        queue.managed_source_repository
+    );
+    println!("main branch: {}", queue.main_branch);
+    println!("worktree root: {}", queue.worktree_root);
+    println!("branch template: {}", queue.branch_template);
+    println!("done worktree retention: {}", queue.done_worktree_retention);
 }
 
 fn ensure_db_parent(db_path: &Path) -> Result<()> {
@@ -198,5 +312,41 @@ mod tests {
 
         assert!(configured_db_path.is_file());
         assert!(!paths.db_path.exists());
+    }
+
+    #[tokio::test]
+    async fn queue_commands_create_show_and_list() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = TaskerPaths::resolve(temp.path(), PathOverrides::default());
+        init(&paths, false).await.expect("init");
+
+        queue(
+            &paths,
+            false,
+            QueueCommand::Create {
+                key: "TASK".to_string(),
+                name: "Tasker".to_string(),
+                managed_source_repository: temp.path().join("repo"),
+                main_branch: "main".to_string(),
+                worktree_root: temp.path().join("worktrees"),
+                branch_template: "tasker/{task_identifier}".to_string(),
+                done_worktree_retention: false,
+                actor: "tester".to_string(),
+            },
+        )
+        .await
+        .expect("create queue");
+        queue(
+            &paths,
+            false,
+            QueueCommand::Show {
+                key: "TASK".to_string(),
+            },
+        )
+        .await
+        .expect("show queue");
+        queue(&paths, false, QueueCommand::List)
+            .await
+            .expect("list queues");
     }
 }
