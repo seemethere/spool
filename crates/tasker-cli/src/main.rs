@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use serde::Deserialize;
 use tasker_config::{ensure_data_dir, PathOverrides, TaskerConfig, TaskerPaths};
 
 #[derive(Debug, Parser)]
@@ -38,6 +39,13 @@ enum Command {
         #[command(subcommand)]
         command: QueueCommand,
     },
+    /// Manage Tasks.
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
+    /// Show Tasker queue and Task State counts.
+    Status,
     /// Start the Tasker Service.
     Serve {
         /// Override the service bind address.
@@ -83,6 +91,91 @@ enum QueueCommand {
     List,
 }
 
+#[derive(Debug, Subcommand)]
+enum TaskCommand {
+    /// Create a Task.
+    Create {
+        /// Use temporary Bootstrap Task Creation from a Markdown file with YAML front matter.
+        #[arg(long)]
+        bootstrap: bool,
+        /// Task Queue Key for the new Task.
+        #[arg(long)]
+        queue: String,
+        /// Markdown file containing YAML front matter and the Task Brief body.
+        #[arg(long)]
+        file: PathBuf,
+        /// Operator actor display name for audit attribution.
+        #[arg(long, default_value = "local-operator")]
+        actor: String,
+    },
+    /// Show a Task by Task Identifier.
+    Show { identifier: String },
+    /// Update Acceptance Criterion status for a Task.
+    Criterion {
+        #[command(subcommand)]
+        command: RequirementCommand,
+    },
+    /// Update Validation Item status for a Task.
+    Validation {
+        #[command(subcommand)]
+        command: RequirementCommand,
+    },
+    /// Update the singleton Workpad Note for a Task.
+    Workpad {
+        #[command(subcommand)]
+        command: WorkpadCommand,
+    },
+    /// Show Audit Events for a Task.
+    Audit { identifier: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum RequirementCommand {
+    /// Set the structured status for a requirement.
+    Set {
+        /// Task Identifier.
+        identifier: String,
+        /// 1-based requirement position on the Task.
+        #[arg(long)]
+        position: i64,
+        /// New status, such as satisfied, passed, failed, pending, or waived.
+        #[arg(long)]
+        status: String,
+        /// Explicit reason required when setting waived.
+        #[arg(long)]
+        waiver_reason: Option<String>,
+        /// Operator actor display name for audit attribution.
+        #[arg(long, default_value = "local-operator")]
+        actor: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkpadCommand {
+    /// Set the current Workpad Note body from a file.
+    Set {
+        /// Task Identifier.
+        identifier: String,
+        /// Markdown file containing the Workpad Note body.
+        #[arg(long)]
+        file: PathBuf,
+        /// Operator actor display name for audit attribution.
+        #[arg(long, default_value = "local-operator")]
+        actor: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct BootstrapFrontMatter {
+    title: String,
+    priority: Option<String>,
+    state: Option<String>,
+    acceptance_criteria: Option<Vec<String>>,
+    validation_items: Option<Vec<String>>,
+    tags: Option<Vec<String>>,
+    review_required: Option<bool>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -96,6 +189,8 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Init) => init(&paths, db_path_overridden).await,
         Some(Command::Queue { command }) => queue(&paths, db_path_overridden, command).await,
+        Some(Command::Task { command }) => task(&paths, db_path_overridden, command).await,
+        Some(Command::Status) => status(&paths, db_path_overridden).await,
         Some(Command::Serve { bind }) => serve(&paths, bind, db_path_overridden).await,
         Some(Command::Version) => {
             println!("{}", env!("CARGO_PKG_VERSION"));
@@ -193,6 +288,144 @@ async fn queue(paths: &TaskerPaths, db_path_overridden: bool, command: QueueComm
     Ok(())
 }
 
+async fn task(paths: &TaskerPaths, db_path_overridden: bool, command: TaskCommand) -> Result<()> {
+    let pool = open_pool(paths, db_path_overridden).await?;
+
+    match command {
+        TaskCommand::Create {
+            bootstrap,
+            queue,
+            file,
+            actor,
+        } => {
+            if !bootstrap {
+                anyhow::bail!("task create currently requires --bootstrap");
+            }
+            let input = parse_bootstrap_task_file(&queue, &file)?;
+            let detail =
+                tasker_db::create_task(&pool, &input, &tasker_db::Actor::operator(actor)).await?;
+            println!("created Task: {}", detail.task.identifier);
+            println!("title: {}", detail.task.title);
+            println!("state: {}", detail.task.state);
+        }
+        TaskCommand::Show { identifier } => {
+            let detail = tasker_db::get_task_detail(&pool, &identifier)
+                .await?
+                .with_context(|| format!("Task {identifier} not found"))?;
+            print_task_detail(&detail);
+        }
+        TaskCommand::Criterion { command } => match command {
+            RequirementCommand::Set {
+                identifier,
+                position,
+                status,
+                waiver_reason,
+                actor,
+            } => {
+                let input = tasker_db::UpdateRequirementStatus {
+                    status: normalize_label(&status),
+                    waiver_reason,
+                };
+                let detail = tasker_db::update_acceptance_criterion_status(
+                    &pool,
+                    &identifier,
+                    position,
+                    &input,
+                    &tasker_db::Actor::operator(actor),
+                )
+                .await?;
+                println!(
+                    "updated Acceptance Criterion {position} for Task {}",
+                    detail.task.identifier
+                );
+            }
+        },
+        TaskCommand::Validation { command } => match command {
+            RequirementCommand::Set {
+                identifier,
+                position,
+                status,
+                waiver_reason,
+                actor,
+            } => {
+                let input = tasker_db::UpdateRequirementStatus {
+                    status: normalize_label(&status),
+                    waiver_reason,
+                };
+                let detail = tasker_db::update_validation_item_status(
+                    &pool,
+                    &identifier,
+                    position,
+                    &input,
+                    &tasker_db::Actor::operator(actor),
+                )
+                .await?;
+                println!(
+                    "updated Validation Item {position} for Task {}",
+                    detail.task.identifier
+                );
+            }
+        },
+        TaskCommand::Workpad { command } => match command {
+            WorkpadCommand::Set {
+                identifier,
+                file,
+                actor,
+            } => {
+                let body = fs::read_to_string(&file)
+                    .with_context(|| format!("failed to read {}", file.display()))?;
+                let detail = tasker_db::update_workpad_note(
+                    &pool,
+                    &identifier,
+                    &body,
+                    &tasker_db::Actor::operator(actor),
+                )
+                .await?;
+                println!("updated Workpad Note for Task {}", detail.task.identifier);
+            }
+        },
+        TaskCommand::Audit { identifier } => {
+            let events = tasker_db::list_task_audit_events(&pool, &identifier).await?;
+            for event in events {
+                println!(
+                    "{}\t{}\t{} ({})\t{}",
+                    event.created_at,
+                    event.event_type,
+                    event.actor_display_name,
+                    event.actor_kind,
+                    event.payload_json
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn status(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
+    let pool = open_pool(paths, db_path_overridden).await?;
+    let rows = tasker_db::status_by_queue_and_state(&pool).await?;
+    if rows.is_empty() {
+        println!("No Task Queues found");
+        return Ok(());
+    }
+
+    let mut current_queue: Option<String> = None;
+    for row in rows {
+        let queue_header = format!("{}\t{}", row.queue_key, row.queue_name);
+        if current_queue.as_ref() != Some(&queue_header) {
+            if current_queue.is_some() {
+                println!();
+            }
+            println!("Task Queue: {queue_header}");
+            current_queue = Some(queue_header);
+        }
+        println!("  {}: {}", row.state, row.task_count);
+    }
+
+    Ok(())
+}
+
 async fn serve(
     paths: &TaskerPaths,
     bind: Option<SocketAddr>,
@@ -225,6 +458,79 @@ async fn open_pool(paths: &TaskerPaths, db_path_overridden: bool) -> Result<sqlx
     let pool = tasker_db::connect(&config.database.path).await?;
     tasker_db::run_migrations(&pool).await?;
     Ok(pool)
+}
+
+fn parse_bootstrap_task_file(queue_key: &str, file: &Path) -> Result<tasker_db::CreateTask> {
+    let text =
+        fs::read_to_string(file).with_context(|| format!("failed to read {}", file.display()))?;
+    let (front_matter, brief) = split_front_matter(&text)?;
+    let front_matter: BootstrapFrontMatter = serde_yaml::from_str(front_matter)
+        .with_context(|| format!("failed to parse YAML front matter in {}", file.display()))?;
+
+    Ok(tasker_db::CreateTask {
+        queue_key: queue_key.to_string(),
+        title: front_matter.title,
+        brief: brief.trim().to_string(),
+        priority: normalize_label(front_matter.priority.as_deref().unwrap_or("normal")),
+        state: normalize_label(front_matter.state.as_deref().unwrap_or("ready")),
+        review_required: front_matter.review_required.unwrap_or(false),
+        acceptance_criteria: front_matter.acceptance_criteria.unwrap_or_default(),
+        validation_items: front_matter.validation_items.unwrap_or_default(),
+        tags: front_matter.tags.unwrap_or_default(),
+    })
+}
+
+fn split_front_matter(text: &str) -> Result<(&str, &str)> {
+    let Some(after_start) = text.strip_prefix("---\n") else {
+        anyhow::bail!("bootstrap task file must start with YAML front matter delimited by ---");
+    };
+    let Some((front_matter, body)) = after_start.split_once("\n---\n") else {
+        anyhow::bail!("bootstrap task file must close YAML front matter with ---");
+    };
+    Ok((front_matter, body))
+}
+
+fn normalize_label(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace([' ', '-'], "_")
+}
+
+fn print_task_detail(detail: &tasker_db::TaskDetail) {
+    println!("Task: {}", detail.task.identifier);
+    println!("title: {}", detail.task.title);
+    println!("Task Queue: {}", detail.task.task_queue_key);
+    println!("Task State: {}", detail.task.state);
+    println!("Priority: {}", detail.task.priority);
+    println!("review required: {}", detail.task.review_required);
+    if !detail.tags.is_empty() {
+        println!("tags: {}", detail.tags.join(", "));
+    }
+    println!("\nTask Brief:\n{}", detail.task.brief);
+    println!("\nAcceptance Criteria:");
+    for criterion in &detail.acceptance_criteria {
+        println!(
+            "  {}. [{}] {}",
+            criterion.position, criterion.status, criterion.description
+        );
+        if let Some(reason) = &criterion.waiver_reason {
+            println!("     waiver: {reason}");
+        }
+    }
+    println!("\nValidation Items:");
+    for item in &detail.validation_items {
+        println!(
+            "  {}. [{}] {}",
+            item.position, item.status, item.description
+        );
+        if let Some(reason) = &item.waiver_reason {
+            println!("     waiver: {reason}");
+        }
+    }
+    println!("\nWorkpad Note:");
+    if let Some(note) = &detail.workpad_note {
+        println!("{}", note.body);
+    } else {
+        println!("(none)");
+    }
 }
 
 fn print_queue(queue: &tasker_db::TaskQueue) {
@@ -348,5 +654,151 @@ mod tests {
         queue(&paths, false, QueueCommand::List)
             .await
             .expect("list queues");
+    }
+
+    #[tokio::test]
+    async fn task_commands_create_show_workpad_and_status() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = TaskerPaths::resolve(temp.path(), PathOverrides::default());
+        init(&paths, false).await.expect("init");
+        queue(
+            &paths,
+            false,
+            QueueCommand::Create {
+                key: "TASK".to_string(),
+                name: "Tasker".to_string(),
+                managed_source_repository: temp.path().join("repo"),
+                main_branch: "main".to_string(),
+                worktree_root: temp.path().join("worktrees"),
+                branch_template: "tasker/{task_identifier}".to_string(),
+                done_worktree_retention: false,
+                actor: "tester".to_string(),
+            },
+        )
+        .await
+        .expect("create queue");
+
+        let task_file = temp.path().join("task.md");
+        fs::write(
+            &task_file,
+            r#"---
+title: Add bootstrap task creation
+priority: high
+acceptance_criteria:
+  - Bootstrap file creates a Task
+validation_items:
+  - cargo test passes
+tags:
+  - dogfood
+  - backend
+---
+Implement Bootstrap Task Creation.
+"#,
+        )
+        .expect("write task file");
+        task(
+            &paths,
+            false,
+            TaskCommand::Create {
+                bootstrap: true,
+                queue: "TASK".to_string(),
+                file: task_file,
+                actor: "tester".to_string(),
+            },
+        )
+        .await
+        .expect("create task");
+        task(
+            &paths,
+            false,
+            TaskCommand::Show {
+                identifier: "TASK-1".to_string(),
+            },
+        )
+        .await
+        .expect("show task");
+
+        task(
+            &paths,
+            false,
+            TaskCommand::Criterion {
+                command: RequirementCommand::Set {
+                    identifier: "TASK-1".to_string(),
+                    position: 1,
+                    status: "satisfied".to_string(),
+                    waiver_reason: None,
+                    actor: "tester".to_string(),
+                },
+            },
+        )
+        .await
+        .expect("set criterion");
+        task(
+            &paths,
+            false,
+            TaskCommand::Validation {
+                command: RequirementCommand::Set {
+                    identifier: "TASK-1".to_string(),
+                    position: 1,
+                    status: "passed".to_string(),
+                    waiver_reason: None,
+                    actor: "tester".to_string(),
+                },
+            },
+        )
+        .await
+        .expect("set validation");
+
+        let workpad_file = temp.path().join("workpad.md");
+        fs::write(&workpad_file, "Plan and evidence").expect("write workpad");
+        task(
+            &paths,
+            false,
+            TaskCommand::Workpad {
+                command: WorkpadCommand::Set {
+                    identifier: "TASK-1".to_string(),
+                    file: workpad_file,
+                    actor: "tester".to_string(),
+                },
+            },
+        )
+        .await
+        .expect("set workpad");
+        task(
+            &paths,
+            false,
+            TaskCommand::Audit {
+                identifier: "TASK-1".to_string(),
+            },
+        )
+        .await
+        .expect("audit");
+        status(&paths, false).await.expect("status");
+    }
+
+    #[test]
+    fn bootstrap_parser_defaults_to_ready_normal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let task_file = temp.path().join("task.md");
+        fs::write(
+            &task_file,
+            "---\ntitle: Test\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\n---\nBrief\n",
+        )
+        .expect("write task file");
+
+        let parsed = parse_bootstrap_task_file("TASK", &task_file).expect("parse");
+
+        assert_eq!(parsed.queue_key, "TASK");
+        assert_eq!(parsed.priority, "normal");
+        assert_eq!(parsed.state, "ready");
+        assert_eq!(parsed.brief, "Brief");
+    }
+
+    #[test]
+    fn bootstrap_parser_requires_front_matter() {
+        let error = split_front_matter("title: Missing delimiters")
+            .expect_err("missing front matter fails");
+
+        assert!(error.to_string().contains("must start"));
     }
 }

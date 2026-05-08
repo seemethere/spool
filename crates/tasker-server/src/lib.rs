@@ -33,6 +33,25 @@ pub struct CreateQueueRequest {
     pub queue: tasker_db::CreateTaskQueue,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CreateTaskRequest {
+    pub actor: tasker_db::Actor,
+    pub task: tasker_db::CreateTask,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateWorkpadRequest {
+    pub actor: tasker_db::Actor,
+    pub body: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateRequirementStatusRequest {
+    pub actor: tasker_db::Actor,
+    pub status: String,
+    pub waiver_reason: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
     pub error: String,
@@ -44,6 +63,22 @@ pub fn router(app_version: impl Into<String>, pool: SqlitePool) -> Router {
         .route("/version", get(version))
         .route("/queues", post(create_queue).get(list_queues))
         .route("/queues/{key}", get(get_queue))
+        .route("/tasks/bootstrap", post(create_task))
+        .route("/tasks/{identifier}", get(get_task))
+        .route(
+            "/tasks/{identifier}/workpad",
+            axum::routing::put(update_workpad),
+        )
+        .route(
+            "/tasks/{identifier}/acceptance-criteria/{position}/status",
+            axum::routing::put(update_acceptance_criterion_status),
+        )
+        .route(
+            "/tasks/{identifier}/validation-items/{position}/status",
+            axum::routing::put(update_validation_item_status),
+        )
+        .route("/tasks/{identifier}/audit-events", get(task_audit_events))
+        .route("/status", get(status))
         .with_state(ServerState {
             version: app_version.into(),
             pool,
@@ -92,6 +127,120 @@ async fn create_queue(
         .await
         .map(|queue| (StatusCode::CREATED, Json(queue)))
         .map_err(queue_create_error)
+}
+
+async fn create_task(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateTaskRequest>,
+) -> Result<(StatusCode, Json<tasker_db::TaskDetail>), (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    require_task_create_actor(&request.actor)?;
+    tasker_db::create_task(&state.pool, &request.task, &request.actor)
+        .await
+        .map(|task| (StatusCode::CREATED, Json(task)))
+        .map_err(task_mutation_error)
+}
+
+async fn get_task(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+) -> Result<Json<tasker_db::TaskDetail>, (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    match tasker_db::get_task_detail(&state.pool, &identifier)
+        .await
+        .map_err(internal_error)?
+    {
+        Some(task) => Ok(Json(task)),
+        None => Err(error_response(
+            StatusCode::NOT_FOUND,
+            format!("Task {identifier} not found"),
+        )),
+    }
+}
+
+async fn update_acceptance_criterion_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path((identifier, position)): Path<(String, i64)>,
+    Json(request): Json<UpdateRequirementStatusRequest>,
+) -> Result<Json<tasker_db::TaskDetail>, (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    let input = tasker_db::UpdateRequirementStatus {
+        status: request.status,
+        waiver_reason: request.waiver_reason,
+    };
+    tasker_db::update_acceptance_criterion_status(
+        &state.pool,
+        &identifier,
+        position,
+        &input,
+        &request.actor,
+    )
+    .await
+    .map(Json)
+    .map_err(task_mutation_error)
+}
+
+async fn update_validation_item_status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path((identifier, position)): Path<(String, i64)>,
+    Json(request): Json<UpdateRequirementStatusRequest>,
+) -> Result<Json<tasker_db::TaskDetail>, (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    let input = tasker_db::UpdateRequirementStatus {
+        status: request.status,
+        waiver_reason: request.waiver_reason,
+    };
+    tasker_db::update_validation_item_status(
+        &state.pool,
+        &identifier,
+        position,
+        &input,
+        &request.actor,
+    )
+    .await
+    .map(Json)
+    .map_err(task_mutation_error)
+}
+
+async fn task_audit_events(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+) -> Result<Json<Vec<tasker_db::AuditEvent>>, (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    tasker_db::list_task_audit_events(&state.pool, &identifier)
+        .await
+        .map(Json)
+        .map_err(task_mutation_error)
+}
+
+async fn update_workpad(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+    Json(request): Json<UpdateWorkpadRequest>,
+) -> Result<Json<tasker_db::TaskDetail>, (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    require_workpad_actor(&request.actor)?;
+    tasker_db::update_workpad_note(&state.pool, &identifier, &request.body, &request.actor)
+        .await
+        .map(Json)
+        .map_err(task_mutation_error)
+}
+
+async fn status(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<tasker_db::QueueStatus>>, (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    tasker_db::status_by_queue_and_state(&state.pool)
+        .await
+        .map(Json)
+        .map_err(internal_error)
 }
 
 async fn list_queues(
@@ -170,6 +319,33 @@ fn require_operator(actor: &tasker_db::Actor) -> Result<(), (StatusCode, Json<Er
     }
 }
 
+fn require_task_create_actor(
+    actor: &tasker_db::Actor,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if actor.kind == "operator" || actor.kind == "delegating_agent" {
+        Ok(())
+    } else {
+        Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Bootstrap Task Creation requires an Operator or Delegating Agent actor",
+        ))
+    }
+}
+
+fn require_workpad_actor(
+    actor: &tasker_db::Actor,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if actor.kind == "operator" || actor.kind == "delegating_agent" || actor.kind == "worker_agent"
+    {
+        Ok(())
+    } else {
+        Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Workpad Note updates require an Operator, Delegating Agent, or Worker Agent actor",
+        ))
+    }
+}
+
 fn queue_create_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
     if is_unique_queue_key_error(&error) {
         error_response(StatusCode::CONFLICT, "Task Queue already exists")
@@ -182,6 +358,29 @@ fn is_unique_queue_key_error(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.to_string().contains("task_queues.key"))
+}
+
+fn task_mutation_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
+    let message = error.to_string();
+    if message.contains("Worker Agents cannot create Waivers")
+        || message.contains("Waivers require an Operator or Review Agent")
+    {
+        error_response(StatusCode::FORBIDDEN, message)
+    } else if message.contains("not found") {
+        error_response(StatusCode::NOT_FOUND, message)
+    } else if message.contains("Ready Tasks require")
+        || message.contains("invalid Priority")
+        || message.contains("invalid Task State")
+        || message.contains("invalid requirement status")
+        || message.contains("only supports Backlog or Ready")
+        || message.contains("explicit reason")
+        || message.contains("position must")
+        || message.contains("must not be blank")
+    {
+        error_response(StatusCode::BAD_REQUEST, message)
+    } else {
+        internal_error(error)
+    }
 }
 
 fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
@@ -344,6 +543,228 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_endpoints_create_show_status_and_update_workpad() {
+        let (_temp, pool, token) = migrated_pool().await;
+        let app = router("test-version", pool);
+
+        let queue = app
+            .clone()
+            .oneshot(create_queue_request("TASK", "Tasker", "operator", &token))
+            .await
+            .unwrap();
+        assert_eq!(queue.status(), StatusCode::CREATED);
+
+        let create = app
+            .clone()
+            .oneshot(create_task_request(
+                "TASK",
+                "API Task",
+                "delegating_agent",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(create.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["task"]["identifier"], "TASK-1");
+
+        let show = app
+            .clone()
+            .oneshot(authorized_get("/tasks/TASK-1", &token))
+            .await
+            .unwrap();
+        assert_eq!(show.status(), StatusCode::OK);
+
+        let criterion = app
+            .clone()
+            .oneshot(update_requirement_request(
+                "/tasks/TASK-1/acceptance-criteria/1/status",
+                "satisfied",
+                None,
+                "worker_agent",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(criterion.status(), StatusCode::OK);
+
+        let validation = app
+            .clone()
+            .oneshot(update_requirement_request(
+                "/tasks/TASK-1/validation-items/1/status",
+                "passed",
+                None,
+                "worker_agent",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(validation.status(), StatusCode::OK);
+
+        let update = app
+            .clone()
+            .oneshot(update_workpad_request(
+                "TASK-1",
+                "notes",
+                "worker_agent",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(update.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["workpad_note"]["body"], "notes");
+
+        let audit = app
+            .clone()
+            .oneshot(authorized_get("/tasks/TASK-1/audit-events", &token))
+            .await
+            .unwrap();
+        assert_eq!(audit.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(audit.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.as_array().unwrap().len() >= 4);
+
+        let status = app
+            .oneshot(authorized_get("/status", &token))
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn task_endpoints_require_auth_and_valid_actor() {
+        let (_temp, pool, token) = migrated_pool().await;
+        let app = router("test-version", pool);
+        let queue = app
+            .clone()
+            .oneshot(create_queue_request("TASK", "Tasker", "operator", &token))
+            .await
+            .unwrap();
+        assert_eq!(queue.status(), StatusCode::CREATED);
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "actor": { "kind": "operator", "id": "tester", "display_name": "tester" },
+                            "task": sample_task_json("TASK", "No Auth")
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let forbidden = app
+            .oneshot(create_task_request(
+                "TASK",
+                "Wrong Actor",
+                "worker_agent",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn worker_agent_waiver_returns_forbidden() {
+        let (_temp, pool, token) = migrated_pool().await;
+        let app = router("test-version", pool);
+        let queue = app
+            .clone()
+            .oneshot(create_queue_request("TASK", "Tasker", "operator", &token))
+            .await
+            .unwrap();
+        assert_eq!(queue.status(), StatusCode::CREATED);
+        let create = app
+            .clone()
+            .oneshot(create_task_request("TASK", "API Task", "operator", &token))
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let response = app
+            .oneshot(update_requirement_request(
+                "/tasks/TASK-1/acceptance-criteria/1/status",
+                "waived",
+                Some("not needed"),
+                "worker_agent",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn invalid_ready_task_returns_bad_request() {
+        let (_temp, pool, token) = migrated_pool().await;
+        let app = router("test-version", pool);
+        let queue = app
+            .clone()
+            .oneshot(create_queue_request("TASK", "Tasker", "operator", &token))
+            .await
+            .unwrap();
+        assert_eq!(queue.status(), StatusCode::CREATED);
+
+        let request = serde_json::json!({
+            "actor": { "kind": "operator", "id": "tester", "display_name": "tester" },
+            "task": {
+                "queue_key": "TASK",
+                "title": "Invalid",
+                "brief": "Missing requirements",
+                "priority": "normal",
+                "state": "ready",
+                "review_required": false,
+                "acceptance_criteria": [],
+                "validation_items": [],
+                "tags": []
+            }
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks/bootstrap")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn missing_task_returns_not_found() {
+        let (_temp, pool, token) = migrated_pool().await;
+        let response = router("test-version", pool)
+            .oneshot(authorized_get("/tasks/MISSING-1", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn missing_queue_returns_not_found() {
         let (_temp, pool, token) = migrated_pool().await;
         let response = router("test-version", pool)
@@ -390,6 +811,94 @@ mod tests {
             .header("authorization", format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap()
+    }
+
+    fn create_task_request(
+        queue_key: &str,
+        title: &str,
+        actor_kind: &str,
+        token: &str,
+    ) -> Request<Body> {
+        let request = serde_json::json!({
+            "actor": {
+                "kind": actor_kind,
+                "id": "tester",
+                "display_name": "tester"
+            },
+            "task": sample_task_json(queue_key, title)
+        });
+
+        Request::builder()
+            .method("POST")
+            .uri("/tasks/bootstrap")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(request.to_string()))
+            .unwrap()
+    }
+
+    fn update_requirement_request(
+        uri: &str,
+        status: &str,
+        waiver_reason: Option<&str>,
+        actor_kind: &str,
+        token: &str,
+    ) -> Request<Body> {
+        let request = serde_json::json!({
+            "actor": {
+                "kind": actor_kind,
+                "id": "tester",
+                "display_name": "tester"
+            },
+            "status": status,
+            "waiver_reason": waiver_reason
+        });
+
+        Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(request.to_string()))
+            .unwrap()
+    }
+
+    fn update_workpad_request(
+        identifier: &str,
+        body: &str,
+        actor_kind: &str,
+        token: &str,
+    ) -> Request<Body> {
+        let request = serde_json::json!({
+            "actor": {
+                "kind": actor_kind,
+                "id": "tester",
+                "display_name": "tester"
+            },
+            "body": body
+        });
+
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/tasks/{identifier}/workpad"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(request.to_string()))
+            .unwrap()
+    }
+
+    fn sample_task_json(queue_key: &str, title: &str) -> Value {
+        serde_json::json!({
+            "queue_key": queue_key,
+            "title": title,
+            "brief": "Implement the requested API behavior.",
+            "priority": "normal",
+            "state": "ready",
+            "review_required": false,
+            "acceptance_criteria": ["It works"],
+            "validation_items": ["cargo test passes"],
+            "tags": ["api"]
+        })
     }
 
     fn sample_queue_json(key: &str, name: &str) -> Value {
