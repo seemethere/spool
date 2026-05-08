@@ -33,6 +33,20 @@ pub fn write_task_detail(mut writer: impl Write, detail: &tasker_db::TaskDetail)
             writeln!(writer, "     waiver: {reason}")?;
         }
     }
+    writeln!(writer, "\nTask Links:")?;
+    if detail.task_links.is_empty() {
+        writeln!(writer, "(none)")?;
+    } else {
+        for link in &detail.task_links {
+            let primary = if link.is_primary { " primary" } else { "" };
+            let label = link.label.as_deref().unwrap_or("");
+            writeln!(
+                writer,
+                "  [{}{}] {} {}",
+                link.kind, primary, link.target, label
+            )?;
+        }
+    }
     writeln!(writer, "\nWorkpad Note:")?;
     if let Some(note) = &detail.workpad_note {
         writeln!(writer, "{}", note.body)?;

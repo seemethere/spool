@@ -143,6 +143,7 @@ pub async fn create_task_queue(
     actor: &Actor,
 ) -> Result<TaskQueue> {
     validate_actor(actor)?;
+    validate_task_queue(input)?;
     let mut tx = pool.begin().await.context("failed to begin transaction")?;
     let queue_id = Uuid::new_v4().to_string();
     let audit_id = Uuid::new_v4().to_string();
@@ -339,6 +340,26 @@ pub struct WorkpadNote {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct TaskLink {
+    pub id: String,
+    pub task_id: String,
+    pub kind: String,
+    pub target: String,
+    pub label: Option<String>,
+    pub is_primary: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpsertTaskLink {
+    pub kind: String,
+    pub target: String,
+    pub label: Option<String>,
+    pub is_primary: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskDetail {
     pub task: Task,
@@ -346,6 +367,7 @@ pub struct TaskDetail {
     pub validation_items: Vec<ValidationItem>,
     pub tags: Vec<String>,
     pub workpad_note: Option<WorkpadNote>,
+    pub task_links: Vec<TaskLink>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
@@ -619,13 +641,95 @@ pub async fn get_task_detail(pool: &SqlitePool, identifier: &str) -> Result<Opti
     .await
     .context("failed to load Workpad Note")?;
 
+    let task_links = sqlx::query_as::<_, TaskLink>(
+        r#"
+        SELECT id, task_id, kind, target, label, is_primary, created_at, updated_at
+        FROM task_links
+        WHERE task_id = ?
+        ORDER BY is_primary DESC, kind, target
+        "#,
+    )
+    .bind(&task.id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load Task Links")?;
+
     Ok(Some(TaskDetail {
         task,
         acceptance_criteria,
         validation_items,
         tags,
         workpad_note,
+        task_links,
     }))
+}
+
+pub async fn upsert_task_link(
+    pool: &SqlitePool,
+    identifier: &str,
+    input: &UpsertTaskLink,
+    actor: &Actor,
+) -> Result<TaskDetail> {
+    validate_actor(actor)?;
+    ensure_not_blank("Task Link kind", &input.kind)?;
+    ensure_not_blank("Task Link target", &input.target)?;
+    let mut tx = pool.begin().await.context("failed to begin transaction")?;
+    let task_id: String = sqlx::query_scalar("SELECT id FROM tasks WHERE identifier = ?")
+        .bind(identifier)
+        .fetch_optional(&mut *tx)
+        .await
+        .with_context(|| format!("failed to load Task {identifier}"))?
+        .with_context(|| format!("Task {identifier} not found"))?;
+
+    if input.is_primary {
+        sqlx::query("UPDATE task_links SET is_primary = 0, updated_at = CURRENT_TIMESTAMP WHERE task_id = ?")
+            .bind(&task_id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to clear Primary Handoff Link")?;
+    }
+
+    let link_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        r#"
+        INSERT INTO task_links (id, task_id, kind, target, label, is_primary)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(task_id, kind, target) DO UPDATE SET
+            label = excluded.label,
+            is_primary = excluded.is_primary,
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+    )
+    .bind(&link_id)
+    .bind(&task_id)
+    .bind(&input.kind)
+    .bind(&input.target)
+    .bind(&input.label)
+    .bind(input.is_primary)
+    .execute(&mut *tx)
+    .await
+    .context("failed to upsert Task Link")?;
+
+    append_audit_event_in_tx(
+        &mut tx,
+        actor,
+        "task_link.upserted",
+        "task",
+        &task_id,
+        serde_json::json!({
+            "identifier": identifier,
+            "kind": input.kind,
+            "target": input.target,
+            "label": input.label,
+            "is_primary": input.is_primary,
+        }),
+    )
+    .await?;
+
+    tx.commit().await.context("failed to commit transaction")?;
+    get_task_detail(pool, identifier)
+        .await?
+        .with_context(|| format!("updated Task {identifier} was not found"))
 }
 
 pub async fn update_workpad_note(
@@ -1337,6 +1441,27 @@ fn agent_run_select_sql(where_clause: &str) -> String {
     )
 }
 
+fn validate_task_queue(input: &CreateTaskQueue) -> Result<()> {
+    ensure_not_blank("Task Queue Key", &input.key)?;
+    if input.key.contains('/') || input.key.contains('\\') {
+        anyhow::bail!("Task Queue Key must not contain path separators");
+    }
+    ensure_not_blank("Task Queue name", &input.name)?;
+    ensure_not_blank(
+        "Managed Source Repository",
+        &input.managed_source_repository,
+    )?;
+    ensure_not_blank("Main Branch", &input.main_branch)?;
+    ensure_not_blank("Worktree Root", &input.worktree_root)?;
+    ensure_not_blank("Branch Template", &input.branch_template)?;
+    if let Some(limit) = input.queue_concurrency_limit {
+        if limit <= 0 {
+            anyhow::bail!("Queue Concurrency Limit must be positive");
+        }
+    }
+    Ok(())
+}
+
 fn validate_requirement_status(
     input: &UpdateRequirementStatus,
     actor: &Actor,
@@ -1517,6 +1642,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["OPS", "TASK"]
         );
+    }
+
+    #[tokio::test]
+    async fn task_queue_key_must_not_contain_path_separators() {
+        let (_temp, pool) = migrated_pool().await;
+        let input = sample_queue("BAD/KEY", "Bad Queue");
+
+        let error = create_task_queue(&pool, &input, &Actor::operator("tester"))
+            .await
+            .expect_err("path separator key fails");
+
+        assert!(error.to_string().contains("path separators"));
     }
 
     #[tokio::test]
@@ -1716,6 +1853,79 @@ mod tests {
             .expect("task.created event");
         assert_eq!(event.subject_id, task.task.id);
         assert!(event.payload_json.contains("TASK-1"));
+    }
+
+    #[tokio::test]
+    async fn task_links_are_upserted_with_one_primary_handoff_link() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Links"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
+
+        let detail = upsert_task_link(
+            &pool,
+            "TASK-1",
+            &UpsertTaskLink {
+                kind: "local_worktree".to_string(),
+                target: "/tmp/worktrees/TASK-1".to_string(),
+                label: Some("Local Worktree".to_string()),
+                is_primary: true,
+            },
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("upsert worktree link");
+        assert_eq!(detail.task_links.len(), 1);
+        assert!(detail.task_links[0].is_primary);
+
+        let detail = upsert_task_link(
+            &pool,
+            "TASK-1",
+            &UpsertTaskLink {
+                kind: "task_branch".to_string(),
+                target: "tasker/TASK-1".to_string(),
+                label: Some("Task Branch".to_string()),
+                is_primary: true,
+            },
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("upsert branch link");
+
+        assert_eq!(detail.task_links.len(), 2);
+        assert_eq!(
+            detail
+                .task_links
+                .iter()
+                .filter(|link| link.is_primary)
+                .count(),
+            1
+        );
+        assert_eq!(
+            detail
+                .task_links
+                .iter()
+                .find(|link| link.is_primary)
+                .unwrap()
+                .kind,
+            "task_branch"
+        );
+        assert!(list_task_audit_events(&pool, "TASK-1")
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "task_link.upserted"));
     }
 
     #[tokio::test]

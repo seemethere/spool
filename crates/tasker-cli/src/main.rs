@@ -666,13 +666,15 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = TaskerPaths::resolve(temp.path(), PathOverrides::default());
         init(&paths, false).await.expect("init");
+        let repo = temp.path().join("repo");
+        init_git_repo(&repo);
         queue(
             &paths,
             false,
             QueueCommand::Create {
                 key: "TASK".to_string(),
                 name: "Tasker".to_string(),
-                managed_source_repository: temp.path().join("repo"),
+                managed_source_repository: repo,
                 main_branch: "main".to_string(),
                 worktree_root: temp.path().join("worktrees"),
                 branch_template: "tasker/{task_identifier}".to_string(),
@@ -809,6 +811,31 @@ Implement Bootstrap Task Creation.
             .body
             .contains("Fake Agent Launcher processed Task TASK-1"));
         status(&paths, false).await.expect("status");
+    }
+
+    fn init_git_repo(repo: &Path) {
+        fs::create_dir_all(repo).expect("repo dir");
+        git(repo, &["init", "-b", "main"]);
+        git(repo, &["config", "user.email", "tasker@example.test"]);
+        git(repo, &["config", "user.name", "Tasker Test"]);
+        fs::write(repo.join("README.md"), "test repo\n").expect("readme");
+        git(repo, &["add", "README.md"]);
+        git(repo, &["commit", "-m", "initial"]);
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
