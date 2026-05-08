@@ -16,8 +16,9 @@ For each **Implementation Slice**:
 4. Implement the slice.
 5. Run relevant deterministic checks, plus formatting and linting when configured and reasonably cheap.
 6. Update documentation when domain language, workflow behavior, persistence meaning, delivery behavior, launcher behavior, or milestone sequencing changes.
-7. Summarize changes and recommend a Conventional Commit message.
-8. Let the human decide whether the agent commits.
+7. Run the **Subagent Review Loop** when the slice changes implementation code or other high-impact project behavior.
+8. Summarize changes and recommend a Conventional Commit message.
+9. Let the human decide whether the agent commits, unless operating inside an **Approved Slice Sequence**.
 
 ## Slice selection rules
 
@@ -33,6 +34,41 @@ For each **Implementation Slice**:
 - If a slice discovers extra work that changes scope, architecture, workflow meaning, or acceptance checks, pause and ask whether to expand, split, or defer the work.
 - During an **Approved Slice Sequence**, stop for human input when scope, architecture, security, persistence semantics, task lifecycle, delivery behavior, launcher behavior, or unresolved check failures exceed the approved plan.
 - Small local fixes that preserve the approved scope may remain inside the current slice.
+
+## Subagent Review Loop
+
+Use advisory subagents to improve pre-dogfooding implementation quality without creating parallel implementation streams.
+
+Default loop for implementation slices:
+
+1. Implement the approved **Implementation Slice** as the single writer.
+2. Run the slice's deterministic checks.
+3. Ask a reviewer subagent to review the uncommitted diff.
+4. Fix blocking findings inside the approved scope.
+5. Re-run checks after fixes.
+6. Re-review when blockers were fixed or the fix materially changes the diff.
+7. Commit the slice only after checks pass and no reviewer blockers remain.
+
+Reviewer subagents should focus on correctness, domain language, test coverage, API shape, persistence safety, security/authentication, and whether the diff stays within the approved slice.
+
+A reviewer subagent is an advisory development helper, not Tasker's domain **Review Agent**.
+
+### Oracle Escalation
+
+Use an oracle subagent when a reviewer finding, implementation discovery, or user instruction raises a decision conflict or stop-condition ambiguity.
+
+Escalate to oracle for:
+
+- documented architecture contradictions;
+- security or authentication decisions;
+- persistence semantics or migration safety;
+- task lifecycle or state transition rules;
+- Local Worktree Delivery behavior;
+- launcher/pi behavior;
+- domain terminology conflicts;
+- whether to split, pause, or continue an **Approved Slice Sequence**.
+
+The oracle decides whether to continue within scope, insert a prerequisite slice, split the work, or stop for human input. After oracle guidance, continue only within the resolved scope.
 
 ## Review standard
 

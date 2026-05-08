@@ -44,6 +44,14 @@ _Avoid_: Vibes-based done, hidden reviewer expectations
 A human-approved run of multiple low-risk **Implementation Slices** that the agent may implement and commit one-by-one without pausing after each slice.
 _Avoid_: Unbounded autonomous development, mixed mega-commit
 
+**Subagent Review Loop**:
+The pre-dogfooding practice of using advisory subagents to review diffs and escalate decision conflicts before committing an **Implementation Slice**.
+_Avoid_: Parallel implementation, replacing human approval, Tasker Review Session
+
+**Oracle Escalation**:
+A **Subagent Review Loop** step where an oracle subagent resolves documented decision conflicts or stop-condition ambiguity before implementation continues.
+_Avoid_: Guessing through architecture/security/domain contradictions
+
 **Dogfooding Cutover**:
 The point where Tasker development work starts being managed as real Tasker **Tasks**.
 _Avoid_: Full v1 completion, polished launch
@@ -526,6 +534,9 @@ _Avoid_: Separate progress comment
 - Pre-dogfooding loop rules and cutover criteria are recorded in `docs/PRE_DOGFOODING_LOOP.md` until Tasker can track real development **Tasks**.
 - A completed **Pre-Dogfooding Development Loop** normally ends with unstaged or staged working tree changes, a concise summary, and a recommended Conventional Commit message; the human decides whether the agent commits.
 - In an **Approved Slice Sequence**, the agent may implement and commit multiple approved low-risk **Implementation Slices** in order, stopping when scope, architecture, security, persistence semantics, task lifecycle, delivery behavior, launcher behavior, or unresolved check failures require human input.
+- A **Subagent Review Loop** runs before committing implementation slices during pre-dogfooding work.
+- **Subagent Review Loop** reviewers are advisory development helpers and are distinct from Tasker's domain **Review Agent**.
+- **Oracle Escalation** is used when a reviewer finding, implementation discovery, or user instruction exposes a conflict with documented architecture, security, persistence semantics, task lifecycle, delivery behavior, launcher behavior, or domain language.
 - **Dogfooding Cutover** occurs when Tasker development work starts being created and tracked as real Tasker **Tasks**.
 - The first **Dogfooding Cutover** target is after roadmap Milestone 2, when **Bootstrap Task Creation**, **Task Queues**, task show/status, **Workpad Notes**, and **Audit Events** are usable for real Tasker development work.
 - **Dogfooding Readiness** requires enough init/config, queue setup, delegation or temporary task creation, one-shot work, local worktree handling, work updates, and status visibility to build Tasker with Tasker.
@@ -581,6 +592,7 @@ _Avoid_: Separate progress comment
 - "MVP" could imply finishing every planned v1 feature before self-use — resolved: **Dogfooding Readiness** is an earlier milestone focused on using Tasker to build Tasker.
 - "development loop until dogfooding" could mean either the temporary manual workflow or the Tasker-powered self-use workflow — resolved: use **Pre-Dogfooding Development Loop** before **Dogfooding Cutover**, then Tasker-managed dogfooding after cutover.
 - "task" before Tasker can dogfood could conflict with the domain **Task** — resolved: use **Implementation Slice** for pre-dogfooding planning units and reserve **Task** for Tasker-managed work.
+- "reviewer" during pre-dogfooding could mean either an advisory subagent or Tasker's domain **Review Agent** — resolved: use **Subagent Review Loop** for pre-dogfooding advisory review and reserve **Review Agent** for Tasker-managed review sessions.
 - "manual merge" during dogfooding could redefine delivery — resolved: **Manual Dogfood Merge** is a temporary sequencing compromise, not the target delivery model.
 - "serve" could imply workers run automatically — resolved: `tasker serve` only serves the API; `tasker work` runs the **Worker Loop** explicitly.
 - "issue", "label", and "blocked_by" are Linear-shaped API terms — resolved: canonical Tasker language is **Task**, **Task Tag**, and **Blocking Task**.
