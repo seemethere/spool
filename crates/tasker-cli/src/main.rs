@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use tasker_config::{ensure_data_dir, PathOverrides, TaskerConfig, TaskerPaths};
 
 mod bootstrap;
+mod output;
 mod worker;
 
 #[derive(Debug, Parser)]
@@ -323,13 +324,13 @@ async fn queue(paths: &TaskerPaths, db_path_overridden: bool, command: QueueComm
             let queue =
                 tasker_db::create_task_queue(&pool, &input, &tasker_db::Actor::operator(actor))
                     .await?;
-            print_queue(&queue);
+            output::print_queue(&queue)?;
         }
         QueueCommand::Show { key } => {
             let queue = tasker_db::get_task_queue(&pool, &key)
                 .await?
                 .with_context(|| format!("Task Queue {key} not found"))?;
-            print_queue(&queue);
+            output::print_queue(&queue)?;
         }
         QueueCommand::List => {
             let queues = tasker_db::list_task_queues(&pool).await?;
@@ -366,7 +367,7 @@ async fn task(paths: &TaskerPaths, db_path_overridden: bool, command: TaskComman
             let detail = tasker_db::get_task_detail(&pool, &identifier)
                 .await?
                 .with_context(|| format!("Task {identifier} not found"))?;
-            print_task_detail(&detail);
+            output::print_task_detail(&detail)?;
         }
         TaskCommand::Criterion { command } => match command {
             RequirementCommand::Set {
@@ -548,63 +549,6 @@ async fn open_pool(paths: &TaskerPaths, db_path_overridden: bool) -> Result<sqlx
     let pool = tasker_db::connect(&config.database.path).await?;
     tasker_db::run_migrations(&pool).await?;
     Ok(pool)
-}
-
-fn print_task_detail(detail: &tasker_db::TaskDetail) {
-    println!("Task: {}", detail.task.identifier);
-    println!("title: {}", detail.task.title);
-    println!("Task Queue: {}", detail.task.task_queue_key);
-    println!("Task State: {}", detail.task.state);
-    println!("Priority: {}", detail.task.priority);
-    println!("review required: {}", detail.task.review_required);
-    if !detail.tags.is_empty() {
-        println!("tags: {}", detail.tags.join(", "));
-    }
-    println!("\nTask Brief:\n{}", detail.task.brief);
-    println!("\nAcceptance Criteria:");
-    for criterion in &detail.acceptance_criteria {
-        println!(
-            "  {}. [{}] {}",
-            criterion.position, criterion.status, criterion.description
-        );
-        if let Some(reason) = &criterion.waiver_reason {
-            println!("     waiver: {reason}");
-        }
-    }
-    println!("\nValidation Items:");
-    for item in &detail.validation_items {
-        println!(
-            "  {}. [{}] {}",
-            item.position, item.status, item.description
-        );
-        if let Some(reason) = &item.waiver_reason {
-            println!("     waiver: {reason}");
-        }
-    }
-    println!("\nWorkpad Note:");
-    if let Some(note) = &detail.workpad_note {
-        println!("{}", note.body);
-    } else {
-        println!("(none)");
-    }
-}
-
-fn print_queue(queue: &tasker_db::TaskQueue) {
-    println!("key: {}", queue.key);
-    println!("name: {}", queue.name);
-    println!("delivery backend: {}", queue.delivery_backend);
-    println!(
-        "managed source repository: {}",
-        queue.managed_source_repository
-    );
-    println!("main branch: {}", queue.main_branch);
-    println!("worktree root: {}", queue.worktree_root);
-    println!("branch template: {}", queue.branch_template);
-    println!("done worktree retention: {}", queue.done_worktree_retention);
-    match queue.queue_concurrency_limit {
-        Some(limit) => println!("Queue Concurrency Limit: {limit}"),
-        None => println!("Queue Concurrency Limit: none"),
-    }
 }
 
 fn ensure_db_parent(db_path: &Path) -> Result<()> {
