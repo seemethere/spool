@@ -21,8 +21,9 @@ For each **Implementation Slice**:
 
 ## Slice selection rules
 
-- Work on one **Implementation Slice** at a time.
+- Work on one **Implementation Slice** at a time unless the human approves an **Approved Slice Sequence**.
 - The agent proposes the next slice; the human approves or redirects it.
+- An **Approved Slice Sequence** may contain multiple low-risk slices that the agent implements and commits one-by-one without pausing after each slice.
 - Each slice should advance exactly one current roadmap milestone.
 - Each slice proposal should include intent, likely files touched, and proposed **Slice Acceptance Checks**.
 - Prefer small, reviewable changes over whole-milestone batches.
@@ -30,13 +31,14 @@ For each **Implementation Slice**:
 - Keep implementation single-slice and single-writer by default before dogfooding.
 - Parallel agents or sessions may help with research, review, or code auditing, but should not implement separate slices concurrently before Tasker provides workflow coordination.
 - If a slice discovers extra work that changes scope, architecture, workflow meaning, or acceptance checks, pause and ask whether to expand, split, or defer the work.
+- During an **Approved Slice Sequence**, stop for human input when scope, architecture, security, persistence semantics, task lifecycle, delivery behavior, launcher behavior, or unresolved check failures exceed the approved plan.
 - Small local fixes that preserve the approved scope may remain inside the current slice.
 
 ## Review standard
 
 Use risk-based review before **Dogfooding Cutover**.
 
-Agent self-review is enough for low-risk slices. Human review is required for slices that affect persistence schema, task lifecycle or state transitions, Local Worktree Delivery behavior, launcher/pi behavior, authentication, or ADR-worthy architectural decisions.
+Agent self-review is enough for low-risk slices. Human review is required for slices that affect persistence schema, task lifecycle or state transitions, Local Worktree Delivery behavior, launcher/pi behavior, authentication, or ADR-worthy architectural decisions, unless the human explicitly approved those details as part of an **Approved Slice Sequence**.
 
 ## ADR policy
 

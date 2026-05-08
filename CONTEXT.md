@@ -40,6 +40,10 @@ _Avoid_: Whole-milestone batch, vague chat request, giant branch
 The explicit deterministic tests, formatting, linting, and documentation expectations that prove an **Implementation Slice** is complete.
 _Avoid_: Vibes-based done, hidden reviewer expectations
 
+**Approved Slice Sequence**:
+A human-approved run of multiple low-risk **Implementation Slices** that the agent may implement and commit one-by-one without pausing after each slice.
+_Avoid_: Unbounded autonomous development, mixed mega-commit
+
 **Dogfooding Cutover**:
 The point where Tasker development work starts being managed as real Tasker **Tasks**.
 _Avoid_: Full v1 completion, polished launch
@@ -521,6 +525,7 @@ _Avoid_: Separate progress comment
 - Documentation changes are part of an **Implementation Slice** when domain language, workflow behavior, persistence meaning, delivery behavior, launcher behavior, or milestone sequencing changes.
 - Pre-dogfooding loop rules and cutover criteria are recorded in `docs/PRE_DOGFOODING_LOOP.md` until Tasker can track real development **Tasks**.
 - A completed **Pre-Dogfooding Development Loop** normally ends with unstaged or staged working tree changes, a concise summary, and a recommended Conventional Commit message; the human decides whether the agent commits.
+- In an **Approved Slice Sequence**, the agent may implement and commit multiple approved low-risk **Implementation Slices** in order, stopping when scope, architecture, security, persistence semantics, task lifecycle, delivery behavior, launcher behavior, or unresolved check failures require human input.
 - **Dogfooding Cutover** occurs when Tasker development work starts being created and tracked as real Tasker **Tasks**.
 - The first **Dogfooding Cutover** target is after roadmap Milestone 2, when **Bootstrap Task Creation**, **Task Queues**, task show/status, **Workpad Notes**, and **Audit Events** are usable for real Tasker development work.
 - **Dogfooding Readiness** requires enough init/config, queue setup, delegation or temporary task creation, one-shot work, local worktree handling, work updates, and status visibility to build Tasker with Tasker.
