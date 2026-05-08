@@ -9,8 +9,11 @@ repository.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 serde.workspace = true
+sqlx.workspace = true
+tasker-db = { path = "../tasker-db" }
 tokio.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile.workspace = true
 tower.workspace = true

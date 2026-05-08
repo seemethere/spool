@@ -123,9 +123,8 @@ async fn serve(
 
     let pool = tasker_db::connect(&config.database.path).await?;
     tasker_db::run_migrations(&pool).await?;
-    drop(pool);
 
-    tasker_server::serve(bind_addr, env!("CARGO_PKG_VERSION")).await
+    tasker_server::serve(bind_addr, env!("CARGO_PKG_VERSION"), pool).await
 }
 
 fn ensure_db_parent(db_path: &Path) -> Result<()> {

@@ -1802,6 +1802,9 @@ dependencies = [
  "axum",
  "serde",
  "serde_json",
+ "sqlx",
+ "tasker-db",
+ "tempfile",
  "tokio",
  "tower",
 ]
