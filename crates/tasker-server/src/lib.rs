@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -52,6 +53,28 @@ pub struct UpdateRequirementStatusRequest {
     pub waiver_reason: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ClaimNextRequest {
+    pub actor: tasker_db::Actor,
+    pub worker_id: String,
+    pub launcher_kind: Option<String>,
+    pub lease_seconds: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HeartbeatRunRequest {
+    pub actor: tasker_db::Actor,
+    pub lease_seconds: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FinishRunRequest {
+    pub actor: tasker_db::Actor,
+    pub outcome: String,
+    pub failure_reason: Option<String>,
+    pub retry_hold_seconds: Option<i64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
     pub error: String,
@@ -63,6 +86,7 @@ pub fn router(app_version: impl Into<String>, pool: SqlitePool) -> Router {
         .route("/version", get(version))
         .route("/queues", post(create_queue).get(list_queues))
         .route("/queues/{key}", get(get_queue))
+        .route("/queues/{key}/claim-next", post(claim_next))
         .route("/tasks/bootstrap", post(create_task))
         .route("/tasks/{identifier}", get(get_task))
         .route(
@@ -78,6 +102,8 @@ pub fn router(app_version: impl Into<String>, pool: SqlitePool) -> Router {
             axum::routing::put(update_validation_item_status),
         )
         .route("/tasks/{identifier}/audit-events", get(task_audit_events))
+        .route("/agent-runs/{run_id}/heartbeat", post(heartbeat_run))
+        .route("/agent-runs/{run_id}/finish", post(finish_run))
         .route("/status", get(status))
         .with_state(ServerState {
             version: app_version.into(),
@@ -243,6 +269,68 @@ async fn status(
         .map_err(internal_error)
 }
 
+async fn claim_next(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    Json(request): Json<ClaimNextRequest>,
+) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    let input = tasker_db::ClaimNextInput {
+        queue_key: key,
+        worker_id: request.worker_id,
+        launcher_kind: request.launcher_kind.unwrap_or_else(|| "fake".to_string()),
+        lease_seconds: request.lease_seconds.unwrap_or(90),
+    };
+    match tasker_db::claim_next(&state.pool, &input, &request.actor)
+        .await
+        .map_err(task_mutation_error)?
+    {
+        Some(claimed) => Ok(Json(claimed).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+async fn heartbeat_run(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(request): Json<HeartbeatRunRequest>,
+) -> Result<Json<tasker_db::AgentRun>, (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    tasker_db::heartbeat_run(
+        &state.pool,
+        &run_id,
+        request.lease_seconds.unwrap_or(90),
+        &request.actor,
+    )
+    .await
+    .map(Json)
+    .map_err(task_mutation_error)
+}
+
+async fn finish_run(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Json(request): Json<FinishRunRequest>,
+) -> Result<Json<tasker_db::AgentRun>, (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    tasker_db::finish_run(
+        &state.pool,
+        &run_id,
+        &tasker_db::FinishRunInput {
+            outcome: request.outcome,
+            failure_reason: request.failure_reason,
+            retry_hold_seconds: request.retry_hold_seconds,
+        },
+        &request.actor,
+    )
+    .await
+    .map(Json)
+    .map_err(task_mutation_error)
+}
+
 async fn list_queues(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -364,6 +452,7 @@ fn task_mutation_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>
     let message = error.to_string();
     if message.contains("Worker Agents cannot create Waivers")
         || message.contains("Waivers require an Operator or Review Agent")
+        || message.contains("require a Worker Agent actor")
     {
         error_response(StatusCode::FORBIDDEN, message)
     } else if message.contains("not found") {
@@ -373,6 +462,8 @@ fn task_mutation_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>
         || message.contains("invalid Task State")
         || message.contains("invalid requirement status")
         || message.contains("only supports Backlog or Ready")
+        || message.contains("invalid Agent Run outcome")
+        || message.contains("must be positive")
         || message.contains("explicit reason")
         || message.contains("position must")
         || message.contains("must not be blank")
@@ -684,6 +775,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_run_endpoints_claim_heartbeat_and_finish() {
+        let (_temp, pool, token) = migrated_pool().await;
+        let app = router("test-version", pool);
+        assert_eq!(
+            app.clone()
+                .oneshot(create_queue_request("TASK", "Tasker", "operator", &token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(create_task_request("TASK", "Run", "operator", &token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+
+        let claim = app
+            .clone()
+            .oneshot(claim_next_request("TASK", "worker_agent", &token))
+            .await
+            .unwrap();
+        assert_eq!(claim.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(claim.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let run_id = json["run"]["id"].as_str().unwrap();
+        assert_eq!(json["task"]["task"]["state"], "in_progress");
+
+        let heartbeat = app
+            .clone()
+            .oneshot(heartbeat_request(run_id, "worker_agent", &token))
+            .await
+            .unwrap();
+        assert_eq!(heartbeat.status(), StatusCode::OK);
+
+        let finish = app
+            .clone()
+            .oneshot(finish_request(run_id, "completed", "worker_agent", &token))
+            .await
+            .unwrap();
+        assert_eq!(finish.status(), StatusCode::OK);
+
+        let reclaim = app
+            .oneshot(claim_next_request("TASK", "worker_agent", &token))
+            .await
+            .unwrap();
+        assert_eq!(reclaim.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn claim_next_requires_worker_agent() {
+        let (_temp, pool, token) = migrated_pool().await;
+        let app = router("test-version", pool);
+        assert_eq!(
+            app.clone()
+                .oneshot(create_queue_request("TASK", "Tasker", "operator", &token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        let response = app
+            .oneshot(claim_next_request("TASK", "operator", &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn worker_agent_waiver_returns_forbidden() {
         let (_temp, pool, token) = migrated_pool().await;
         let app = router("test-version", pool);
@@ -810,6 +975,67 @@ mod tests {
             .uri(uri)
             .header("authorization", format!("Bearer {token}"))
             .body(Body::empty())
+            .unwrap()
+    }
+
+    fn claim_next_request(queue_key: &str, actor_kind: &str, token: &str) -> Request<Body> {
+        let request = serde_json::json!({
+            "actor": {
+                "kind": actor_kind,
+                "id": "worker",
+                "display_name": "worker"
+            },
+            "worker_id": "worker",
+            "launcher_kind": "fake",
+            "lease_seconds": 90
+        });
+
+        Request::builder()
+            .method("POST")
+            .uri(format!("/queues/{queue_key}/claim-next"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(request.to_string()))
+            .unwrap()
+    }
+
+    fn heartbeat_request(run_id: &str, actor_kind: &str, token: &str) -> Request<Body> {
+        let request = serde_json::json!({
+            "actor": {
+                "kind": actor_kind,
+                "id": "worker",
+                "display_name": "worker"
+            },
+            "lease_seconds": 90
+        });
+
+        Request::builder()
+            .method("POST")
+            .uri(format!("/agent-runs/{run_id}/heartbeat"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(request.to_string()))
+            .unwrap()
+    }
+
+    fn finish_request(run_id: &str, outcome: &str, actor_kind: &str, token: &str) -> Request<Body> {
+        let request = serde_json::json!({
+            "actor": {
+                "kind": actor_kind,
+                "id": "worker",
+                "display_name": "worker"
+            },
+            "outcome": outcome,
+            "failure_reason": null,
+            "retry_hold_seconds": null
+        });
+
+        Request::builder()
+            .method("POST")
+            .uri(format!("/agent-runs/{run_id}/finish"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(request.to_string()))
             .unwrap()
     }
 

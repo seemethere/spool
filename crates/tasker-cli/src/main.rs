@@ -46,6 +46,30 @@ enum Command {
     },
     /// Show Tasker queue and Task State counts.
     Status,
+    /// Run a Worker Loop.
+    Work {
+        /// Task Queue Key to claim from.
+        #[arg(long)]
+        queue: String,
+        /// Claim and run at most one Task.
+        #[arg(long)]
+        once: bool,
+        /// Agent Launcher to use.
+        #[arg(long, default_value = "fake")]
+        launcher: String,
+        /// Worker Agent actor display name.
+        #[arg(long, default_value = "local-worker")]
+        actor: String,
+        /// Fake Agent Launcher outcome.
+        #[arg(long, default_value = "completed")]
+        fake_outcome: String,
+        /// Claim Lease duration in seconds.
+        #[arg(long, default_value_t = 90)]
+        lease_seconds: i64,
+        /// Retry Hold duration in seconds for failed fake runs.
+        #[arg(long)]
+        retry_hold_seconds: Option<i64>,
+    },
     /// Start the Tasker Service.
     Serve {
         /// Override the service bind address.
@@ -81,6 +105,9 @@ enum QueueCommand {
         /// Keep completed Local Worktrees for debugging.
         #[arg(long, default_value_t = false)]
         done_worktree_retention: bool,
+        /// Optional Queue Concurrency Limit for active Agent Runs.
+        #[arg(long)]
+        queue_concurrency_limit: Option<i64>,
         /// Operator actor display name for audit attribution.
         #[arg(long, default_value = "local-operator")]
         actor: String,
@@ -165,6 +192,16 @@ enum WorkpadCommand {
     },
 }
 
+struct WorkOptions {
+    queue: String,
+    once: bool,
+    launcher: String,
+    actor: String,
+    fake_outcome: String,
+    lease_seconds: i64,
+    retry_hold_seconds: Option<i64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct BootstrapFrontMatter {
     title: String,
@@ -191,6 +228,30 @@ async fn main() -> Result<()> {
         Some(Command::Queue { command }) => queue(&paths, db_path_overridden, command).await,
         Some(Command::Task { command }) => task(&paths, db_path_overridden, command).await,
         Some(Command::Status) => status(&paths, db_path_overridden).await,
+        Some(Command::Work {
+            queue,
+            once,
+            launcher,
+            actor,
+            fake_outcome,
+            lease_seconds,
+            retry_hold_seconds,
+        }) => {
+            work(
+                &paths,
+                db_path_overridden,
+                WorkOptions {
+                    queue,
+                    once,
+                    launcher,
+                    actor,
+                    fake_outcome,
+                    lease_seconds,
+                    retry_hold_seconds,
+                },
+            )
+            .await
+        }
         Some(Command::Serve { bind }) => serve(&paths, bind, db_path_overridden).await,
         Some(Command::Version) => {
             println!("{}", env!("CARGO_PKG_VERSION"));
@@ -251,6 +312,7 @@ async fn queue(paths: &TaskerPaths, db_path_overridden: bool, command: QueueComm
             worktree_root,
             branch_template,
             done_worktree_retention,
+            queue_concurrency_limit,
             actor,
         } => {
             println!(
@@ -265,6 +327,7 @@ async fn queue(paths: &TaskerPaths, db_path_overridden: bool, command: QueueComm
                 worktree_root: worktree_root.display().to_string(),
                 branch_template,
                 done_worktree_retention,
+                queue_concurrency_limit,
             };
             let queue =
                 tasker_db::create_task_queue(&pool, &input, &tasker_db::Actor::operator(actor))
@@ -418,11 +481,73 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
                 println!();
             }
             println!("Task Queue: {queue_header}");
+            println!("  active Agent Runs: {}", row.active_agent_runs);
+            println!("  active Retry Holds: {}", row.active_retry_holds);
             current_queue = Some(queue_header);
         }
         println!("  {}: {}", row.state, row.task_count);
     }
 
+    Ok(())
+}
+
+async fn work(paths: &TaskerPaths, db_path_overridden: bool, options: WorkOptions) -> Result<()> {
+    if !options.once {
+        anyhow::bail!("tasker work currently requires --once");
+    }
+    if options.launcher != "fake" {
+        anyhow::bail!("only the fake Agent Launcher is available in this milestone");
+    }
+    let pool = open_pool(paths, db_path_overridden).await?;
+    let actor = tasker_db::Actor {
+        kind: "worker_agent".to_string(),
+        id: options.actor.clone(),
+        display_name: options.actor.clone(),
+    };
+    let claim = tasker_db::claim_next(
+        &pool,
+        &tasker_db::ClaimNextInput {
+            queue_key: options.queue.clone(),
+            worker_id: options.actor.clone(),
+            launcher_kind: options.launcher.clone(),
+            lease_seconds: options.lease_seconds,
+        },
+        &actor,
+    )
+    .await?;
+
+    let Some(claimed) = claim else {
+        println!("no eligible Tasks found for Task Queue {}", options.queue);
+        return Ok(());
+    };
+
+    println!(
+        "claimed Task {} with Agent Run {}",
+        claimed.task.task.identifier, claimed.run.id
+    );
+    tasker_db::heartbeat_run(&pool, &claimed.run.id, options.lease_seconds, &actor).await?;
+    let fake_note = format!(
+        "Fake Agent Launcher processed Task {} in Agent Run {}.\nOutcome: {}\n",
+        claimed.task.task.identifier, claimed.run.id, options.fake_outcome
+    );
+    tasker_db::update_workpad_note(&pool, &claimed.task.task.identifier, &fake_note, &actor)
+        .await?;
+    let finished = tasker_db::finish_run(
+        &pool,
+        &claimed.run.id,
+        &tasker_db::FinishRunInput {
+            outcome: options.fake_outcome,
+            failure_reason: None,
+            retry_hold_seconds: options.retry_hold_seconds,
+        },
+        &actor,
+    )
+    .await?;
+    println!(
+        "finished Agent Run {} with outcome {}",
+        finished.id,
+        finished.outcome.unwrap_or_else(|| "unknown".to_string())
+    );
     Ok(())
 }
 
@@ -545,6 +670,10 @@ fn print_queue(queue: &tasker_db::TaskQueue) {
     println!("worktree root: {}", queue.worktree_root);
     println!("branch template: {}", queue.branch_template);
     println!("done worktree retention: {}", queue.done_worktree_retention);
+    match queue.queue_concurrency_limit {
+        Some(limit) => println!("Queue Concurrency Limit: {limit}"),
+        None => println!("Queue Concurrency Limit: none"),
+    }
 }
 
 fn ensure_db_parent(db_path: &Path) -> Result<()> {
@@ -637,6 +766,7 @@ mod tests {
                 worktree_root: temp.path().join("worktrees"),
                 branch_template: "tasker/{task_identifier}".to_string(),
                 done_worktree_retention: false,
+                queue_concurrency_limit: None,
                 actor: "tester".to_string(),
             },
         )
@@ -672,6 +802,7 @@ mod tests {
                 worktree_root: temp.path().join("worktrees"),
                 branch_template: "tasker/{task_identifier}".to_string(),
                 done_worktree_retention: false,
+                queue_concurrency_limit: None,
                 actor: "tester".to_string(),
             },
         )
@@ -773,6 +904,35 @@ Implement Bootstrap Task Creation.
         )
         .await
         .expect("audit");
+        work(
+            &paths,
+            false,
+            WorkOptions {
+                queue: "TASK".to_string(),
+                once: true,
+                launcher: "fake".to_string(),
+                actor: "worker".to_string(),
+                fake_outcome: "completed".to_string(),
+                lease_seconds: 90,
+                retry_hold_seconds: None,
+            },
+        )
+        .await
+        .expect("fake work");
+        let pool = open_pool(&paths, false).await.expect("pool");
+        let run = tasker_db::get_agent_run(&pool, "not-a-real-run")
+            .await
+            .expect("get missing run");
+        assert!(run.is_none());
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("get task")
+            .expect("task");
+        assert!(detail
+            .workpad_note
+            .unwrap()
+            .body
+            .contains("Fake Agent Launcher processed Task TASK-1"));
         status(&paths, false).await.expect("status");
     }
 
