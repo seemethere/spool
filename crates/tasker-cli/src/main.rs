@@ -89,11 +89,13 @@ async fn init(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
 
     let pool = tasker_db::connect(&config.database.path).await?;
     tasker_db::run_migrations(&pool).await?;
+    let token = tasker_db::ensure_local_api_token(&pool).await?;
 
     println!("Tasker initialized");
     println!("config: {}", paths.config_path.display());
     println!("data: {}", paths.data_dir.display());
     println!("database: {}", config.database.path.display());
+    println!("local api token: {token}");
     if !wrote_config {
         println!("config already existed; left unchanged");
     }

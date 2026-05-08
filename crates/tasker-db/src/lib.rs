@@ -8,6 +8,8 @@ use sqlx::{
 };
 use uuid::Uuid;
 
+pub const LOCAL_TOKEN_NAME: &str = "local";
+
 pub fn sqlite_url(db_path: &Path) -> String {
     format!("sqlite://{}", db_path.display())
 }
@@ -34,6 +36,45 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
         .run(pool)
         .await
         .context("failed to run SQLite migrations")
+}
+
+pub async fn ensure_local_api_token(pool: &SqlitePool) -> Result<String> {
+    if let Some(token) = get_api_token(pool, LOCAL_TOKEN_NAME).await? {
+        return Ok(token);
+    }
+
+    let token = format!("tasker_{}", Uuid::new_v4().simple());
+    sqlx::query(
+        r#"
+        INSERT INTO api_tokens (id, name, token)
+        VALUES (?, ?, ?)
+        "#,
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(LOCAL_TOKEN_NAME)
+    .bind(&token)
+    .execute(pool)
+    .await
+    .context("failed to create local API token")?;
+
+    Ok(token)
+}
+
+pub async fn get_api_token(pool: &SqlitePool, name: &str) -> Result<Option<String>> {
+    sqlx::query_scalar("SELECT token FROM api_tokens WHERE name = ?")
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .with_context(|| format!("failed to load API token {name}"))
+}
+
+pub async fn authenticate_api_token(pool: &SqlitePool, token: &str) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens WHERE token = ?")
+        .bind(token)
+        .fetch_one(pool)
+        .await
+        .context("failed to authenticate API token")?;
+    Ok(count > 0)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -254,6 +295,22 @@ mod tests {
         let value: String = row.get("value");
 
         assert_eq!(value, "1");
+    }
+
+    #[tokio::test]
+    async fn local_api_token_is_created_once_and_authenticates() {
+        let (_temp, pool) = migrated_pool().await;
+
+        let token = ensure_local_api_token(&pool).await.expect("create token");
+        let same_token = ensure_local_api_token(&pool).await.expect("reuse token");
+
+        assert_eq!(token, same_token);
+        assert!(authenticate_api_token(&pool, &token)
+            .await
+            .expect("valid token authenticates"));
+        assert!(!authenticate_api_token(&pool, "not-the-token")
+            .await
+            .expect("invalid token rejected"));
     }
 
     #[tokio::test]
