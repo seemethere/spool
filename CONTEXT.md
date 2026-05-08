@@ -28,6 +28,22 @@ _Avoid_: Hidden worker inside Tasker Service
 The early milestone where Tasker can run useful Tasks against its own repository.
 _Avoid_: Waiting for full polish before self-use
 
+**Pre-Dogfooding Development Loop**:
+The temporary manual human/agent workflow used to build Tasker until **Dogfooding Cutover**.
+_Avoid_: Permanent delivery workflow, ad hoc forever process
+
+**Implementation Slice**:
+A small reviewable unit of pre-dogfooding work that advances one roadmap milestone and can be tested or documented independently.
+_Avoid_: Whole-milestone batch, vague chat request, giant branch
+
+**Slice Acceptance Checks**:
+The explicit deterministic tests, formatting, linting, and documentation expectations that prove an **Implementation Slice** is complete.
+_Avoid_: Vibes-based done, hidden reviewer expectations
+
+**Dogfooding Cutover**:
+The point where Tasker development work starts being managed as real Tasker **Tasks**.
+_Avoid_: Full v1 completion, polished launch
+
 **Bootstrap Task Creation**:
 A temporary dogfooding shortcut for creating a **Task** from a Markdown file with YAML front matter before the full **Delegation Session** is ready.
 _Avoid_: Permanent manual intake model
@@ -495,6 +511,18 @@ _Avoid_: Separate progress comment
 - Search, bulk edits, review sessions, pruning, metrics export, and token admin APIs are deferred until after **Dogfooding Readiness**.
 - Dogfooding persistence includes queues, tasks, acceptance criteria, validation items, workpad notes/revisions, task links, task relationships, agent runs/heartbeats, delivery records, launcher session data, audit events, and API tokens.
 - **Dogfooding Readiness** comes before full v1 polish.
+- **Pre-Dogfooding Development Loop** is used before **Dogfooding Cutover**.
+- **Pre-Dogfooding Development Loop** operates on one **Implementation Slice** at a time.
+- During the **Pre-Dogfooding Development Loop**, the agent proposes the next **Implementation Slice** and the human approves or redirects it.
+- An **Implementation Slice** advances exactly one current roadmap milestone.
+- Each **Implementation Slice** has **Slice Acceptance Checks** before implementation begins.
+- **Slice Acceptance Checks** include relevant targeted tests plus formatting and linting when configured and reasonably cheap to run.
+- A **Pre-Dogfooding Development Loop** inspects docs/code, proposes an **Implementation Slice**, confirms **Slice Acceptance Checks**, implements, runs deterministic checks, updates docs when domain or behavior changes, and summarizes the result.
+- Documentation changes are part of an **Implementation Slice** when domain language, workflow behavior, persistence meaning, delivery behavior, launcher behavior, or milestone sequencing changes.
+- Pre-dogfooding loop rules and cutover criteria are recorded in `docs/PRE_DOGFOODING_LOOP.md` until Tasker can track real development **Tasks**.
+- A completed **Pre-Dogfooding Development Loop** normally ends with unstaged or staged working tree changes, a concise summary, and a recommended Conventional Commit message; the human decides whether the agent commits.
+- **Dogfooding Cutover** occurs when Tasker development work starts being created and tracked as real Tasker **Tasks**.
+- The first **Dogfooding Cutover** target is after roadmap Milestone 2, when **Bootstrap Task Creation**, **Task Queues**, task show/status, **Workpad Notes**, and **Audit Events** are usable for real Tasker development work.
 - **Dogfooding Readiness** requires enough init/config, queue setup, delegation or temporary task creation, one-shot work, local worktree handling, work updates, and status visibility to build Tasker with Tasker.
 - **Dogfooding Readiness** uses single-worker execution only.
 - **Bootstrap Task Creation** uses `tasker task create --bootstrap --queue <key> --file task.md`.
@@ -546,6 +574,8 @@ _Avoid_: Separate progress comment
 - "eliminate Linear dependency" could imply importing or syncing Linear issues in v1 — resolved: v1 is greenfield local Tasker only; future imports use the **Tasker API**.
 - "v1 backend" could mean API-only storage — resolved: v1 includes the **Tasker Service** plus a thin **Symphony Adapter** to validate the local workflow end-to-end.
 - "MVP" could imply finishing every planned v1 feature before self-use — resolved: **Dogfooding Readiness** is an earlier milestone focused on using Tasker to build Tasker.
+- "development loop until dogfooding" could mean either the temporary manual workflow or the Tasker-powered self-use workflow — resolved: use **Pre-Dogfooding Development Loop** before **Dogfooding Cutover**, then Tasker-managed dogfooding after cutover.
+- "task" before Tasker can dogfood could conflict with the domain **Task** — resolved: use **Implementation Slice** for pre-dogfooding planning units and reserve **Task** for Tasker-managed work.
 - "manual merge" during dogfooding could redefine delivery — resolved: **Manual Dogfood Merge** is a temporary sequencing compromise, not the target delivery model.
 - "serve" could imply workers run automatically — resolved: `tasker serve` only serves the API; `tasker work` runs the **Worker Loop** explicitly.
 - "issue", "label", and "blocked_by" are Linear-shaped API terms — resolved: canonical Tasker language is **Task**, **Task Tag**, and **Blocking Task**.
