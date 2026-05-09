@@ -544,6 +544,9 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
         return Ok(());
     }
 
+    let active_runs = tasker_db::active_agent_runs_for_status(&pool).await?;
+    let active_holds = tasker_db::active_retry_holds_for_status(&pool).await?;
+
     let mut current_queue: Option<String> = None;
     for row in rows {
         let queue_header = format!("{}\t{}", row.queue_key, row.queue_name);
@@ -553,7 +556,29 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
             }
             println!("Task Queue: {queue_header}");
             println!("  active Agent Runs: {}", row.active_agent_runs);
+            for run in active_runs
+                .iter()
+                .filter(|run| run.queue_key.as_str() == row.queue_key.as_str())
+            {
+                println!(
+                    "    {}\t{}\tlauncher={}\tworker={}\tlease_expires_at={}",
+                    run.task_identifier,
+                    run.agent_run_id,
+                    run.launcher_kind,
+                    run.worker_id,
+                    run.lease_expires_at
+                );
+            }
             println!("  active Retry Holds: {}", row.active_retry_holds);
+            for hold in active_holds
+                .iter()
+                .filter(|hold| hold.queue_key.as_str() == row.queue_key.as_str())
+            {
+                println!(
+                    "    {}\thold_until={}\treason={}",
+                    hold.task_identifier, hold.hold_until, hold.reason
+                );
+            }
             current_queue = Some(queue_header);
         }
         println!("  {}: {}", row.state, row.task_count);

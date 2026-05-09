@@ -393,6 +393,24 @@ pub struct QueueStatus {
     pub active_retry_holds: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct ActiveAgentRunStatus {
+    pub queue_key: String,
+    pub task_identifier: String,
+    pub agent_run_id: String,
+    pub launcher_kind: String,
+    pub worker_id: String,
+    pub lease_expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct ActiveRetryHoldStatus {
+    pub queue_key: String,
+    pub task_identifier: String,
+    pub hold_until: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateRequirementStatus {
     pub status: String,
@@ -1353,6 +1371,53 @@ pub async fn status_by_queue_and_state(pool: &SqlitePool) -> Result<Vec<QueueSta
     .fetch_all(pool)
     .await
     .context("failed to load Tasker status")
+}
+
+pub async fn active_agent_runs_for_status(
+    pool: &SqlitePool,
+) -> Result<Vec<ActiveAgentRunStatus>> {
+    sqlx::query_as::<_, ActiveAgentRunStatus>(
+        r#"
+        SELECT
+            task_queues.key AS queue_key,
+            tasks.identifier AS task_identifier,
+            agent_runs.id AS agent_run_id,
+            agent_runs.launcher_kind AS launcher_kind,
+            agent_runs.worker_id AS worker_id,
+            agent_runs.lease_expires_at AS lease_expires_at
+        FROM agent_runs
+        JOIN tasks ON tasks.id = agent_runs.task_id
+        JOIN task_queues ON task_queues.id = agent_runs.task_queue_id
+        WHERE agent_runs.outcome IS NULL
+          AND agent_runs.lease_expires_at > CURRENT_TIMESTAMP
+        ORDER BY task_queues.key, tasks.identifier, agent_runs.created_at, agent_runs.id
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to load active Agent Runs for status")
+}
+
+pub async fn active_retry_holds_for_status(
+    pool: &SqlitePool,
+) -> Result<Vec<ActiveRetryHoldStatus>> {
+    sqlx::query_as::<_, ActiveRetryHoldStatus>(
+        r#"
+        SELECT
+            task_queues.key AS queue_key,
+            tasks.identifier AS task_identifier,
+            task_retry_holds.hold_until AS hold_until,
+            task_retry_holds.reason AS reason
+        FROM task_retry_holds
+        JOIN tasks ON tasks.id = task_retry_holds.task_id
+        JOIN task_queues ON task_queues.id = tasks.task_queue_id
+        WHERE task_retry_holds.hold_until > CURRENT_TIMESTAMP
+        ORDER BY task_queues.key, tasks.identifier
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to load active Retry Holds for status")
 }
 
 pub async fn claim_next(
@@ -3556,6 +3621,67 @@ mod tests {
         assert!(status
             .iter()
             .any(|row| row.queue_key == "TASK" && row.state == "backlog" && row.task_count == 1));
+    }
+
+    #[tokio::test]
+    async fn status_lists_active_runs_and_retry_holds() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "First"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create first");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Second"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create second");
+
+        let failed_run = claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim first")
+            .expect("first claimed");
+        finish_run(
+            &pool,
+            &failed_run.run.id,
+            &FinishRunInput {
+                outcome: "failed".to_string(),
+                failure_reason: Some("model unavailable".to_string()),
+                retry_hold_seconds: Some(300),
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("finish first failed");
+        let active_run = claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim second")
+            .expect("second claimed");
+
+        let runs = active_agent_runs_for_status(&pool).await.expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].task_identifier, active_run.task.task.identifier);
+        assert_eq!(runs[0].agent_run_id, active_run.run.id);
+        assert_eq!(runs[0].launcher_kind, "fake");
+        assert_eq!(runs[0].worker_id, "worker");
+        assert_eq!(runs[0].lease_expires_at, active_run.run.lease_expires_at);
+
+        let holds = active_retry_holds_for_status(&pool).await.expect("holds");
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].task_identifier, failed_run.task.task.identifier);
+        assert_eq!(holds[0].reason, "model unavailable");
+        assert!(!holds[0].hold_until.is_empty());
     }
 
     async fn migrated_pool() -> (tempfile::TempDir, SqlitePool) {
