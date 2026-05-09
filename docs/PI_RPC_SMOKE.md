@@ -44,3 +44,9 @@ cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data 
 ```
 
 The Run Transcript is stored under `.tasker/data/runs/<agent-run-id>/`. If pi exits nonzero or emits an unattended question/confirmation event, Tasker records a failed Agent Run with a clear failure reason.
+
+## First Dogfood Run Notes
+
+The first real Pi Worker Loop attempt successfully exercised the unattended Tasker Pi Extension path, but it also exposed launcher bugs before a successful Agent Run was recorded. After each dogfood run, operators should inspect `tasker run show <agent-run-id>` and the saved Run Transcript under `.tasker/data/runs/<agent-run-id>/` before trusting the handoff.
+
+Keep these notes focused on Dogfooding Readiness observability: confirming the Agent Run outcome, launcher session metadata, failure reason when present, and transcript location. Do not treat this smoke path as a broader product workflow or as a replacement for the structured Tasker gates.
