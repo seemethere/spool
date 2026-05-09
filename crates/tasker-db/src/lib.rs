@@ -423,6 +423,42 @@ pub struct AgentRun {
     pub finished_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct LauncherSessionData {
+    pub agent_run_id: String,
+    pub launcher_kind: String,
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub final_status: Option<String>,
+    pub transcript_path: Option<String>,
+    pub raw_json: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpsertLauncherSessionData {
+    pub launcher_kind: String,
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub final_status: Option<String>,
+    pub transcript_path: Option<String>,
+    pub raw_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunDetail {
+    pub run: AgentRun,
+    pub task: TaskDetail,
+    pub launcher_session_data: Option<LauncherSessionData>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClaimedRun {
     pub run: AgentRun,
@@ -1636,6 +1672,115 @@ pub async fn get_agent_run(pool: &SqlitePool, run_id: &str) -> Result<Option<Age
         .fetch_optional(pool)
         .await
         .with_context(|| format!("failed to load Agent Run {run_id}"))
+}
+
+pub async fn upsert_launcher_session_data(
+    pool: &SqlitePool,
+    agent_run_id: &str,
+    input: &UpsertLauncherSessionData,
+    actor: &Actor,
+) -> Result<LauncherSessionData> {
+    validate_actor(actor)?;
+    let mut tx = pool.begin().await.context("failed to begin transaction")?;
+    let run_exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM agent_runs WHERE id = ?")
+        .bind(agent_run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .with_context(|| format!("failed to load Agent Run {agent_run_id}"))?;
+    if run_exists.is_none() {
+        anyhow::bail!("Agent Run {agent_run_id} not found");
+    }
+    sqlx::query(
+        r#"
+        INSERT INTO launcher_session_data (
+            agent_run_id, launcher_kind, session_id, model, provider, started_at, finished_at,
+            final_status, transcript_path, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(agent_run_id) DO UPDATE SET
+            launcher_kind = excluded.launcher_kind,
+            session_id = excluded.session_id,
+            model = excluded.model,
+            provider = excluded.provider,
+            started_at = excluded.started_at,
+            finished_at = excluded.finished_at,
+            final_status = excluded.final_status,
+            transcript_path = excluded.transcript_path,
+            raw_json = excluded.raw_json,
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+    )
+    .bind(agent_run_id)
+    .bind(&input.launcher_kind)
+    .bind(&input.session_id)
+    .bind(&input.model)
+    .bind(&input.provider)
+    .bind(&input.started_at)
+    .bind(&input.finished_at)
+    .bind(&input.final_status)
+    .bind(&input.transcript_path)
+    .bind(&input.raw_json)
+    .execute(&mut *tx)
+    .await
+    .context("failed to upsert Launcher Session Data")?;
+    append_audit_event_in_tx(
+        &mut tx,
+        actor,
+        "agent_run.launcher_session_data_recorded",
+        "agent_run",
+        agent_run_id,
+        serde_json::json!({
+            "launcher_kind": input.launcher_kind,
+            "session_id": input.session_id,
+            "final_status": input.final_status,
+            "transcript_path": input.transcript_path,
+        }),
+    )
+    .await?;
+    tx.commit().await.context("failed to commit transaction")?;
+    get_launcher_session_data(pool, agent_run_id)
+        .await?
+        .with_context(|| format!("Launcher Session Data for Agent Run {agent_run_id} not found"))
+}
+
+pub async fn get_launcher_session_data(
+    pool: &SqlitePool,
+    agent_run_id: &str,
+) -> Result<Option<LauncherSessionData>> {
+    sqlx::query_as::<_, LauncherSessionData>(
+        r#"
+        SELECT agent_run_id, launcher_kind, session_id, model, provider, started_at, finished_at,
+               final_status, transcript_path, raw_json, created_at, updated_at
+        FROM launcher_session_data
+        WHERE agent_run_id = ?
+        "#,
+    )
+    .bind(agent_run_id)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| format!("failed to load Launcher Session Data for Agent Run {agent_run_id}"))
+}
+
+pub async fn get_agent_run_detail(
+    pool: &SqlitePool,
+    run_id: &str,
+) -> Result<Option<AgentRunDetail>> {
+    let Some(run) = get_agent_run(pool, run_id).await? else {
+        return Ok(None);
+    };
+    let identifier: String = sqlx::query_scalar("SELECT identifier FROM tasks WHERE id = ?")
+        .bind(&run.task_id)
+        .fetch_one(pool)
+        .await
+        .with_context(|| format!("failed to load Task for Agent Run {run_id}"))?;
+    let task = get_task_detail(pool, &identifier)
+        .await?
+        .with_context(|| format!("Task {identifier} for Agent Run {run_id} not found"))?;
+    let launcher_session_data = get_launcher_session_data(pool, run_id).await?;
+    Ok(Some(AgentRunDetail {
+        run,
+        task,
+        launcher_session_data,
+    }))
 }
 
 async fn expire_stale_agent_runs(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
@@ -3321,6 +3466,62 @@ mod tests {
             .expect("load run")
             .expect("run exists");
         assert_eq!(run.outcome.as_deref(), Some("expired"));
+    }
+
+    #[tokio::test]
+    async fn launcher_session_data_is_upserted_and_loaded_with_run_detail() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Run"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
+        let claimed = claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim")
+            .expect("claimed task");
+
+        let session = upsert_launcher_session_data(
+            &pool,
+            &claimed.run.id,
+            &UpsertLauncherSessionData {
+                launcher_kind: "pi".to_string(),
+                session_id: Some("session-1".to_string()),
+                model: Some("model".to_string()),
+                provider: Some("provider".to_string()),
+                started_at: Some(claimed.run.created_at.clone()),
+                finished_at: None,
+                final_status: Some("completed".to_string()),
+                transcript_path: Some("/tmp/transcript.jsonl".to_string()),
+                raw_json: Some("{}".to_string()),
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("upsert session");
+        assert_eq!(session.launcher_kind, "pi");
+        let detail = get_agent_run_detail(&pool, &claimed.run.id)
+            .await
+            .expect("load detail")
+            .expect("detail exists");
+        assert_eq!(detail.task.task.identifier, "TASK-1");
+        assert_eq!(
+            detail
+                .launcher_session_data
+                .unwrap()
+                .transcript_path
+                .as_deref(),
+            Some("/tmp/transcript.jsonl")
+        );
     }
 
     #[tokio::test]

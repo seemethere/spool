@@ -49,7 +49,8 @@ Once this milestone works, create real dogfood tasks for later milestones.
 - Run transcripts and launcher session data
 - `tasker run show`
 - Improved `tasker status`
-- Manual dogfood merge or first Integrating implementation
+- Manual dogfood merge documentation before automatic Integrating
+- Opt-in real pi smoke documentation
 - Tests with temp SQLite DBs, temp Git repos, fake launchers, and fake delivery outcomes
 
 ## Full v1 after dogfooding

@@ -23,3 +23,7 @@ Set these environment variables before loading the extension:
 - `tasker_request_transition`
 
 All mutations send explicit Tasker Actor attribution. The extension does not shell out to the Tasker CLI.
+
+## Worker Loop usage
+
+`tasker work --launcher pi` starts `pi --mode rpc` with these environment variables set for the fresh Agent Run. Run `tasker serve` separately so the extension can reach the Tasker API, then inspect the Agent Run with `tasker run show <agent-run-id>`.

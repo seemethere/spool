@@ -69,9 +69,23 @@ enum Command {
         /// Claim Lease duration in seconds.
         #[arg(long, default_value_t = 90)]
         lease_seconds: i64,
-        /// Retry Hold duration in seconds for failed fake runs.
+        /// Retry Hold duration in seconds for failed runs.
         #[arg(long)]
         retry_hold_seconds: Option<i64>,
+        /// Tasker API URL exposed to launched pi sessions.
+        #[arg(long)]
+        api_url: Option<String>,
+        /// Pi executable path.
+        #[arg(long, default_value = "pi")]
+        pi_bin: String,
+        /// Worker Role Prompt file to send to pi RPC stdin.
+        #[arg(long)]
+        worker_prompt: Option<PathBuf>,
+    },
+    /// Inspect Agent Runs.
+    Run {
+        #[command(subcommand)]
+        command: RunCommand,
     },
     /// Start the Tasker Service.
     Serve {
@@ -212,6 +226,12 @@ enum WorkpadCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum RunCommand {
+    /// Show one Agent Run, its Task, and Launcher Session Data.
+    Show { run_id: String },
+}
+
 struct WorkOptions {
     queue: String,
     once: bool,
@@ -220,6 +240,9 @@ struct WorkOptions {
     fake_outcome: String,
     lease_seconds: i64,
     retry_hold_seconds: Option<i64>,
+    api_url: Option<String>,
+    pi_bin: String,
+    worker_prompt: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -245,6 +268,9 @@ async fn main() -> Result<()> {
             fake_outcome,
             lease_seconds,
             retry_hold_seconds,
+            api_url,
+            pi_bin,
+            worker_prompt,
         }) => {
             work(
                 &paths,
@@ -257,10 +283,14 @@ async fn main() -> Result<()> {
                     fake_outcome,
                     lease_seconds,
                     retry_hold_seconds,
+                    api_url,
+                    pi_bin,
+                    worker_prompt,
                 },
             )
             .await
         }
+        Some(Command::Run { command }) => run(&paths, db_path_overridden, command).await,
         Some(Command::Serve { bind }) => serve(&paths, bind, db_path_overridden).await,
         Some(Command::Version) => {
             println!("{}", env!("CARGO_PKG_VERSION"));
@@ -531,6 +561,14 @@ async fn work(paths: &TaskerPaths, db_path_overridden: bool, options: WorkOption
         anyhow::bail!("tasker work currently requires --once");
     }
     let pool = open_pool(paths, db_path_overridden).await?;
+    let mut config = TaskerConfig::load_or_default(paths)?;
+    if db_path_overridden {
+        config.database.path = paths.db_path.clone();
+    }
+    let api_token = tasker_db::ensure_local_api_token(&pool).await?;
+    let api_url = options
+        .api_url
+        .unwrap_or_else(|| format!("http://{}", config.service.bind_addr));
     let outcome = worker::run_worker_once(
         &pool,
         worker::WorkOnceRequest {
@@ -540,6 +578,11 @@ async fn work(paths: &TaskerPaths, db_path_overridden: bool, options: WorkOption
             fake_outcome: options.fake_outcome,
             lease_seconds: options.lease_seconds,
             retry_hold_seconds: options.retry_hold_seconds,
+            data_dir: paths.data_dir.clone(),
+            api_url,
+            api_token,
+            pi_bin: options.pi_bin,
+            worker_prompt: options.worker_prompt,
         },
     )
     .await?;
@@ -555,6 +598,19 @@ async fn work(paths: &TaskerPaths, db_path_overridden: bool, options: WorkOption
         } => {
             println!("claimed Task {task_identifier} with Agent Run {run_id}");
             println!("finished Agent Run {run_id} with outcome {outcome}");
+        }
+    }
+    Ok(())
+}
+
+async fn run(paths: &TaskerPaths, db_path_overridden: bool, command: RunCommand) -> Result<()> {
+    let pool = open_pool(paths, db_path_overridden).await?;
+    match command {
+        RunCommand::Show { run_id } => {
+            let detail = tasker_db::get_agent_run_detail(&pool, &run_id)
+                .await?
+                .with_context(|| format!("Agent Run {run_id} not found"))?;
+            output::print_run_detail(&detail)?;
         }
     }
     Ok(())
@@ -835,6 +891,9 @@ Implement Bootstrap Task Creation.
                 fake_outcome: "completed".to_string(),
                 lease_seconds: 90,
                 retry_hold_seconds: None,
+                api_url: None,
+                pi_bin: "pi".to_string(),
+                worker_prompt: None,
             },
         )
         .await

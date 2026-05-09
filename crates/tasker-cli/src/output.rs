@@ -83,8 +83,58 @@ pub fn print_task_detail(detail: &tasker_db::TaskDetail) -> Result<()> {
     write_task_detail(std::io::stdout(), detail)
 }
 
+pub fn write_run_detail(mut writer: impl Write, detail: &tasker_db::AgentRunDetail) -> Result<()> {
+    writeln!(writer, "Agent Run: {}", detail.run.id)?;
+    writeln!(writer, "Task: {}", detail.task.task.identifier)?;
+    writeln!(writer, "Task Title: {}", detail.task.task.title)?;
+    writeln!(writer, "Task State: {}", detail.task.task.state)?;
+    writeln!(
+        writer,
+        "Worker Agent: {}",
+        detail.run.worker_actor_display_name
+    )?;
+    writeln!(writer, "Launcher: {}", detail.run.launcher_kind)?;
+    writeln!(
+        writer,
+        "Claim Lease Expires At: {}",
+        detail.run.lease_expires_at
+    )?;
+    writeln!(
+        writer,
+        "Outcome: {}",
+        detail.run.outcome.as_deref().unwrap_or("active")
+    )?;
+    if let Some(reason) = &detail.run.failure_reason {
+        writeln!(writer, "Failure Reason: {reason}")?;
+    }
+    writeln!(writer, "Created At: {}", detail.run.created_at)?;
+    if let Some(finished_at) = &detail.run.finished_at {
+        writeln!(writer, "Finished At: {finished_at}")?;
+    }
+    writeln!(writer, "\nLauncher Session Data:")?;
+    if let Some(session) = &detail.launcher_session_data {
+        writeln!(writer, "  launcher kind: {}", session.launcher_kind)?;
+        if let Some(session_id) = &session.session_id {
+            writeln!(writer, "  session id: {session_id}")?;
+        }
+        if let Some(status) = &session.final_status {
+            writeln!(writer, "  final status: {status}")?;
+        }
+        if let Some(path) = &session.transcript_path {
+            writeln!(writer, "  Run Transcript: {path}")?;
+        }
+    } else {
+        writeln!(writer, "  (none)")?;
+    }
+    Ok(())
+}
+
 pub fn print_queue(queue: &tasker_db::TaskQueue) -> Result<()> {
     write_queue(std::io::stdout(), queue)
+}
+
+pub fn print_run_detail(detail: &tasker_db::AgentRunDetail) -> Result<()> {
+    write_run_detail(std::io::stdout(), detail)
 }
 
 #[cfg(test)]

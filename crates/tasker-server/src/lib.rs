@@ -117,6 +117,7 @@ pub fn router(app_version: impl Into<String>, pool: SqlitePool) -> Router {
             axum::routing::put(update_validation_item_status),
         )
         .route("/tasks/{identifier}/audit-events", get(task_audit_events))
+        .route("/agent-runs/{run_id}", get(get_agent_run))
         .route("/agent-runs/{run_id}/heartbeat", post(heartbeat_run))
         .route("/agent-runs/{run_id}/finish", post(finish_run))
         .route("/status", get(status))
@@ -339,6 +340,24 @@ async fn claim_next(
         Some(claimed) => Ok(Json(claimed).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
+}
+
+async fn get_agent_run(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<Json<tasker_db::AgentRunDetail>, (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    tasker_db::get_agent_run_detail(&state.pool, &run_id)
+        .await
+        .map_err(internal_error)?
+        .map(Json)
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                format!("Agent Run {run_id} not found"),
+            )
+        })
 }
 
 async fn heartbeat_run(
@@ -925,6 +944,19 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).unwrap();
         let run_id = json["run"]["id"].as_str().unwrap();
         assert_eq!(json["task"]["task"]["state"], "in_progress");
+
+        let show = app
+            .clone()
+            .oneshot(authorized_get(&format!("/agent-runs/{run_id}"), &token))
+            .await
+            .unwrap();
+        assert_eq!(show.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(show.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["run"]["id"], run_id);
+        assert_eq!(json["task"]["task"]["identifier"], "TASK-1");
 
         let heartbeat = app
             .clone()

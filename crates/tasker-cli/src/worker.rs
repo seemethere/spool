@@ -1,7 +1,10 @@
 use std::{
     fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context, Result};
@@ -15,6 +18,11 @@ pub struct WorkOnceRequest {
     pub fake_outcome: String,
     pub lease_seconds: i64,
     pub retry_hold_seconds: Option<i64>,
+    pub data_dir: PathBuf,
+    pub api_url: String,
+    pub api_token: String,
+    pub pi_bin: String,
+    pub worker_prompt: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,8 +41,11 @@ pub async fn run_worker_once(
     pool: &SqlitePool,
     request: WorkOnceRequest,
 ) -> Result<WorkOnceOutcome> {
-    if request.launcher != "fake" {
-        bail!("only the fake Agent Launcher is available in this milestone");
+    if request.launcher != "fake" && request.launcher != "pi" {
+        bail!(
+            "unsupported Agent Launcher {}; expected fake or pi",
+            request.launcher
+        );
     }
 
     let actor = tasker_db::Actor {
@@ -47,7 +58,7 @@ pub async fn run_worker_once(
         &tasker_db::ClaimNextInput {
             queue_key: request.queue.clone(),
             worker_id: request.actor.clone(),
-            launcher_kind: request.launcher,
+            launcher_kind: request.launcher.clone(),
             lease_seconds: request.lease_seconds,
         },
         &actor,
@@ -60,20 +71,43 @@ pub async fn run_worker_once(
         });
     };
 
-    prepare_local_worktree(pool, &claimed.task, &actor).await?;
+    let worktree_path = prepare_local_worktree(pool, &claimed.task, &actor).await?;
     tasker_db::heartbeat_run(pool, &claimed.run.id, request.lease_seconds, &actor).await?;
-    let fake_note = fake_workpad_note(
-        &claimed.task.task.identifier,
+    let transcript_dir = request.data_dir.join("runs").join(&claimed.run.id);
+    fs::create_dir_all(&transcript_dir).with_context(|| {
+        format!(
+            "failed to create Run Transcript directory {}",
+            transcript_dir.display()
+        )
+    })?;
+
+    let launcher_result = if request.launcher == "fake" {
+        run_fake_launcher(pool, &request, &claimed, &actor, &transcript_dir).await?
+    } else {
+        run_pi_launcher(
+            pool,
+            &request,
+            &claimed,
+            &actor,
+            &worktree_path,
+            &transcript_dir,
+        )
+        .await?
+    };
+
+    tasker_db::upsert_launcher_session_data(
+        pool,
         &claimed.run.id,
-        &request.fake_outcome,
-    );
-    tasker_db::update_workpad_note(pool, &claimed.task.task.identifier, &fake_note, &actor).await?;
+        &launcher_result.session_data,
+        &actor,
+    )
+    .await?;
     let finished = tasker_db::finish_run(
         pool,
         &claimed.run.id,
         &tasker_db::FinishRunInput {
-            outcome: request.fake_outcome,
-            failure_reason: None,
+            outcome: launcher_result.outcome,
+            failure_reason: launcher_result.failure_reason,
             retry_hold_seconds: request.retry_hold_seconds,
         },
         &actor,
@@ -87,11 +121,341 @@ pub async fn run_worker_once(
     })
 }
 
+struct LauncherResult {
+    outcome: String,
+    failure_reason: Option<String>,
+    session_data: tasker_db::UpsertLauncherSessionData,
+}
+
+async fn run_fake_launcher(
+    pool: &SqlitePool,
+    request: &WorkOnceRequest,
+    claimed: &tasker_db::ClaimedRun,
+    actor: &tasker_db::Actor,
+    transcript_dir: &Path,
+) -> Result<LauncherResult> {
+    let fake_note = fake_workpad_note(
+        &claimed.task.task.identifier,
+        &claimed.run.id,
+        &request.fake_outcome,
+    );
+    tasker_db::update_workpad_note(pool, &claimed.task.task.identifier, &fake_note, actor).await?;
+    let transcript_path = transcript_dir.join("fake.jsonl");
+    fs::write(
+        &transcript_path,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "launcher": "fake",
+                "task_identifier": claimed.task.task.identifier,
+                "agent_run_id": claimed.run.id,
+                "outcome": request.fake_outcome,
+            })
+        ),
+    )
+    .with_context(|| {
+        format!(
+            "failed to write Run Transcript {}",
+            transcript_path.display()
+        )
+    })?;
+    Ok(LauncherResult {
+        outcome: request.fake_outcome.clone(),
+        failure_reason: None,
+        session_data: tasker_db::UpsertLauncherSessionData {
+            launcher_kind: "fake".to_string(),
+            session_id: Some(claimed.run.id.clone()),
+            model: None,
+            provider: None,
+            started_at: Some(claimed.run.created_at.clone()),
+            finished_at: None,
+            final_status: Some(request.fake_outcome.clone()),
+            transcript_path: Some(transcript_path.display().to_string()),
+            raw_json: Some(serde_json::json!({"fake_outcome": request.fake_outcome}).to_string()),
+        },
+    })
+}
+
+async fn run_pi_launcher(
+    pool: &SqlitePool,
+    request: &WorkOnceRequest,
+    claimed: &tasker_db::ClaimedRun,
+    actor: &tasker_db::Actor,
+    worktree_path: &Path,
+    transcript_dir: &Path,
+) -> Result<LauncherResult> {
+    let transcript_path = transcript_dir.join("pi.jsonl");
+    let prompt = build_worker_prompt(
+        &claimed.task,
+        &claimed.run,
+        worktree_path,
+        request.worker_prompt.as_deref(),
+    )?;
+    let mut child = match Command::new(&request.pi_bin)
+        .arg("--mode")
+        .arg("rpc")
+        .current_dir(worktree_path)
+        .env("TASKER_API_URL", &request.api_url)
+        .env("TASKER_API_TOKEN", &request.api_token)
+        .env("TASKER_ACTOR_KIND", "worker_agent")
+        .env("TASKER_ACTOR_ID", &actor.id)
+        .env("TASKER_ACTOR_DISPLAY_NAME", &actor.display_name)
+        .env("TASKER_AGENT_RUN_ID", &claimed.run.id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return pi_failure_result(
+                claimed,
+                &transcript_path,
+                format!(
+                    "failed to start Pi Launcher process {}: {error}",
+                    request.pi_bin
+                ),
+                None,
+                None,
+            )
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let rpc_start = format!(
+            "{}\n",
+            serde_json::json!({ "type": "prompt", "prompt": prompt })
+        );
+        if let Err(error) = stdin.write_all(rpc_start.as_bytes()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return pi_failure_result(
+                claimed,
+                &transcript_path,
+                format!("failed to write Worker Role Prompt to Pi RPC stdin: {error}"),
+                None,
+                None,
+            );
+        }
+    }
+
+    let stdout = Arc::new(Mutex::new(String::new()));
+    let stderr = Arc::new(Mutex::new(String::new()));
+    let stdout_thread = child
+        .stdout
+        .take()
+        .map(|pipe| spawn_reader(pipe, Arc::clone(&stdout)));
+    let stderr_thread = child
+        .stderr
+        .take()
+        .map(|pipe| spawn_reader(pipe, Arc::clone(&stderr)));
+    let mut last_heartbeat = Instant::now();
+    let heartbeat_interval = Duration::from_secs((request.lease_seconds.max(2) / 2) as u64);
+    let mut question_detected = false;
+    let mut exit_code = None;
+
+    loop {
+        if contains_unattended_question(&locked_string(&stdout))
+            || contains_unattended_question(&locked_string(&stderr))
+        {
+            question_detected = true;
+            let _ = child.kill();
+            let _ = child.wait();
+            break;
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll Pi Launcher process")?
+        {
+            exit_code = status.code();
+            break;
+        }
+        if last_heartbeat.elapsed() >= heartbeat_interval {
+            tasker_db::heartbeat_run(pool, &claimed.run.id, request.lease_seconds, actor).await?;
+            last_heartbeat = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    if !question_detected {
+        if let Some(handle) = stdout_thread {
+            let _ = handle.join();
+        }
+        if let Some(handle) = stderr_thread {
+            let _ = handle.join();
+        }
+    }
+    let stdout_text = locked_string(&stdout);
+    let stderr_text = locked_string(&stderr);
+    let question_detected = question_detected
+        || contains_unattended_question(&stdout_text)
+        || contains_unattended_question(&stderr_text);
+    let (outcome, failure_reason) = if question_detected {
+        (
+            "failed".to_string(),
+            Some("unexpected question UI in unattended Worker Session".to_string()),
+        )
+    } else if exit_code == Some(0) {
+        ("completed".to_string(), None)
+    } else {
+        (
+            "failed".to_string(),
+            Some(format!(
+                "Pi Launcher exited with status {}",
+                exit_code.map_or_else(|| "signal".to_string(), |c| c.to_string())
+            )),
+        )
+    };
+    write_pi_transcript(
+        claimed,
+        &transcript_path,
+        exit_code,
+        &stdout_text,
+        &stderr_text,
+        question_detected,
+    )?;
+    Ok(pi_result(
+        claimed,
+        &transcript_path,
+        outcome,
+        failure_reason,
+        exit_code,
+        question_detected,
+    ))
+}
+
+fn spawn_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    output: Arc<Mutex<String>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let chunk = String::from_utf8_lossy(&buffer[..count]);
+                    if let Ok(mut locked) = output.lock() {
+                        locked.push_str(&chunk);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn locked_string(output: &Arc<Mutex<String>>) -> String {
+    output.lock().map(|text| text.clone()).unwrap_or_default()
+}
+
+fn pi_failure_result(
+    claimed: &tasker_db::ClaimedRun,
+    transcript_path: &Path,
+    failure_reason: String,
+    stdout: Option<&str>,
+    stderr: Option<&str>,
+) -> Result<LauncherResult> {
+    let stdout = stdout.unwrap_or_default();
+    let stderr = stderr.unwrap_or_default();
+    write_pi_transcript(claimed, transcript_path, None, stdout, stderr, false)?;
+    Ok(pi_result(
+        claimed,
+        transcript_path,
+        "failed".to_string(),
+        Some(failure_reason),
+        None,
+        false,
+    ))
+}
+
+fn pi_result(
+    claimed: &tasker_db::ClaimedRun,
+    transcript_path: &Path,
+    outcome: String,
+    failure_reason: Option<String>,
+    exit_code: Option<i32>,
+    question_detected: bool,
+) -> LauncherResult {
+    LauncherResult {
+        outcome: outcome.clone(),
+        failure_reason,
+        session_data: tasker_db::UpsertLauncherSessionData {
+            launcher_kind: "pi".to_string(),
+            session_id: Some(claimed.run.id.clone()),
+            model: None,
+            provider: None,
+            started_at: Some(claimed.run.created_at.clone()),
+            finished_at: None,
+            final_status: Some(outcome),
+            transcript_path: Some(transcript_path.display().to_string()),
+            raw_json: Some(
+                serde_json::json!({
+                    "exit_code": exit_code,
+                    "unattended_question_detected": question_detected,
+                })
+                .to_string(),
+            ),
+        },
+    }
+}
+
+fn write_pi_transcript(
+    claimed: &tasker_db::ClaimedRun,
+    transcript_path: &Path,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    question_detected: bool,
+) -> Result<()> {
+    let transcript = serde_json::json!({
+        "launcher": "pi",
+        "task_identifier": claimed.task.task.identifier,
+        "agent_run_id": claimed.run.id,
+        "status": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "unattended_question_detected": question_detected,
+    });
+    fs::write(transcript_path, format!("{}\n", transcript)).with_context(|| {
+        format!(
+            "failed to write Run Transcript {}",
+            transcript_path.display()
+        )
+    })
+}
+
+fn build_worker_prompt(
+    task: &tasker_db::TaskDetail,
+    run: &tasker_db::AgentRun,
+    worktree_path: &Path,
+    prompt_path: Option<&Path>,
+) -> Result<String> {
+    let base = if let Some(path) = prompt_path {
+        fs::read_to_string(path)
+            .with_context(|| format!("failed to read Worker Role Prompt {}", path.display()))?
+    } else {
+        "You are a Tasker Worker Agent running unattended. Do not ask questions or open interactive UI. Use the Tasker Pi Extension tools to read and update Tasker state, Workpad Notes, requirements, child tasks, and transitions.".to_string()
+    };
+    Ok(format!(
+        "{base}\n\nTask Identifier: {}\nTask Title: {}\nTask State: {}\nAgent Run ID: {}\nLocal Worktree: {}\nUse Tasker Pi Extension tools for Tasker mutations. When finished, update criteria/validation/workpad and request the appropriate Task State Transition.\n",
+        task.task.identifier,
+        task.task.title,
+        task.task.state,
+        run.id,
+        worktree_path.display()
+    ))
+}
+
+fn contains_unattended_question(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("question") || lower.contains("confirm") || lower.contains("unattended_question")
+}
+
 async fn prepare_local_worktree(
     pool: &SqlitePool,
     task: &tasker_db::TaskDetail,
     actor: &tasker_db::Actor,
-) -> Result<()> {
+) -> Result<PathBuf> {
     let queue = tasker_db::get_task_queue(pool, &task.task.task_queue_key)
         .await?
         .with_context(|| format!("Task Queue {} not found", task.task.task_queue_key))?;
@@ -131,7 +495,7 @@ async fn prepare_local_worktree(
         actor,
     )
     .await?;
-    Ok(())
+    Ok(worktree_path)
 }
 
 fn setup_local_worktree(
@@ -290,6 +654,15 @@ fn fake_workpad_note(task_identifier: &str, run_id: &str, outcome: &str) -> Stri
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn write_executable(path: &Path, body: &str) {
+        fs::write(path, body).expect("write script");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod");
+    }
+
     #[tokio::test]
     async fn fake_worker_prepares_local_worktree_and_records_task_links() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -342,6 +715,11 @@ mod tests {
                 fake_outcome: "completed".to_string(),
                 lease_seconds: 90,
                 retry_hold_seconds: None,
+                data_dir: temp.path().join("data"),
+                api_url: "http://127.0.0.1:4317".to_string(),
+                api_token: "token".to_string(),
+                pi_bin: "pi".to_string(),
+                worker_prompt: None,
             },
         )
         .await
@@ -361,6 +739,149 @@ mod tests {
             .task_links
             .iter()
             .any(|link| link.kind == "task_branch" && link.target == "tasker/TASK-1"));
+        let runs_dir = temp.path().join("data/runs");
+        assert!(runs_dir.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_worker_records_transcript_and_completes_successful_process() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let worktrees = temp.path().join("worktrees");
+        init_git_repo(&repo);
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        seed_ready_task(&pool, &repo, &worktrees).await;
+        let pi_bin = temp.path().join("fake-pi");
+        write_executable(
+            &pi_bin,
+            "#!/bin/sh\ntest \"$1 $2\" = \"--mode rpc\" || exit 7\ntest -n \"$TASKER_AGENT_RUN_ID\" || exit 8\ncat >/dev/null\necho '{\"event\":\"done\"}'\n",
+        );
+
+        let outcome = run_worker_once(
+            &pool,
+            WorkOnceRequest {
+                queue: "TASK".to_string(),
+                launcher: "pi".to_string(),
+                actor: "worker".to_string(),
+                fake_outcome: "completed".to_string(),
+                lease_seconds: 90,
+                retry_hold_seconds: None,
+                data_dir: temp.path().join("data"),
+                api_url: "http://127.0.0.1:4317".to_string(),
+                api_token: "token".to_string(),
+                pi_bin: pi_bin.display().to_string(),
+                worker_prompt: None,
+            },
+        )
+        .await
+        .expect("run worker");
+
+        let WorkOnceOutcome::Finished {
+            run_id, outcome, ..
+        } = outcome
+        else {
+            panic!("finished")
+        };
+        assert_eq!(outcome, "completed");
+        let detail = tasker_db::get_agent_run_detail(&pool, &run_id)
+            .await
+            .expect("load run")
+            .expect("run detail");
+        let session = detail.launcher_session_data.expect("session");
+        assert_eq!(session.launcher_kind, "pi");
+        assert!(Path::new(&session.transcript_path.expect("transcript")).is_file());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_worker_fails_unattended_question_process() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let worktrees = temp.path().join("worktrees");
+        init_git_repo(&repo);
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        seed_ready_task(&pool, &repo, &worktrees).await;
+        let pi_bin = temp.path().join("fake-pi-question");
+        write_executable(
+            &pi_bin,
+            "#!/bin/sh\ncat >/dev/null\necho '{\"event\":\"question\"}'\nsleep 5\n",
+        );
+
+        let outcome = run_worker_once(
+            &pool,
+            WorkOnceRequest {
+                queue: "TASK".to_string(),
+                launcher: "pi".to_string(),
+                actor: "worker".to_string(),
+                fake_outcome: "completed".to_string(),
+                lease_seconds: 90,
+                retry_hold_seconds: None,
+                data_dir: temp.path().join("data"),
+                api_url: "http://127.0.0.1:4317".to_string(),
+                api_token: "token".to_string(),
+                pi_bin: pi_bin.display().to_string(),
+                worker_prompt: None,
+            },
+        )
+        .await
+        .expect("run worker");
+
+        let WorkOnceOutcome::Finished {
+            run_id, outcome, ..
+        } = outcome
+        else {
+            panic!("finished")
+        };
+        assert_eq!(outcome, "failed");
+        let run = tasker_db::get_agent_run(&pool, &run_id)
+            .await
+            .expect("load run")
+            .expect("run");
+        assert_eq!(
+            run.failure_reason.as_deref(),
+            Some("unexpected question UI in unattended Worker Session")
+        );
+    }
+
+    async fn seed_ready_task(pool: &SqlitePool, repo: &Path, worktrees: &Path) {
+        tasker_db::create_task_queue(
+            pool,
+            &tasker_db::CreateTaskQueue {
+                key: "TASK".to_string(),
+                name: "Tasker".to_string(),
+                managed_source_repository: repo.display().to_string(),
+                main_branch: "main".to_string(),
+                worktree_root: worktrees.display().to_string(),
+                branch_template: "tasker/{task_identifier}".to_string(),
+                done_worktree_retention: false,
+                queue_concurrency_limit: None,
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        tasker_db::create_task(
+            pool,
+            &tasker_db::CreateTask {
+                queue_key: "TASK".to_string(),
+                title: "Test work".to_string(),
+                brief: "Do work".to_string(),
+                priority: "normal".to_string(),
+                state: "ready".to_string(),
+                review_required: false,
+                acceptance_criteria: vec!["Works".to_string()],
+                validation_items: vec!["Validated".to_string()],
+                tags: vec![],
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
     }
 
     #[test]
