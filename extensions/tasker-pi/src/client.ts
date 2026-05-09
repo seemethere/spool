@@ -17,6 +17,13 @@ export class TaskerClient {
     return this.request("PUT", `/tasks/${encodeURIComponent(identifier)}/workpad`, { actor, body }, signal);
   }
 
+  async appendWorkpad(identifier: string, actor: Actor, body: string, separator = "\n\n", signal?: AbortSignal): Promise<unknown> {
+    const task = await this.getTask(identifier, signal);
+    const existingBody = workpadBody(task);
+    const nextBody = existingBody.length === 0 ? body : `${existingBody}${separator}${body}`;
+    return this.updateWorkpad(identifier, actor, nextBody, signal);
+  }
+
   setAcceptanceCriterionStatus(input: RequirementStatusInput, actor: Actor, signal?: AbortSignal): Promise<unknown> {
     return this.request(
       "PUT",
@@ -77,6 +84,14 @@ export class TaskerClient {
     if (response.status === 204) return null;
     return response.json();
   }
+}
+
+function workpadBody(task: unknown): string {
+  if (!task || typeof task !== "object" || !("workpad_note" in task)) return "";
+  const note = (task as { workpad_note?: unknown }).workpad_note;
+  if (!note || typeof note !== "object" || !("body" in note)) return "";
+  const body = (note as { body?: unknown }).body;
+  return typeof body === "string" ? body : "";
 }
 
 export function configFromEnv(env: Record<string, string | undefined> = process.env): TaskerExtensionConfig {

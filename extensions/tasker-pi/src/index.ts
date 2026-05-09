@@ -3,11 +3,41 @@ import { TaskerClient, configFromEnv } from "./client";
 import type { ExtensionAPI, TaskerToolResult } from "./types";
 
 const Identifier = Type.String({ description: "Task Identifier, such as TASKER-1" });
+const CriterionStatus = Type.Union([Type.Literal("pending"), Type.Literal("satisfied"), Type.Literal("waived")]);
+const ValidationStatus = Type.Union([
+  Type.Literal("pending"),
+  Type.Literal("passed"),
+  Type.Literal("failed"),
+  Type.Literal("waived"),
+]);
+const Priority = Type.Union([Type.Literal("urgent"), Type.Literal("high"), Type.Literal("normal"), Type.Literal("low")]);
+const ChildTaskState = Type.Union([Type.Literal("backlog"), Type.Literal("ready")]);
+const TaskState = Type.Union([
+  Type.Literal("backlog"),
+  Type.Literal("ready"),
+  Type.Literal("in_progress"),
+  Type.Literal("human_review"),
+  Type.Literal("rework"),
+  Type.Literal("integrating"),
+  Type.Literal("done"),
+  Type.Literal("canceled"),
+]);
 const WorkpadParams = Type.Object({ identifier: Identifier, body: Type.String() });
-const StatusParams = Type.Object({
+const AppendWorkpadParams = Type.Object({
+  identifier: Identifier,
+  body: Type.String({ description: "Markdown to append to the current Workpad Note." }),
+  separator: Type.Optional(Type.String({ description: "Separator inserted before appended text; defaults to a blank line." })),
+});
+const AcceptanceCriterionStatusParams = Type.Object({
   identifier: Identifier,
   position: Type.Number({ description: "1-based requirement position" }),
-  status: Type.String(),
+  status: CriterionStatus,
+  waiver_reason: Type.Optional(Type.String()),
+});
+const ValidationItemStatusParams = Type.Object({
+  identifier: Identifier,
+  position: Type.Number({ description: "1-based requirement position" }),
+  status: ValidationStatus,
   waiver_reason: Type.Optional(Type.String()),
 });
 const ChildTaskParams = Type.Object({
@@ -16,15 +46,15 @@ const ChildTaskParams = Type.Object({
   brief: Type.String(),
   acceptance_criteria: Type.Array(Type.String()),
   validation_items: Type.Array(Type.String()),
-  priority: Type.Optional(Type.String()),
-  state: Type.Optional(Type.String()),
+  priority: Type.Optional(Priority),
+  state: Type.Optional(ChildTaskState),
   tags: Type.Optional(Type.Array(Type.String())),
   review_required: Type.Optional(Type.Boolean()),
   blocks_parent: Type.Optional(Type.Boolean()),
 });
 const TransitionParams = Type.Object({
   identifier: Identifier,
-  to_state: Type.String(),
+  to_state: TaskState,
   agent_run_id: Type.Optional(Type.String()),
 });
 
@@ -60,10 +90,22 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "tasker_append_workpad",
+    label: "Tasker: Append Workpad",
+    description: "Append Markdown to the current Workpad Note without manually replacing the whole note.",
+    parameters: AppendWorkpadParams,
+    async execute(_id, params, signal) {
+      return asToolResult(
+        await client.appendWorkpad(params.identifier, config.actor, params.body, params.separator ?? "\n\n", signal),
+      );
+    },
+  });
+
+  pi.registerTool({
     name: "tasker_set_acceptance_criterion_status",
     label: "Tasker: Set Acceptance Criterion Status",
     description: "Set an Acceptance Criterion status by 1-based position.",
-    parameters: StatusParams,
+    parameters: AcceptanceCriterionStatusParams,
     async execute(_id, params, signal) {
       return asToolResult(await client.setAcceptanceCriterionStatus(params, config.actor, signal));
     },
@@ -73,7 +115,7 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
     name: "tasker_set_validation_item_status",
     label: "Tasker: Set Validation Item Status",
     description: "Set a Validation Item status by 1-based position.",
-    parameters: StatusParams,
+    parameters: ValidationItemStatusParams,
     async execute(_id, params, signal) {
       return asToolResult(await client.setValidationItemStatus(params, config.actor, signal));
     },
