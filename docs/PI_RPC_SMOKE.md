@@ -43,7 +43,7 @@ cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data 
 cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data task show <task-identifier>
 ```
 
-The Run Transcript is stored under `.tasker/data/runs/<agent-run-id>/`. If pi exits nonzero or emits an unattended question/confirmation event, Tasker records a failed Agent Run with a clear failure reason.
+The Run Transcript is stored under `.tasker/data/runs/<agent-run-id>/`. The Pi Launcher treats stdout as JSONL RPC events: fire-and-forget extension UI requests such as `notify` are safe to ignore, while blocking `select`, `confirm`, `input`, or `editor` extension UI requests fail the unattended Agent Run with a clear failure reason.
 
 ## First Dogfood Run Notes
 

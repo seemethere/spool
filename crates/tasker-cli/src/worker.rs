@@ -255,20 +255,21 @@ async fn run_pi_launcher(
         .map(|pipe| spawn_reader(pipe, Arc::clone(&stderr)));
     let mut last_heartbeat = Instant::now();
     let heartbeat_interval = Duration::from_secs((request.lease_seconds.max(2) / 2) as u64);
-    let mut question_detected = false;
+    let mut blocking_ui_request: Option<String> = None;
+    let mut agent_ended = false;
     let mut exit_code = None;
 
     loop {
         let current_stdout = locked_string(&stdout);
-        if contains_unattended_question(&current_stdout)
-            || contains_unattended_question(&locked_string(&stderr))
-        {
-            question_detected = true;
+        let event_scan = scan_pi_rpc_stdout(&current_stdout);
+        if let Some(reason) = event_scan.blocking_ui_request {
+            blocking_ui_request = Some(reason);
             let _ = child.kill();
             let _ = child.wait();
             break;
         }
-        if contains_agent_end(&current_stdout) {
+        if event_scan.agent_ended {
+            agent_ended = true;
             exit_code = Some(0);
             drop(stdin_guard.take());
             let _ = child.kill();
@@ -289,7 +290,7 @@ async fn run_pi_launcher(
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    if !question_detected {
+    if blocking_ui_request.is_none() {
         if let Some(handle) = stdout_thread {
             let _ = handle.join();
         }
@@ -299,16 +300,19 @@ async fn run_pi_launcher(
     }
     let stdout_text = locked_string(&stdout);
     let stderr_text = locked_string(&stderr);
-    let question_detected = question_detected
-        || contains_unattended_question(&stdout_text)
-        || contains_unattended_question(&stderr_text);
-    let (outcome, failure_reason) = if question_detected {
+    let final_scan = scan_pi_rpc_stdout(&stdout_text);
+    let blocking_ui_request = blocking_ui_request.or(final_scan.blocking_ui_request);
+    agent_ended = agent_ended || final_scan.agent_ended;
+    let ui_blocked = blocking_ui_request.is_some();
+    let (outcome, failure_reason) = if let Some(reason) = blocking_ui_request {
+        ("failed".to_string(), Some(reason))
+    } else if agent_ended {
+        ("completed".to_string(), None)
+    } else if exit_code == Some(0) {
         (
             "failed".to_string(),
-            Some("unexpected question UI in unattended Worker Session".to_string()),
+            Some("Pi Launcher exited without agent_end event".to_string()),
         )
-    } else if exit_code == Some(0) {
-        ("completed".to_string(), None)
     } else {
         (
             "failed".to_string(),
@@ -324,7 +328,7 @@ async fn run_pi_launcher(
         exit_code,
         &stdout_text,
         &stderr_text,
-        question_detected,
+        ui_blocked,
     )?;
     Ok(pi_result(
         claimed,
@@ -332,7 +336,7 @@ async fn run_pi_launcher(
         outcome,
         failure_reason,
         exit_code,
-        question_detected,
+        ui_blocked,
     ))
 }
 
@@ -459,45 +463,41 @@ fn build_worker_prompt(
     ))
 }
 
-fn contains_unattended_question(output: &str) -> bool {
-    output.lines().any(|line| {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PiRpcEventScan {
+    agent_ended: bool,
+    blocking_ui_request: Option<String>,
+}
+
+fn scan_pi_rpc_stdout(output: &str) -> PiRpcEventScan {
+    let mut scan = PiRpcEventScan {
+        agent_ended: false,
+        blocking_ui_request: None,
+    };
+    for line in output.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            let lower = line.to_ascii_lowercase();
-            return lower.contains("unattended_question")
-                || lower.contains("confirmation_required");
+            continue;
         };
         let type_name = value
             .get("type")
             .and_then(|kind| kind.as_str())
             .unwrap_or_default();
-        let event_name = value
-            .get("event")
-            .and_then(|kind| kind.as_str())
-            .unwrap_or_default();
-        let method_name = value
-            .get("method")
-            .and_then(|kind| kind.as_str())
-            .unwrap_or_default();
-        type_name == "unattended_question"
-            || event_name == "question"
-            || event_name == "confirmation_required"
-            || matches!(method_name, "confirm" | "input" | "select" | "editor")
-    })
-}
-
-fn contains_agent_end(output: &str) -> bool {
-    output.lines().any(|line| {
-        serde_json::from_str::<serde_json::Value>(line)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("type")
-                    .and_then(|kind| kind.as_str())
-                    .map(str::to_string)
-            })
-            .as_deref()
-            == Some("agent_end")
-    })
+        if type_name == "agent_end" {
+            scan.agent_ended = true;
+        } else if type_name == "extension_ui_request" {
+            let method_name = value
+                .get("method")
+                .and_then(|kind| kind.as_str())
+                .unwrap_or_default();
+            if matches!(method_name, "confirm" | "input" | "select" | "editor") {
+                scan.blocking_ui_request = Some(format!(
+                    "blocking extension UI request {method_name} in unattended Worker Session"
+                ));
+                break;
+            }
+        }
+    }
+    scan
 }
 
 async fn prepare_local_worktree(
@@ -848,7 +848,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn pi_worker_fails_unattended_question_process() {
+    async fn pi_worker_fails_zero_exit_without_agent_end_event() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
         let worktrees = temp.path().join("worktrees");
@@ -857,10 +857,10 @@ mod tests {
         let pool = tasker_db::connect(&db_path).await.expect("connect");
         tasker_db::run_migrations(&pool).await.expect("migrate");
         seed_ready_task(&pool, &repo, &worktrees).await;
-        let pi_bin = temp.path().join("fake-pi-question");
+        let pi_bin = temp.path().join("fake-pi-no-agent-end");
         write_executable(
             &pi_bin,
-            "#!/bin/sh\nread line\necho '{\"event\":\"question\"}'\nsleep 5\n",
+            "#!/bin/sh\nread line\necho '{\"type\":\"turn_end\"}'\n",
         );
 
         let outcome = run_worker_once(
@@ -896,7 +896,134 @@ mod tests {
             .expect("run");
         assert_eq!(
             run.failure_reason.as_deref(),
-            Some("unexpected question UI in unattended Worker Session")
+            Some("Pi Launcher exited without agent_end event")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_worker_fails_blocking_extension_ui_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let worktrees = temp.path().join("worktrees");
+        init_git_repo(&repo);
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        seed_ready_task(&pool, &repo, &worktrees).await;
+        let pi_bin = temp.path().join("fake-pi-question");
+        write_executable(
+            &pi_bin,
+            "#!/bin/sh\nread line\necho '{\"type\":\"extension_ui_request\",\"id\":\"ui-1\",\"method\":\"input\"}'\nsleep 5\n",
+        );
+
+        let outcome = run_worker_once(
+            &pool,
+            WorkOnceRequest {
+                queue: "TASK".to_string(),
+                launcher: "pi".to_string(),
+                actor: "worker".to_string(),
+                fake_outcome: "completed".to_string(),
+                lease_seconds: 90,
+                retry_hold_seconds: None,
+                data_dir: temp.path().join("data"),
+                api_url: "http://127.0.0.1:4317".to_string(),
+                api_token: "token".to_string(),
+                pi_bin: pi_bin.display().to_string(),
+                pi_extension: None,
+                worker_prompt: None,
+            },
+        )
+        .await
+        .expect("run worker");
+
+        let WorkOnceOutcome::Finished {
+            run_id, outcome, ..
+        } = outcome
+        else {
+            panic!("finished")
+        };
+        assert_eq!(outcome, "failed");
+        let run = tasker_db::get_agent_run(&pool, &run_id)
+            .await
+            .expect("load run")
+            .expect("run");
+        assert_eq!(
+            run.failure_reason.as_deref(),
+            Some("blocking extension UI request input in unattended Worker Session")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_worker_ignores_fire_and_forget_extension_ui_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let worktrees = temp.path().join("worktrees");
+        init_git_repo(&repo);
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        seed_ready_task(&pool, &repo, &worktrees).await;
+        let pi_bin = temp.path().join("fake-pi-notify");
+        write_executable(
+            &pi_bin,
+            "#!/bin/sh\nread line\necho '{\"type\":\"extension_ui_request\",\"id\":\"ui-1\",\"method\":\"notify\",\"message\":\"ok\"}'\necho '{\"event\":\"question\"}'\necho '{\"type\":\"agent_end\"}'\n",
+        );
+
+        let outcome = run_worker_once(
+            &pool,
+            WorkOnceRequest {
+                queue: "TASK".to_string(),
+                launcher: "pi".to_string(),
+                actor: "worker".to_string(),
+                fake_outcome: "completed".to_string(),
+                lease_seconds: 90,
+                retry_hold_seconds: None,
+                data_dir: temp.path().join("data"),
+                api_url: "http://127.0.0.1:4317".to_string(),
+                api_token: "secret-token-that-must-not-be-in-raw-json".to_string(),
+                pi_bin: pi_bin.display().to_string(),
+                pi_extension: None,
+                worker_prompt: None,
+            },
+        )
+        .await
+        .expect("run worker");
+
+        let WorkOnceOutcome::Finished {
+            run_id, outcome, ..
+        } = outcome
+        else {
+            panic!("finished")
+        };
+        assert_eq!(outcome, "completed");
+        let detail = tasker_db::get_agent_run_detail(&pool, &run_id)
+            .await
+            .expect("load run")
+            .expect("run detail");
+        let raw_json = detail
+            .launcher_session_data
+            .expect("session")
+            .raw_json
+            .expect("raw json");
+        assert!(!raw_json.contains("secret-token-that-must-not-be-in-raw-json"));
+    }
+
+    #[test]
+    fn pi_rpc_stdout_scan_uses_structured_jsonl_events() {
+        let scan = scan_pi_rpc_stdout(
+            "not json question\n{\"type\":\"extension_ui_request\",\"method\":\"notify\"}\n{\"event\":\"question\"}\n{\"type\":\"agent_end\"}\n",
+        );
+        assert!(scan.agent_ended);
+        assert_eq!(scan.blocking_ui_request, None);
+
+        let scan = scan_pi_rpc_stdout(
+            "{\"type\":\"extension_ui_request\",\"method\":\"confirm\"}\n{\"type\":\"agent_end\"}\n",
+        );
+        assert_eq!(
+            scan.blocking_ui_request.as_deref(),
+            Some("blocking extension UI request confirm in unattended Worker Session")
         );
     }
 
