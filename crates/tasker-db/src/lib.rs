@@ -386,6 +386,12 @@ pub struct UpdateRequirementStatus {
     pub waiver_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransitionTaskState {
+    pub to_state: String,
+    pub agent_run_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
 pub struct AgentRun {
     pub id: String,
@@ -811,6 +817,129 @@ pub async fn update_workpad_note(
     get_task_detail(pool, identifier)
         .await?
         .with_context(|| format!("updated Task {identifier} was not found"))
+}
+
+pub async fn transition_task_state(
+    pool: &SqlitePool,
+    identifier: &str,
+    input: &TransitionTaskState,
+    actor: &Actor,
+) -> Result<TaskDetail> {
+    validate_actor(actor)?;
+    validate_state(&input.to_state)?;
+
+    let mut tx = pool.begin().await.context("failed to begin transaction")?;
+    let task = sqlx::query_as::<_, Task>(
+        r#"
+        SELECT
+            tasks.id,
+            tasks.task_queue_id,
+            task_queues.key AS task_queue_key,
+            tasks.identifier,
+            tasks.sequence,
+            tasks.title,
+            tasks.brief,
+            tasks.priority,
+            tasks.state,
+            tasks.review_required,
+            tasks.created_at,
+            tasks.updated_at
+        FROM tasks
+        JOIN task_queues ON task_queues.id = tasks.task_queue_id
+        WHERE tasks.identifier = ?
+        "#,
+    )
+    .bind(identifier)
+    .fetch_optional(&mut *tx)
+    .await
+    .with_context(|| format!("failed to load Task {identifier}"))?
+    .with_context(|| format!("Task {identifier} not found"))?;
+
+    validate_transition(&task, &input.to_state, actor)?;
+    if input.to_state == "ready" {
+        ensure_ready_requirements_exist(&mut tx, &task.id).await?;
+    }
+    if requires_completion_gates(&input.to_state) {
+        ensure_completion_gates_pass(&mut tx, &task.id).await?;
+    }
+    if actor.kind == "worker_agent" {
+        ensure_worker_owns_active_run(&mut tx, &task.id, input.agent_run_id.as_deref(), actor)
+            .await?;
+    }
+
+    let update = sqlx::query(
+        "UPDATE tasks SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?",
+    )
+    .bind(&input.to_state)
+    .bind(&task.id)
+    .bind(&task.state)
+    .execute(&mut *tx)
+    .await
+    .context("failed to transition Task State")?;
+    if update.rows_affected() != 1 {
+        anyhow::bail!("Task State changed while attempting State Transition");
+    }
+    let deleted_holds = sqlx::query("DELETE FROM task_retry_holds WHERE task_id = ?")
+        .bind(&task.id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to clear Retry Hold after State Transition")?;
+    if deleted_holds.rows_affected() > 0 {
+        append_audit_event_in_tx(
+            &mut tx,
+            actor,
+            "task.retry_hold_cleared",
+            "task",
+            &task.id,
+            serde_json::json!({ "identifier": identifier, "reason": "Task State changed" }),
+        )
+        .await?;
+    }
+    if input.to_state == "canceled" {
+        let canceled_runs = sqlx::query(
+            r#"
+            UPDATE agent_runs
+            SET outcome = 'canceled', finished_at = CURRENT_TIMESTAMP, failure_reason = 'Task canceled'
+            WHERE task_id = ? AND outcome IS NULL
+            "#,
+        )
+        .bind(&task.id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to cancel active Agent Runs")?;
+        if canceled_runs.rows_affected() > 0 {
+            append_audit_event_in_tx(
+                &mut tx,
+                actor,
+                "agent_run.canceled_for_task",
+                "task",
+                &task.id,
+                serde_json::json!({
+                    "identifier": identifier,
+                    "canceled_runs": canceled_runs.rows_affected(),
+                }),
+            )
+            .await?;
+        }
+    }
+    append_audit_event_in_tx(
+        &mut tx,
+        actor,
+        "task.state_transitioned",
+        "task",
+        &task.id,
+        serde_json::json!({
+            "identifier": identifier,
+            "from": task.state,
+            "to": input.to_state,
+        }),
+    )
+    .await?;
+
+    tx.commit().await.context("failed to commit transaction")?;
+    get_task_detail(pool, identifier)
+        .await?
+        .with_context(|| format!("transitioned Task {identifier} was not found"))
 }
 
 pub async fn update_acceptance_criterion_status(
@@ -1441,6 +1570,150 @@ fn agent_run_select_sql(where_clause: &str) -> String {
     )
 }
 
+fn validate_transition(task: &Task, to_state: &str, actor: &Actor) -> Result<()> {
+    match actor.kind.as_str() {
+        "operator" | "review_agent" | "worker_agent" => {}
+        _ => anyhow::bail!(
+            "State Transitions require an Operator, Review Agent, or Worker Agent actor"
+        ),
+    }
+    if task.state == to_state {
+        anyhow::bail!("Task is already in requested Task State");
+    }
+    let allowed = match task.state.as_str() {
+        "backlog" => matches!(to_state, "ready" | "canceled"),
+        "ready" => matches!(to_state, "in_progress" | "canceled"),
+        "in_progress" => matches!(
+            to_state,
+            "human_review" | "integrating" | "done" | "canceled"
+        ),
+        "human_review" => matches!(to_state, "rework" | "integrating" | "canceled"),
+        "rework" => matches!(
+            to_state,
+            "in_progress" | "human_review" | "integrating" | "canceled"
+        ),
+        "integrating" => matches!(to_state, "done" | "rework" | "canceled"),
+        "done" | "canceled" => false,
+        _ => false,
+    };
+    if !allowed {
+        anyhow::bail!(
+            "State Transition from {} to {to_state} is not allowed",
+            task.state
+        );
+    }
+    if task.review_required && to_state == "integrating" && task.state != "human_review" {
+        anyhow::bail!(
+            "Review-required Tasks must transition through Human Review before Integrating"
+        );
+    }
+    if actor.kind == "worker_agent" {
+        if to_state == "integrating" {
+            if task.review_required {
+                anyhow::bail!(
+                    "Worker Agent cannot transition review-required Tasks to Integrating"
+                );
+            }
+        } else if to_state != "human_review" && to_state != "canceled" {
+            anyhow::bail!("Worker Agent cannot request this State Transition");
+        }
+    }
+    Ok(())
+}
+
+fn requires_completion_gates(to_state: &str) -> bool {
+    matches!(to_state, "human_review" | "integrating" | "done")
+}
+
+async fn ensure_ready_requirements_exist(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: &str,
+) -> Result<()> {
+    let criteria_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM acceptance_criteria WHERE task_id = ?")
+            .bind(task_id)
+            .fetch_one(&mut **tx)
+            .await
+            .context("failed to count Acceptance Criteria")?;
+    let validation_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM validation_items WHERE task_id = ?")
+            .bind(task_id)
+            .fetch_one(&mut **tx)
+            .await
+            .context("failed to count Validation Items")?;
+    if criteria_count == 0 || validation_count == 0 {
+        anyhow::bail!(
+            "Ready Tasks require at least one Acceptance Criterion and one Validation Item"
+        );
+    }
+    Ok(())
+}
+
+async fn ensure_worker_owns_active_run(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: &str,
+    agent_run_id: Option<&str>,
+    actor: &Actor,
+) -> Result<()> {
+    let Some(agent_run_id) = agent_run_id else {
+        anyhow::bail!("Worker Agent Integrating transition requires an active Agent Run ID");
+    };
+    let count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*) FROM agent_runs
+        WHERE id = ?
+          AND task_id = ?
+          AND outcome IS NULL
+          AND lease_expires_at > CURRENT_TIMESTAMP
+          AND worker_actor_kind = ?
+          AND worker_actor_id = ?
+        "#,
+    )
+    .bind(agent_run_id)
+    .bind(task_id)
+    .bind(&actor.kind)
+    .bind(&actor.id)
+    .fetch_one(&mut **tx)
+    .await
+    .context("failed to verify active Agent Run ownership")?;
+    if count != 1 {
+        anyhow::bail!("Worker Agent does not own an active Claim Lease for this Task");
+    }
+    Ok(())
+}
+
+async fn ensure_completion_gates_pass(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: &str,
+) -> Result<()> {
+    let unsatisfied_criteria: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*) FROM acceptance_criteria
+        WHERE task_id = ? AND status NOT IN ('satisfied', 'waived')
+        "#,
+    )
+    .bind(task_id)
+    .fetch_one(&mut **tx)
+    .await
+    .context("failed to check Acceptance Criteria gates")?;
+    let unpassed_validation: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*) FROM validation_items
+        WHERE task_id = ? AND status NOT IN ('passed', 'waived')
+        "#,
+    )
+    .bind(task_id)
+    .fetch_one(&mut **tx)
+    .await
+    .context("failed to check Validation Item gates")?;
+    if unsatisfied_criteria > 0 || unpassed_validation > 0 {
+        anyhow::bail!(
+            "State Transition requires all Acceptance Criteria and Validation Items to pass gates"
+        );
+    }
+    Ok(())
+}
+
 fn validate_task_queue(input: &CreateTaskQueue) -> Result<()> {
     ensure_not_blank("Task Queue Key", &input.key)?;
     if input.key.contains('/') || input.key.contains('\\') {
@@ -1965,6 +2238,392 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn transition_task_state_enforces_gates_and_audit_events() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Transition"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
+        let claimed = claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim")
+            .expect("claimed");
+
+        let error = transition_task_state(
+            &pool,
+            "TASK-1",
+            &TransitionTaskState {
+                to_state: "integrating".to_string(),
+                agent_run_id: None,
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect_err("gates fail");
+        assert!(error.to_string().contains("pass gates"));
+
+        update_acceptance_criterion_status(
+            &pool,
+            "TASK-1",
+            1,
+            &UpdateRequirementStatus {
+                status: "satisfied".to_string(),
+                waiver_reason: None,
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("criterion");
+        update_validation_item_status(
+            &pool,
+            "TASK-1",
+            1,
+            &UpdateRequirementStatus {
+                status: "passed".to_string(),
+                waiver_reason: None,
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("validation");
+
+        let detail = transition_task_state(
+            &pool,
+            "TASK-1",
+            &TransitionTaskState {
+                to_state: "integrating".to_string(),
+                agent_run_id: Some(claimed.run.id.clone()),
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("transition");
+        assert_eq!(detail.task.state, "integrating");
+        assert!(list_task_audit_events(&pool, "TASK-1")
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "task.state_transitioned"));
+    }
+
+    #[tokio::test]
+    async fn transition_task_state_requires_requirements_before_ready() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        let mut task = sample_task("TASK", "Sparse backlog");
+        task.state = "backlog".to_string();
+        task.acceptance_criteria.clear();
+        task.validation_items.clear();
+        create_task(&pool, &task, &Actor::operator("tester"))
+            .await
+            .expect("create backlog task");
+
+        let error = transition_task_state(
+            &pool,
+            "TASK-1",
+            &TransitionTaskState {
+                to_state: "ready".to_string(),
+                agent_run_id: None,
+            },
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect_err("ready without requirements fails");
+
+        assert!(error.to_string().contains("Ready Tasks require"));
+    }
+
+    #[tokio::test]
+    async fn transition_task_state_rejects_noop_transition_without_clearing_retry_hold() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Held"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
+        let claimed = claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim")
+            .expect("claimed");
+        finish_run(
+            &pool,
+            &claimed.run.id,
+            &FinishRunInput {
+                outcome: "failed".to_string(),
+                failure_reason: Some("failed".to_string()),
+                retry_hold_seconds: Some(60),
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("failed run");
+
+        let error = transition_task_state(
+            &pool,
+            "TASK-1",
+            &TransitionTaskState {
+                to_state: "in_progress".to_string(),
+                agent_run_id: None,
+            },
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect_err("noop fails");
+        assert!(error.to_string().contains("already in requested"));
+        assert!(claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_transition_cancels_active_agent_runs() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Cancel"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
+        let claimed = claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim")
+            .expect("claimed");
+
+        transition_task_state(
+            &pool,
+            "TASK-1",
+            &TransitionTaskState {
+                to_state: "canceled".to_string(),
+                agent_run_id: None,
+            },
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("cancel");
+
+        let run = get_agent_run(&pool, &claimed.run.id)
+            .await
+            .expect("load run")
+            .expect("run exists");
+        assert_eq!(run.outcome.as_deref(), Some("canceled"));
+    }
+
+    #[tokio::test]
+    async fn worker_agent_transitions_require_active_claim_lease() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "No lease"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
+        transition_task_state(
+            &pool,
+            "TASK-1",
+            &TransitionTaskState {
+                to_state: "in_progress".to_string(),
+                agent_run_id: None,
+            },
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("start task");
+
+        let error = transition_task_state(
+            &pool,
+            "TASK-1",
+            &TransitionTaskState {
+                to_state: "canceled".to_string(),
+                agent_run_id: None,
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect_err("worker without lease fails");
+        assert!(error.to_string().contains("active Agent Run ID"));
+    }
+
+    #[tokio::test]
+    async fn in_progress_to_done_is_allowed_when_gates_pass() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Done"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
+        transition_task_state(
+            &pool,
+            "TASK-1",
+            &TransitionTaskState {
+                to_state: "in_progress".to_string(),
+                agent_run_id: None,
+            },
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("start");
+        update_acceptance_criterion_status(
+            &pool,
+            "TASK-1",
+            1,
+            &UpdateRequirementStatus {
+                status: "satisfied".to_string(),
+                waiver_reason: None,
+            },
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("criterion");
+        update_validation_item_status(
+            &pool,
+            "TASK-1",
+            1,
+            &UpdateRequirementStatus {
+                status: "passed".to_string(),
+                waiver_reason: None,
+            },
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("validation");
+
+        let detail = transition_task_state(
+            &pool,
+            "TASK-1",
+            &TransitionTaskState {
+                to_state: "done".to_string(),
+                agent_run_id: None,
+            },
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("done");
+        assert_eq!(detail.task.state, "done");
+    }
+
+    #[tokio::test]
+    async fn transition_task_state_rejects_invalid_edges_and_worker_review_required_integrating() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        let mut task = sample_task("TASK", "Review required");
+        task.review_required = true;
+        create_task(&pool, &task, &Actor::operator("tester"))
+            .await
+            .expect("create task");
+
+        let invalid = transition_task_state(
+            &pool,
+            "TASK-1",
+            &TransitionTaskState {
+                to_state: "done".to_string(),
+                agent_run_id: None,
+            },
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect_err("ready to done invalid");
+        assert!(invalid.to_string().contains("not allowed"));
+
+        claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim")
+            .expect("claimed");
+        update_acceptance_criterion_status(
+            &pool,
+            "TASK-1",
+            1,
+            &UpdateRequirementStatus {
+                status: "satisfied".to_string(),
+                waiver_reason: None,
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("criterion");
+        update_validation_item_status(
+            &pool,
+            "TASK-1",
+            1,
+            &UpdateRequirementStatus {
+                status: "passed".to_string(),
+                waiver_reason: None,
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("validation");
+        let forbidden = transition_task_state(
+            &pool,
+            "TASK-1",
+            &TransitionTaskState {
+                to_state: "integrating".to_string(),
+                agent_run_id: None,
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect_err("worker cannot integrate review required");
+        assert!(forbidden.to_string().contains("Review-required"));
     }
 
     #[tokio::test]

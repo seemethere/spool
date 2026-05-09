@@ -140,6 +140,23 @@ enum TaskCommand {
     },
     /// Show a Task by Task Identifier.
     Show { identifier: String },
+    /// Request a normal State Transition for a Task.
+    Transition {
+        /// Task Identifier.
+        identifier: String,
+        /// Target Task State.
+        #[arg(long)]
+        to: String,
+        /// Actor kind for audit attribution and permission checks.
+        #[arg(long, default_value = "operator")]
+        actor_kind: String,
+        /// Actor display name for audit attribution.
+        #[arg(long, default_value = "local-operator")]
+        actor: String,
+        /// Active Agent Run ID required for Worker Agent transition to Integrating.
+        #[arg(long)]
+        agent_run_id: Option<String>,
+    },
     /// Update Acceptance Criterion status for a Task.
     Criterion {
         #[command(subcommand)]
@@ -368,6 +385,32 @@ async fn task(paths: &TaskerPaths, db_path_overridden: bool, command: TaskComman
                 .await?
                 .with_context(|| format!("Task {identifier} not found"))?;
             output::print_task_detail(&detail)?;
+        }
+        TaskCommand::Transition {
+            identifier,
+            to,
+            actor_kind,
+            actor,
+            agent_run_id,
+        } => {
+            let detail = tasker_db::transition_task_state(
+                &pool,
+                &identifier,
+                &tasker_db::TransitionTaskState {
+                    to_state: bootstrap::normalize_label(&to),
+                    agent_run_id,
+                },
+                &tasker_db::Actor {
+                    kind: actor_kind,
+                    id: actor.clone(),
+                    display_name: actor,
+                },
+            )
+            .await?;
+            println!(
+                "transitioned Task {} to {}",
+                detail.task.identifier, detail.task.state
+            );
         }
         TaskCommand::Criterion { command } => match command {
             RequirementCommand::Set {
@@ -810,6 +853,24 @@ Implement Bootstrap Task Creation.
             .unwrap()
             .body
             .contains("Fake Agent Launcher processed Task TASK-1"));
+        task(
+            &paths,
+            false,
+            TaskCommand::Transition {
+                identifier: "TASK-1".to_string(),
+                to: "integrating".to_string(),
+                actor_kind: "operator".to_string(),
+                actor: "tester".to_string(),
+                agent_run_id: None,
+            },
+        )
+        .await
+        .expect("transition");
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("get task")
+            .expect("task");
+        assert_eq!(detail.task.state, "integrating");
         status(&paths, false).await.expect("status");
     }
 

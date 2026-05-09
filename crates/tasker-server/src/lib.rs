@@ -54,6 +54,13 @@ pub struct UpdateRequirementStatusRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct TransitionTaskRequest {
+    pub actor: tasker_db::Actor,
+    pub to_state: String,
+    pub agent_run_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ClaimNextRequest {
     pub actor: tasker_db::Actor,
     pub worker_id: String,
@@ -93,6 +100,7 @@ pub fn router(app_version: impl Into<String>, pool: SqlitePool) -> Router {
             "/tasks/{identifier}/workpad",
             axum::routing::put(update_workpad),
         )
+        .route("/tasks/{identifier}/transition", post(transition_task))
         .route(
             "/tasks/{identifier}/acceptance-criteria/{position}/status",
             axum::routing::put(update_acceptance_criterion_status),
@@ -184,6 +192,27 @@ async fn get_task(
             format!("Task {identifier} not found"),
         )),
     }
+}
+
+async fn transition_task(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+    Json(request): Json<TransitionTaskRequest>,
+) -> Result<Json<tasker_db::TaskDetail>, (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    tasker_db::transition_task_state(
+        &state.pool,
+        &identifier,
+        &tasker_db::TransitionTaskState {
+            to_state: request.to_state,
+            agent_run_id: request.agent_run_id,
+        },
+        &request.actor,
+    )
+    .await
+    .map(Json)
+    .map_err(task_mutation_error)
 }
 
 async fn update_acceptance_criterion_status(
@@ -453,6 +482,9 @@ fn task_mutation_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>
     if message.contains("Worker Agents cannot create Waivers")
         || message.contains("Waivers require an Operator or Review Agent")
         || message.contains("require a Worker Agent actor")
+        || message.contains("Worker Agent cannot")
+        || message.contains("active Agent Run ID")
+        || message.contains("active Claim Lease")
     {
         error_response(StatusCode::FORBIDDEN, message)
     } else if message.contains("not found") {
@@ -463,6 +495,10 @@ fn task_mutation_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>
         || message.contains("invalid requirement status")
         || message.contains("only supports Backlog or Ready")
         || message.contains("invalid Agent Run outcome")
+        || message.contains("State Transition")
+        || message.contains("already in requested")
+        || message.contains("pass gates")
+        || message.contains("Ready Tasks require")
         || message.contains("must be positive")
         || message.contains("explicit reason")
         || message.contains("position must")
@@ -669,6 +705,18 @@ mod tests {
             .unwrap();
         assert_eq!(show.status(), StatusCode::OK);
 
+        let start = app
+            .clone()
+            .oneshot(transition_request(
+                "TASK-1",
+                "in_progress",
+                "operator",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
         let criterion = app
             .clone()
             .oneshot(update_requirement_request(
@@ -694,6 +742,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(validation.status(), StatusCode::OK);
+
+        let transition = app
+            .clone()
+            .oneshot(transition_request(
+                "TASK-1",
+                "integrating",
+                "operator",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(transition.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(transition.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["task"]["state"], "integrating");
 
         let update = app
             .clone()
@@ -1057,6 +1122,31 @@ mod tests {
         Request::builder()
             .method("POST")
             .uri("/tasks/bootstrap")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(request.to_string()))
+            .unwrap()
+    }
+
+    fn transition_request(
+        identifier: &str,
+        to_state: &str,
+        actor_kind: &str,
+        token: &str,
+    ) -> Request<Body> {
+        let request = serde_json::json!({
+            "actor": {
+                "kind": actor_kind,
+                "id": "worker",
+                "display_name": "worker"
+            },
+            "to_state": to_state,
+            "agent_run_id": null
+        });
+
+        Request::builder()
+            .method("POST")
+            .uri(format!("/tasks/{identifier}/transition"))
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {token}"))
             .body(Body::from(request.to_string()))
