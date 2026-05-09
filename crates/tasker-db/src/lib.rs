@@ -3,9 +3,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     FromRow, SqlitePool,
 };
+use std::time::Duration;
 use uuid::Uuid;
 
 pub const LOCAL_TOKEN_NAME: &str = "local";
@@ -18,7 +19,9 @@ pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
     let options = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(30));
 
     SqlitePoolOptions::new()
         .max_connections(5)
@@ -1373,9 +1376,7 @@ pub async fn status_by_queue_and_state(pool: &SqlitePool) -> Result<Vec<QueueSta
     .context("failed to load Tasker status")
 }
 
-pub async fn active_agent_runs_for_status(
-    pool: &SqlitePool,
-) -> Result<Vec<ActiveAgentRunStatus>> {
+pub async fn active_agent_runs_for_status(pool: &SqlitePool) -> Result<Vec<ActiveAgentRunStatus>> {
     sqlx::query_as::<_, ActiveAgentRunStatus>(
         r#"
         SELECT
