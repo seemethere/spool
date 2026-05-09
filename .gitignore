@@ -1,3 +1,6 @@
 .ref
 /target/
 /.tasker/
+
+# extension deps
+/extensions/*/node_modules/

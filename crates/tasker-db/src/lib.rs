@@ -295,6 +295,19 @@ pub struct CreateTask {
     pub tags: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateChildTask {
+    pub title: String,
+    pub brief: String,
+    pub priority: String,
+    pub state: String,
+    pub review_required: bool,
+    pub acceptance_criteria: Vec<String>,
+    pub validation_items: Vec<String>,
+    pub tags: Vec<String>,
+    pub blocks_parent: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
 pub struct Task {
     pub id: String,
@@ -565,6 +578,160 @@ pub async fn create_task(
     get_task_detail(pool, &identifier)
         .await?
         .with_context(|| format!("created Task {identifier} was not found"))
+}
+
+pub async fn create_child_task(
+    pool: &SqlitePool,
+    parent_identifier: &str,
+    input: &CreateChildTask,
+    actor: &Actor,
+) -> Result<TaskDetail> {
+    validate_child_task_actor(actor)?;
+    let mut tx = pool.begin().await.context("failed to begin transaction")?;
+    let parent = sqlx::query_as::<_, Task>(
+        r#"
+        SELECT tasks.id, tasks.task_queue_id, task_queues.key AS task_queue_key, tasks.identifier,
+               tasks.sequence, tasks.title, tasks.brief, tasks.priority, tasks.state,
+               tasks.review_required, tasks.created_at, tasks.updated_at
+        FROM tasks
+        JOIN task_queues ON task_queues.id = tasks.task_queue_id
+        WHERE tasks.identifier = ?
+        "#,
+    )
+    .bind(parent_identifier)
+    .fetch_optional(&mut *tx)
+    .await
+    .with_context(|| format!("failed to load Task {parent_identifier}"))?
+    .with_context(|| format!("Task {parent_identifier} not found"))?;
+    let child_input = CreateTask {
+        queue_key: parent.task_queue_key.clone(),
+        title: input.title.clone(),
+        brief: input.brief.clone(),
+        priority: input.priority.clone(),
+        state: input.state.clone(),
+        review_required: input.review_required,
+        acceptance_criteria: input.acceptance_criteria.clone(),
+        validation_items: input.validation_items.clone(),
+        tags: input.tags.clone(),
+    };
+    validate_create_task(&child_input)?;
+
+    let sequence: i64 = sqlx::query_scalar(
+        r#"
+        UPDATE task_queues
+        SET next_task_sequence = next_task_sequence + 1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        RETURNING next_task_sequence - 1
+        "#,
+    )
+    .bind(&parent.task_queue_id)
+    .fetch_one(&mut *tx)
+    .await
+    .context("failed to allocate Child Task Identifier sequence")?;
+    let child_task_id = Uuid::new_v4().to_string();
+    let child_identifier = format!("{}-{}", parent.task_queue_key, sequence);
+    sqlx::query(
+        r#"
+        INSERT INTO tasks (id, task_queue_id, identifier, sequence, title, brief, priority, state, review_required)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&child_task_id)
+    .bind(&parent.task_queue_id)
+    .bind(&child_identifier)
+    .bind(sequence)
+    .bind(&child_input.title)
+    .bind(&child_input.brief)
+    .bind(&child_input.priority)
+    .bind(&child_input.state)
+    .bind(child_input.review_required)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("failed to create Child Task {child_identifier}"))?;
+    for (index, description) in child_input.acceptance_criteria.iter().enumerate() {
+        sqlx::query("INSERT INTO acceptance_criteria (id, task_id, position, description) VALUES (?, ?, ?, ?)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(&child_task_id)
+            .bind((index + 1) as i64)
+            .bind(description)
+            .execute(&mut *tx)
+            .await
+            .context("failed to create Child Task Acceptance Criterion")?;
+    }
+    for (index, description) in child_input.validation_items.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO validation_items (id, task_id, position, description) VALUES (?, ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&child_task_id)
+        .bind((index + 1) as i64)
+        .bind(description)
+        .execute(&mut *tx)
+        .await
+        .context("failed to create Child Task Validation Item")?;
+    }
+    for tag in normalized_tags(&child_input.tags) {
+        sqlx::query("INSERT INTO task_tags (task_id, tag) VALUES (?, ?)")
+            .bind(&child_task_id)
+            .bind(tag)
+            .execute(&mut *tx)
+            .await
+            .context("failed to create Child Task Tag")?;
+    }
+    append_audit_event_in_tx(
+        &mut tx,
+        actor,
+        "task.created",
+        "task",
+        &child_task_id,
+        serde_json::json!({
+            "identifier": child_identifier,
+            "queue_key": parent.task_queue_key,
+            "title": child_input.title,
+            "priority": child_input.priority,
+            "state": child_input.state,
+            "review_required": child_input.review_required,
+            "acceptance_criteria_count": child_input.acceptance_criteria.len(),
+            "validation_items_count": child_input.validation_items.len(),
+            "tags": normalized_tags(&child_input.tags),
+        }),
+    )
+    .await?;
+    sqlx::query("INSERT INTO task_relationships (id, source_task_id, target_task_id, relationship_kind) VALUES (?, ?, ?, 'parent_child')")
+        .bind(Uuid::new_v4().to_string())
+        .bind(&parent.id)
+        .bind(&child_task_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to create Child Task relationship")?;
+    if input.blocks_parent {
+        sqlx::query("INSERT INTO task_relationships (id, source_task_id, target_task_id, relationship_kind) VALUES (?, ?, ?, 'blocks')")
+            .bind(Uuid::new_v4().to_string())
+            .bind(&child_task_id)
+            .bind(&parent.id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to create Blocking Task relationship")?;
+    }
+    append_audit_event_in_tx(
+        &mut tx,
+        actor,
+        "task.child_created",
+        "task",
+        &parent.id,
+        serde_json::json!({
+            "parent_identifier": parent_identifier,
+            "child_identifier": child_identifier,
+            "blocks_parent": input.blocks_parent,
+        }),
+    )
+    .await?;
+    tx.commit().await.context("failed to commit transaction")?;
+
+    get_task_detail(pool, &child_identifier)
+        .await?
+        .with_context(|| format!("created Child Task {child_identifier} was not found"))
 }
 
 pub async fn get_task_detail(pool: &SqlitePool, identifier: &str) -> Result<Option<TaskDetail>> {
@@ -1789,6 +1956,18 @@ fn validate_actor(actor: &Actor) -> Result<()> {
     Ok(())
 }
 
+fn validate_child_task_actor(actor: &Actor) -> Result<()> {
+    validate_actor(actor)?;
+    if actor.kind == "operator" || actor.kind == "delegating_agent" || actor.kind == "worker_agent"
+    {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Child Task creation requires an Operator, Delegating Agent, or Worker Agent actor"
+        )
+    }
+}
+
 fn validate_worker_actor(actor: &Actor) -> Result<()> {
     validate_actor(actor)?;
     if actor.kind != "worker_agent" {
@@ -2126,6 +2305,107 @@ mod tests {
             .expect("task.created event");
         assert_eq!(event.subject_id, task.task.id);
         assert!(event.payload_json.contains("TASK-1"));
+    }
+
+    #[tokio::test]
+    async fn creates_child_tasks_in_parent_queue_and_records_relationships() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Parent"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create parent");
+
+        let child = create_child_task(
+            &pool,
+            "TASK-1",
+            &CreateChildTask {
+                title: "Child".to_string(),
+                brief: "Child work".to_string(),
+                priority: "normal".to_string(),
+                state: "ready".to_string(),
+                review_required: false,
+                acceptance_criteria: vec!["Child works".to_string()],
+                validation_items: vec!["Tests pass".to_string()],
+                tags: vec!["child".to_string()],
+                blocks_parent: true,
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("create child");
+
+        assert_eq!(child.task.identifier, "TASK-2");
+        assert_eq!(child.task.task_queue_key, "TASK");
+        let relationships: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_relationships")
+            .fetch_one(&pool)
+            .await
+            .expect("relationship count");
+        assert_eq!(relationships, 2);
+        assert!(list_task_audit_events(&pool, "TASK-1")
+            .await
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "task.child_created"));
+    }
+
+    #[tokio::test]
+    async fn child_task_creation_rejects_bad_actor_and_invalid_ready_requirements() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Parent"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create parent");
+        let mut child = CreateChildTask {
+            title: "Child".to_string(),
+            brief: "Child work".to_string(),
+            priority: "normal".to_string(),
+            state: "ready".to_string(),
+            review_required: false,
+            acceptance_criteria: vec![],
+            validation_items: vec![],
+            tags: vec![],
+            blocks_parent: false,
+        };
+
+        let error = create_child_task(&pool, "TASK-1", &child, &worker_actor())
+            .await
+            .expect_err("ready child without requirements fails");
+        assert!(error.to_string().contains("Ready Tasks require"));
+
+        child.state = "backlog".to_string();
+        let error = create_child_task(
+            &pool,
+            "TASK-1",
+            &child,
+            &Actor {
+                kind: "review_agent".to_string(),
+                id: "reviewer".to_string(),
+                display_name: "reviewer".to_string(),
+            },
+        )
+        .await
+        .expect_err("bad actor fails");
+        assert!(error.to_string().contains("Child Task creation requires"));
     }
 
     #[tokio::test]

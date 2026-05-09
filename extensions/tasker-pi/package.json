@@ -1,0 +1,19 @@
+{
+  "name": "@tasker/pi-extension",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "typebox": "^1.0.55"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.3"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  }
+}

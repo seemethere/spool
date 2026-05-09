@@ -41,6 +41,12 @@ pub struct CreateTaskRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CreateChildTaskRequest {
+    pub actor: tasker_db::Actor,
+    pub task: tasker_db::CreateChildTask,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct UpdateWorkpadRequest {
     pub actor: tasker_db::Actor,
     pub body: String,
@@ -96,6 +102,7 @@ pub fn router(app_version: impl Into<String>, pool: SqlitePool) -> Router {
         .route("/queues/{key}/claim-next", post(claim_next))
         .route("/tasks/bootstrap", post(create_task))
         .route("/tasks/{identifier}", get(get_task))
+        .route("/tasks/{identifier}/child-tasks", post(create_child_task))
         .route(
             "/tasks/{identifier}/workpad",
             axum::routing::put(update_workpad),
@@ -171,6 +178,20 @@ async fn create_task(
     require_auth(&state.pool, &headers).await?;
     require_task_create_actor(&request.actor)?;
     tasker_db::create_task(&state.pool, &request.task, &request.actor)
+        .await
+        .map(|task| (StatusCode::CREATED, Json(task)))
+        .map_err(task_mutation_error)
+}
+
+async fn create_child_task(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+    Json(request): Json<CreateChildTaskRequest>,
+) -> Result<(StatusCode, Json<tasker_db::TaskDetail>), (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    require_child_task_actor(&request.actor)?;
+    tasker_db::create_child_task(&state.pool, &identifier, &request.task, &request.actor)
         .await
         .map(|task| (StatusCode::CREATED, Json(task)))
         .map_err(task_mutation_error)
@@ -449,6 +470,20 @@ fn require_task_create_actor(
     }
 }
 
+fn require_child_task_actor(
+    actor: &tasker_db::Actor,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if actor.kind == "operator" || actor.kind == "delegating_agent" || actor.kind == "worker_agent"
+    {
+        Ok(())
+    } else {
+        Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Child Task creation requires an Operator, Delegating Agent, or Worker Agent actor",
+        ))
+    }
+}
+
 fn require_workpad_actor(
     actor: &tasker_db::Actor,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
@@ -483,6 +518,7 @@ fn task_mutation_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>
         || message.contains("Waivers require an Operator or Review Agent")
         || message.contains("require a Worker Agent actor")
         || message.contains("Worker Agent cannot")
+        || message.contains("Child Task creation requires")
         || message.contains("active Agent Run ID")
         || message.contains("active Claim Lease")
     {
@@ -704,6 +740,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(show.status(), StatusCode::OK);
+
+        let child = app
+            .clone()
+            .oneshot(create_child_task_request(
+                "TASK-1",
+                "Child",
+                "worker_agent",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(child.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(child.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["task"]["identifier"], "TASK-2");
 
         let start = app
             .clone()
@@ -1098,6 +1151,40 @@ mod tests {
         Request::builder()
             .method("POST")
             .uri(format!("/agent-runs/{run_id}/finish"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(request.to_string()))
+            .unwrap()
+    }
+
+    fn create_child_task_request(
+        parent_identifier: &str,
+        title: &str,
+        actor_kind: &str,
+        token: &str,
+    ) -> Request<Body> {
+        let request = serde_json::json!({
+            "actor": {
+                "kind": actor_kind,
+                "id": "tester",
+                "display_name": "tester"
+            },
+            "task": {
+                "title": title,
+                "brief": "Child work",
+                "priority": "normal",
+                "state": "ready",
+                "review_required": false,
+                "acceptance_criteria": ["It works"],
+                "validation_items": ["cargo test passes"],
+                "tags": ["child"],
+                "blocks_parent": false
+            }
+        });
+
+        Request::builder()
+            .method("POST")
+            .uri(format!("/tasks/{parent_identifier}/child-tasks"))
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {token}"))
             .body(Body::from(request.to_string()))
