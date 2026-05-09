@@ -8,7 +8,10 @@ beforeEach(() => {
   requests.length = 0;
   globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     requests.push({ url: String(url), init: init ?? {} });
-    return new Response(JSON.stringify({ ok: true }), {
+    const body = String(url).endsWith("/tasks/TASK-1")
+      ? { workpad_note: { body: "existing notes" } }
+      : { ok: true };
+    return new Response(JSON.stringify(body), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
@@ -39,6 +42,31 @@ describe("TaskerClient", () => {
 
     expect(requests[0].init.method).toBe("PUT");
     expect(JSON.parse(requests[0].init.body as string)).toEqual({ actor, body: "notes" });
+  });
+
+  it("appends workpad text by fetching the current note before updating", async () => {
+    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+
+    await client.appendWorkpad("TASK-1", actor, "new notes");
+
+    expect(requests.map((request) => request.init.method)).toEqual(["GET", "PUT"]);
+    expect(JSON.parse(requests[1].init.body as string)).toEqual({ actor, body: "existing notes\n\nnew notes" });
+  });
+
+  it("appends workpad text without a leading separator when no note exists", async () => {
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      requests.push({ url: String(url), init: init ?? {} });
+      const body = String(url).endsWith("/tasks/TASK-1") ? { workpad_note: null } : { ok: true };
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+
+    await client.appendWorkpad("TASK-1", actor, "new notes");
+
+    expect(JSON.parse(requests[1].init.body as string)).toEqual({ actor, body: "new notes" });
   });
 
   it("creates child tasks through the parent task endpoint", async () => {
