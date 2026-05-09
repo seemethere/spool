@@ -78,6 +78,9 @@ enum Command {
         /// Pi executable path.
         #[arg(long, default_value = "pi")]
         pi_bin: String,
+        /// Tasker Pi Extension file to load into pi.
+        #[arg(long)]
+        pi_extension: Option<PathBuf>,
         /// Worker Role Prompt file to send to pi RPC stdin.
         #[arg(long)]
         worker_prompt: Option<PathBuf>,
@@ -242,6 +245,7 @@ struct WorkOptions {
     retry_hold_seconds: Option<i64>,
     api_url: Option<String>,
     pi_bin: String,
+    pi_extension: Option<PathBuf>,
     worker_prompt: Option<PathBuf>,
 }
 
@@ -270,6 +274,7 @@ async fn main() -> Result<()> {
             retry_hold_seconds,
             api_url,
             pi_bin,
+            pi_extension,
             worker_prompt,
         }) => {
             work(
@@ -285,6 +290,7 @@ async fn main() -> Result<()> {
                     retry_hold_seconds,
                     api_url,
                     pi_bin,
+                    pi_extension,
                     worker_prompt,
                 },
             )
@@ -582,6 +588,7 @@ async fn work(paths: &TaskerPaths, db_path_overridden: bool, options: WorkOption
             api_url,
             api_token,
             pi_bin: options.pi_bin,
+            pi_extension: options.pi_extension,
             worker_prompt: options.worker_prompt,
         },
     )
@@ -893,6 +900,7 @@ Implement Bootstrap Task Creation.
                 retry_hold_seconds: None,
                 api_url: None,
                 pi_bin: "pi".to_string(),
+                pi_extension: None,
                 worker_prompt: None,
             },
         )

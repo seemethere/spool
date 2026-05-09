@@ -22,6 +22,7 @@ pub struct WorkOnceRequest {
     pub api_url: String,
     pub api_token: String,
     pub pi_bin: String,
+    pub pi_extension: Option<PathBuf>,
     pub worker_prompt: Option<PathBuf>,
 }
 
@@ -191,9 +192,12 @@ async fn run_pi_launcher(
         worktree_path,
         request.worker_prompt.as_deref(),
     )?;
-    let mut child = match Command::new(&request.pi_bin)
-        .arg("--mode")
-        .arg("rpc")
+    let mut command = Command::new(&request.pi_bin);
+    command.arg("--mode").arg("rpc");
+    if let Some(extension) = &request.pi_extension {
+        command.arg("--extension").arg(extension);
+    }
+    let mut child = match command
         .current_dir(worktree_path)
         .env("TASKER_API_URL", &request.api_url)
         .env("TASKER_API_TOKEN", &request.api_token)
@@ -223,7 +227,7 @@ async fn run_pi_launcher(
     if let Some(mut stdin) = child.stdin.take() {
         let rpc_start = format!(
             "{}\n",
-            serde_json::json!({ "type": "prompt", "prompt": prompt })
+            serde_json::json!({ "type": "prompt", "message": prompt })
         );
         if let Err(error) = stdin.write_all(rpc_start.as_bytes()) {
             let _ = child.kill();
@@ -719,6 +723,7 @@ mod tests {
                 api_url: "http://127.0.0.1:4317".to_string(),
                 api_token: "token".to_string(),
                 pi_bin: "pi".to_string(),
+                pi_extension: None,
                 worker_prompt: None,
             },
         )
@@ -757,7 +762,7 @@ mod tests {
         let pi_bin = temp.path().join("fake-pi");
         write_executable(
             &pi_bin,
-            "#!/bin/sh\ntest \"$1 $2\" = \"--mode rpc\" || exit 7\ntest -n \"$TASKER_AGENT_RUN_ID\" || exit 8\ncat >/dev/null\necho '{\"event\":\"done\"}'\n",
+            "#!/bin/sh\ntest \"$1 $2 $3 $4\" = \"--mode rpc --extension extensions/tasker-pi/src/index.ts\" || exit 7\ntest -n \"$TASKER_AGENT_RUN_ID\" || exit 8\ncat >/dev/null\necho '{\"event\":\"done\"}'\n",
         );
 
         let outcome = run_worker_once(
@@ -773,6 +778,7 @@ mod tests {
                 api_url: "http://127.0.0.1:4317".to_string(),
                 api_token: "token".to_string(),
                 pi_bin: pi_bin.display().to_string(),
+                pi_extension: Some(PathBuf::from("extensions/tasker-pi/src/index.ts")),
                 worker_prompt: None,
             },
         )
@@ -825,6 +831,7 @@ mod tests {
                 api_url: "http://127.0.0.1:4317".to_string(),
                 api_token: "token".to_string(),
                 pi_bin: pi_bin.display().to_string(),
+                pi_extension: None,
                 worker_prompt: None,
             },
         )
