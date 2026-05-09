@@ -224,7 +224,8 @@ async fn run_pi_launcher(
             )
         }
     };
-    if let Some(mut stdin) = child.stdin.take() {
+    let mut stdin_guard = child.stdin.take();
+    if let Some(stdin) = stdin_guard.as_mut() {
         let rpc_start = format!(
             "{}\n",
             serde_json::json!({ "type": "prompt", "message": prompt })
@@ -258,10 +259,18 @@ async fn run_pi_launcher(
     let mut exit_code = None;
 
     loop {
-        if contains_unattended_question(&locked_string(&stdout))
+        let current_stdout = locked_string(&stdout);
+        if contains_unattended_question(&current_stdout)
             || contains_unattended_question(&locked_string(&stderr))
         {
             question_detected = true;
+            let _ = child.kill();
+            let _ = child.wait();
+            break;
+        }
+        if contains_agent_end(&current_stdout) {
+            exit_code = Some(0);
+            drop(stdin_guard.take());
             let _ = child.kill();
             let _ = child.wait();
             break;
@@ -453,6 +462,21 @@ fn build_worker_prompt(
 fn contains_unattended_question(output: &str) -> bool {
     let lower = output.to_ascii_lowercase();
     lower.contains("question") || lower.contains("confirm") || lower.contains("unattended_question")
+}
+
+fn contains_agent_end(output: &str) -> bool {
+    output.lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("type")
+                    .and_then(|kind| kind.as_str())
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some("agent_end")
+    })
 }
 
 async fn prepare_local_worktree(
@@ -762,7 +786,7 @@ mod tests {
         let pi_bin = temp.path().join("fake-pi");
         write_executable(
             &pi_bin,
-            "#!/bin/sh\ntest \"$1 $2 $3 $4\" = \"--mode rpc --extension extensions/tasker-pi/src/index.ts\" || exit 7\ntest -n \"$TASKER_AGENT_RUN_ID\" || exit 8\ncat >/dev/null\necho '{\"event\":\"done\"}'\n",
+            "#!/bin/sh\ntest \"$1 $2 $3 $4\" = \"--mode rpc --extension extensions/tasker-pi/src/index.ts\" || exit 7\ntest -n \"$TASKER_AGENT_RUN_ID\" || exit 8\nread line\necho '{\"type\":\"agent_end\"}'\n",
         );
 
         let outcome = run_worker_once(
@@ -815,7 +839,7 @@ mod tests {
         let pi_bin = temp.path().join("fake-pi-question");
         write_executable(
             &pi_bin,
-            "#!/bin/sh\ncat >/dev/null\necho '{\"event\":\"question\"}'\nsleep 5\n",
+            "#!/bin/sh\nread line\necho '{\"event\":\"question\"}'\nsleep 5\n",
         );
 
         let outcome = run_worker_once(
