@@ -460,8 +460,29 @@ fn build_worker_prompt(
 }
 
 fn contains_unattended_question(output: &str) -> bool {
-    let lower = output.to_ascii_lowercase();
-    lower.contains("question") || lower.contains("confirm") || lower.contains("unattended_question")
+    output.lines().any(|line| {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            let lower = line.to_ascii_lowercase();
+            return lower.contains("unattended_question")
+                || lower.contains("confirmation_required");
+        };
+        let type_name = value
+            .get("type")
+            .and_then(|kind| kind.as_str())
+            .unwrap_or_default();
+        let event_name = value
+            .get("event")
+            .and_then(|kind| kind.as_str())
+            .unwrap_or_default();
+        let method_name = value
+            .get("method")
+            .and_then(|kind| kind.as_str())
+            .unwrap_or_default();
+        type_name == "unattended_question"
+            || event_name == "question"
+            || event_name == "confirmation_required"
+            || matches!(method_name, "confirm" | "input" | "select" | "editor")
+    })
 }
 
 fn contains_agent_end(output: &str) -> bool {
