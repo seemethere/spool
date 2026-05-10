@@ -1748,7 +1748,7 @@ async fn claim_next_once(
         FROM tasks
         JOIN task_queues ON task_queues.id = tasks.task_queue_id
         WHERE tasks.task_queue_id = ?
-          AND tasks.state IN ('ready', 'in_progress', 'rework', 'integrating')
+          AND tasks.state IN ('ready', 'in_progress', 'rework')
           AND NOT EXISTS (
               SELECT 1 FROM agent_runs
               WHERE agent_runs.task_id = tasks.id AND agent_runs.outcome IS NULL
@@ -4055,6 +4055,34 @@ mod tests {
         .await
         .expect("claim")
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_next_does_not_reclaim_integrating_tasks() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Ready for merge"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
+        sqlx::query("UPDATE tasks SET state = 'integrating' WHERE identifier = 'TASK-1'")
+            .execute(&pool)
+            .await
+            .expect("mark integrating");
+
+        assert!(claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim")
+            .is_none());
     }
 
     #[tokio::test]

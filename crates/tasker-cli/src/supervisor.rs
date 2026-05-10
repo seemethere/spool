@@ -546,7 +546,7 @@ async fn unblocking_state(
         FROM tasks
         JOIN task_queues ON task_queues.id = tasks.task_queue_id
         WHERE task_queues.key = ?
-          AND tasks.state IN ('ready', 'in_progress', 'rework', 'integrating')
+          AND tasks.state IN ('ready', 'in_progress', 'rework')
           AND NOT EXISTS (
               SELECT 1 FROM agent_runs
               WHERE agent_runs.task_id = tasks.id AND agent_runs.outcome IS NULL
@@ -640,6 +640,22 @@ mod tests {
         assert!(outcome.no_eligible_exits >= 1);
         assert!(outcome.started_workers <= 2);
         assert!(!outcome.timed_out);
+    }
+
+    #[tokio::test]
+    async fn supervisor_ignores_unclaimed_integrating_tasks_for_unblocking() {
+        let temp = TempDir::new().expect("tempdir");
+        let pool = empty_pool(temp.path()).await;
+        seed_eligible_integrating_task(&pool).await;
+        let reports = SupervisorReports::default();
+
+        let state = unblocking_state(&pool, "TASK", &reports)
+            .await
+            .expect("unblocking state");
+
+        assert!(state.unclaimed_eligible.is_empty());
+        assert_eq!(state.reason(), "drained queue");
+        assert!(state.should_stop());
     }
 
     #[tokio::test]
