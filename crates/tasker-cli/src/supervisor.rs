@@ -23,6 +23,7 @@ pub struct SupervisorOptions {
     pub poll_seconds: u64,
     pub worker_command: Vec<String>,
     pub lock_dir: PathBuf,
+    pub data_dir: PathBuf,
     pub allow_overlap: bool,
     pub watch: bool,
     #[cfg(test)]
@@ -39,6 +40,7 @@ pub struct SupervisorOutcome {
     pub blocked_reports: usize,
     pub retryable_failure_reports: usize,
     pub stuck_runs: Vec<StuckRun>,
+    pub repo_operation_lock_blocks: usize,
     pub timed_out: bool,
 }
 
@@ -122,6 +124,7 @@ pub async fn supervise_batch(
         blocked_reports: 0,
         retryable_failure_reports: 0,
         stuck_runs: Vec::new(),
+        repo_operation_lock_blocks: 0,
         timed_out: false,
     };
 
@@ -139,7 +142,25 @@ pub async fn supervise_batch(
         }
 
         let target_starts = worker_start_target(&options, &outcome, &active, &unblock);
-        while active.len() < options.concurrency && outcome.started_workers < target_starts {
+        if active.len() < options.concurrency && outcome.started_workers < target_starts {
+            if let Some(active_lock) =
+                crate::repo_lock::active_lock(&options.data_dir, &options.queue)?
+            {
+                outcome.repo_operation_lock_blocks += 1;
+                println!("{}", crate::repo_lock::blocked_message(&active_lock));
+                if !options.watch {
+                    println!(
+                        "bounded batch blocked by Managed Source Repository operation lock for Task Queue {}",
+                        options.queue
+                    );
+                    return Ok(outcome);
+                }
+            }
+        }
+        while active.len() < options.concurrency
+            && outcome.started_workers < target_starts
+            && crate::repo_lock::active_lock(&options.data_dir, &options.queue)?.is_none()
+        {
             next_worker += 1;
             let actor = supervisor_worker_id(&run_prefix, next_worker);
             let status_path = status_dir.join(format!("{actor}.jsonl"));
@@ -728,6 +749,7 @@ mod tests {
                 poll_seconds: 1,
                 worker_command: vec![script.display().to_string()],
                 lock_dir: temp.path().join("supervisors"),
+                data_dir: temp.path().to_path_buf(),
                 allow_overlap: false,
                 watch: false,
                 run_prefix: Some("supervisor-test-no-eligible".to_string()),
@@ -759,6 +781,7 @@ mod tests {
         seed_task(&pool, "backlog").await;
         let supervise_pool = pool.clone();
         let lock_dir = temp.path().join("supervisors");
+        let data_dir = temp.path().to_path_buf();
         let handle = tokio::spawn(async move {
             supervise_batch(
                 &supervise_pool,
@@ -769,6 +792,7 @@ mod tests {
                     poll_seconds: 1,
                     worker_command: vec![script.display().to_string()],
                     lock_dir,
+                    data_dir,
                     allow_overlap: false,
                     watch: true,
                     run_prefix: Some("supervisor-test-watch-late-ready".to_string()),
@@ -790,6 +814,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervisor_watch_pauses_while_repo_operation_lock_is_held() {
+        let temp = TempDir::new().expect("tempdir");
+        let script = temp.path().join("worker.sh");
+        let count = temp.path().join("worker-count");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho run >> {count}\necho 'no eligible Tasks found for Task Queue TASK'\nexit 0\n",
+                count = count.display()
+            ),
+        )
+        .expect("write script");
+        make_executable(&script);
+        let pool = empty_pool(temp.path()).await;
+        seed_task(&pool, "ready").await;
+        let data_dir = temp.path().join("data");
+        let _lock = crate::repo_lock::acquire_manual(
+            &data_dir,
+            "TASK",
+            "manual_integration",
+            Some("TASK-99"),
+        )
+        .expect("manual lock");
+        let supervise_pool = pool.clone();
+        let lock_dir = temp.path().join("supervisors");
+        let supervise_data_dir = data_dir.clone();
+        let handle = tokio::spawn(async move {
+            supervise_batch(
+                &supervise_pool,
+                SupervisorOptions {
+                    queue: "TASK".to_string(),
+                    concurrency: 1,
+                    timeout_seconds: 3,
+                    poll_seconds: 1,
+                    worker_command: vec![script.display().to_string()],
+                    lock_dir,
+                    data_dir: supervise_data_dir,
+                    allow_overlap: false,
+                    watch: true,
+                    run_prefix: Some("supervisor-test-repo-lock-watch".to_string()),
+                },
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            !count.exists(),
+            "worker should not start while repo lock is held"
+        );
+        crate::repo_lock::release_manual(&data_dir, "TASK")
+            .expect("release lock")
+            .expect("held lock");
+        let outcome = handle.await.expect("join").expect("supervise");
+
+        assert!(outcome.repo_operation_lock_blocks >= 1);
+        assert!(outcome.started_workers >= 1);
+        assert!(
+            count.exists(),
+            "worker should start after repo lock release"
+        );
+    }
+
+    #[tokio::test]
     async fn supervisor_watch_respects_concurrency_and_timeout() {
         let temp = TempDir::new().expect("tempdir");
         let script = temp.path().join("worker.sh");
@@ -808,6 +896,7 @@ mod tests {
                 poll_seconds: 1,
                 worker_command: vec![script.display().to_string()],
                 lock_dir: temp.path().join("supervisors"),
+                data_dir: temp.path().to_path_buf(),
                 allow_overlap: false,
                 watch: true,
                 run_prefix: Some("supervisor-test-watch-timeout".to_string()),
@@ -858,6 +947,7 @@ mod tests {
                 poll_seconds: 1,
                 worker_command: vec![script.display().to_string()],
                 lock_dir: temp.path().join("supervisors"),
+                data_dir: temp.path().to_path_buf(),
                 allow_overlap: false,
                 watch: false,
                 run_prefix: Some("supervisor-test-handoff".to_string()),
@@ -889,6 +979,7 @@ mod tests {
                 poll_seconds: 1,
                 worker_command: vec![script.display().to_string()],
                 lock_dir: temp.path().join("supervisors"),
+                data_dir: temp.path().to_path_buf(),
                 allow_overlap: false,
                 watch: false,
                 run_prefix: Some("supervisor-test-stuck".to_string()),
@@ -986,6 +1077,7 @@ mod tests {
             poll_seconds: 1,
             worker_command: vec!["worker".to_string()],
             lock_dir: PathBuf::from("/tmp/tasker-supervisor-locks"),
+            data_dir: PathBuf::from("/tmp/tasker-data"),
             allow_overlap: false,
             watch: false,
             run_prefix: None,
@@ -997,6 +1089,7 @@ mod tests {
             poll_seconds: 1,
             worker_command: vec!["worker".to_string()],
             lock_dir: PathBuf::from("/tmp/tasker-supervisor-locks"),
+            data_dir: PathBuf::from("/tmp/tasker-data"),
             allow_overlap: false,
             watch: false,
             run_prefix: None,

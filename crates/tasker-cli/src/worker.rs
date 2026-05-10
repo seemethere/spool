@@ -32,6 +32,10 @@ pub enum WorkOnceOutcome {
     NoEligibleTask {
         queue: String,
     },
+    RepoOperationLocked {
+        queue: String,
+        message: String,
+    },
     Finished {
         task_identifier: String,
         run_id: String,
@@ -48,6 +52,15 @@ pub async fn run_worker_once(
             "unsupported Agent Launcher {}; expected fake or pi",
             request.launcher
         );
+    }
+
+    let data_dir =
+        absolute_path(&request.data_dir).context("failed to resolve Tasker data directory")?;
+    if let Some(active) = crate::repo_lock::active_lock(&data_dir, &request.queue)? {
+        return Ok(WorkOnceOutcome::RepoOperationLocked {
+            queue: request.queue,
+            message: crate::repo_lock::blocked_message(&active),
+        });
     }
 
     let actor = tasker_db::Actor {
@@ -73,8 +86,6 @@ pub async fn run_worker_once(
         });
     };
 
-    let data_dir =
-        absolute_path(&request.data_dir).context("failed to resolve Tasker data directory")?;
     let prepared_worktree =
         match prepare_local_worktree(pool, &claimed.task, &actor, &data_dir).await {
             Ok(prepared) => prepared,
@@ -136,6 +147,7 @@ pub async fn run_worker_once(
             &claimed.task.task.identifier,
             &claimed.run.id,
             &actor,
+            &data_dir,
         )
         .await
         {
@@ -997,6 +1009,7 @@ async fn run_agent_gated_integration_if_ready(
     task_identifier: &str,
     agent_run_id: &str,
     worker_actor: &tasker_db::Actor,
+    data_dir: &Path,
 ) -> Result<Option<LocalIntegrationResult>> {
     let detail = tasker_db::get_task_detail(pool, task_identifier)
         .await?
@@ -1009,9 +1022,15 @@ async fn run_agent_gated_integration_if_ready(
         id: format!("{}-local-delivery-adapter", worker_actor.id),
         display_name: format!("{} Local Delivery Adapter", worker_actor.display_name),
     };
-    integrate_local_worktree_for_run(pool, task_identifier, Some(agent_run_id), &adapter_actor)
-        .await
-        .map(Some)
+    integrate_local_worktree_for_run(
+        pool,
+        task_identifier,
+        Some(agent_run_id),
+        &adapter_actor,
+        data_dir,
+    )
+    .await
+    .map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1024,6 +1043,7 @@ pub async fn integrate_local_worktree_for_run(
     identifier: &str,
     agent_run_id: Option<&str>,
     actor: &tasker_db::Actor,
+    data_dir: &Path,
 ) -> Result<LocalIntegrationResult> {
     let detail = tasker_db::get_task_detail(pool, identifier)
         .await?
@@ -1039,6 +1059,12 @@ pub async fn integrate_local_worktree_for_run(
         .with_context(|| format!("Task Queue {} not found", detail.task.task_queue_key))?;
     let task_branch = required_task_link(&detail, "task_branch")?;
     let local_worktree = required_task_link(&detail, "local_worktree")?;
+    let _repo_operation_lock = crate::repo_lock::acquire_guard(
+        data_dir,
+        &detail.task.task_queue_key,
+        "integration",
+        Some(identifier),
+    )?;
 
     let mut adapter = LocalWorktreeIntegrationAdapter {
         pool,
@@ -1555,7 +1581,10 @@ mod tests {
         assert!(runs_dir.is_dir());
         let run_id = match outcome {
             WorkOnceOutcome::Finished { run_id, .. } => run_id,
-            WorkOnceOutcome::NoEligibleTask { .. } => panic!("expected finished run"),
+            WorkOnceOutcome::NoEligibleTask { .. }
+            | WorkOnceOutcome::RepoOperationLocked { .. } => {
+                panic!("expected finished run")
+            }
         };
         let run_detail = tasker_db::get_agent_run_detail(&pool, &run_id)
             .await
@@ -1778,6 +1807,57 @@ mod tests {
         let failure_reason = run.failure_reason.expect("failure reason");
         assert!(failure_reason.contains("Local Worktree setup failed after claim"));
         assert!(failure_reason.contains("unexpected uncommitted changes"));
+    }
+
+    #[tokio::test]
+    async fn worker_does_not_claim_when_repo_operation_lock_is_held() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let worktrees = temp.path().join("worktrees");
+        let data_dir = temp.path().join("data");
+        init_git_repo(&repo);
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        seed_ready_task(&pool, &repo, &worktrees).await;
+        let _lock = crate::repo_lock::acquire_manual(
+            &data_dir,
+            "TASK",
+            "manual_integration",
+            Some("TASK-99"),
+        )
+        .expect("manual lock");
+
+        let outcome = run_worker_once(
+            &pool,
+            WorkOnceRequest {
+                queue: "TASK".to_string(),
+                launcher: "fake".to_string(),
+                actor: "worker".to_string(),
+                fake_outcome: "completed".to_string(),
+                lease_seconds: 90,
+                retry_hold_seconds: None,
+                max_run_seconds: None,
+                data_dir,
+                api_url: "http://127.0.0.1:4317".to_string(),
+                api_token: "token".to_string(),
+                pi_bin: "pi".to_string(),
+                pi_extension: None,
+                worker_prompt: None,
+            },
+        )
+        .await
+        .expect("run worker");
+
+        assert!(matches!(
+            outcome,
+            WorkOnceOutcome::RepoOperationLocked { .. }
+        ));
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(&pool)
+            .await
+            .expect("count runs");
+        assert_eq!(run_count, 0);
     }
 
     #[cfg(unix)]

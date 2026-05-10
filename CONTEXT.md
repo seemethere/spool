@@ -236,6 +236,10 @@ _Avoid_: GitHub delivery, pull-request delivery
 The local Git repository treated as the source of truth for **Local Worktree Delivery** and owned by the Tasker/Symphony workflow.
 _Avoid_: Casual working copy, unrelated manual worktree
 
+**Managed Source Repository Operation Lock**:
+A queue-scoped local filesystem lock under the active Tasker data directory that tells supervisors and Worker Loops not to start claims while the **Managed Source Repository** is being mutated by a **Delivery Adapter** or Manual Dogfood Merge.
+_Avoid_: Task scheduling dependency, database Claim Lease, Git index lock
+
 **Worktree Root**:
 The local directory where per-Task **Local Worktrees** are created.
 _Avoid_: Workspace root ambiguity
@@ -471,6 +475,11 @@ _Avoid_: Separate progress comment
 - Configuring **Local Worktree Delivery** opts the **Operator** into Tasker/Symphony mutating the **Managed Source Repository**.
 - The **Managed Source Repository** may contain **Prompt Overrides** at `.tasker/prompts/delegate.md`, `.tasker/prompts/worker.md`, and `.tasker/prompts/review.md`.
 - Unexpected uncommitted changes in the **Managed Source Repository** are an **Operational Delivery Failure**.
+- A **Managed Source Repository Operation Lock** is scoped by **Task Queue Key** and stored under the active Tasker data directory.
+- **Delivery Adapters** acquire a **Managed Source Repository Operation Lock** before mutating the **Managed Source Repository** and release it when the operation completes.
+- Manual Dogfood Merge operators may acquire and release a **Managed Source Repository Operation Lock** to protect manual integration windows.
+- A **Managed Source Repository Operation Lock** records pid, operation, queue, optional Task context, and whether it is a manual lock; stale automatic locks whose recorded process has exited may be removed safely, while manual locks require explicit release.
+- Supervisors and Worker Loops check the **Managed Source Repository Operation Lock** before spawning workers or claiming Tasks; watch-mode supervisors pause and poll while the lock is held, and bounded batches report the blocked condition clearly.
 - Every Tasker mutation is attributed to an **Actor** or the system.
 - Authentication identifies the API client; **Actor** identifies the source of the domain change.
 - Every Tasker domain mutation produces an **Audit Event**.
@@ -535,6 +544,7 @@ _Avoid_: Separate progress comment
 - `tasker run fail` is an **Operator** recovery command that fails an active **Agent Run** with an explicit reason and records a **Retry Hold**.
 - `tasker cleanup cargo-targets` and `tasker cleanup runs` are explicit **Operator** cleanup commands for local dogfood storage artifacts; they default to dry-run reporting and require `--delete` before removing rebuildable Cargo target directories or saved Run Transcript/Launcher Session Data files.
 - `tasker supervise` uses a local per-**Task Queue** supervisor lock to prevent overlapping supervisors from starting duplicate **Worker Loop** claims; stale locks from crashed supervisors are removed when the recorded process is gone, and `--allow-overlap` is an explicit recovery override.
+- `tasker merge lock acquire/status/release --queue <key>` manages the queue-scoped **Managed Source Repository Operation Lock** for Manual Dogfood Merge windows.
 - `tasker supervise --watch` keeps polling a **Task Queue** for newly eligible **Tasks** until timeout or interruption instead of exiting when a bounded batch drains.
 - Dogfooding API covers health/version, queue create/show/list, bootstrap task create, task show, claim-next, heartbeat, finish-run, Workpad Note update, criterion/validation status update, child task creation, state transition request, local worktree/delivery metadata, status summary, run show, and operator recovery for failed or stuck work.
 - Search, bulk edits, review sessions, metrics export, and token admin APIs are deferred until after **Dogfooding Readiness**.

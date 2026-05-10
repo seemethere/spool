@@ -15,6 +15,7 @@ mod cleanup;
 mod display;
 mod monitor;
 mod output;
+mod repo_lock;
 mod supervisor;
 mod telemetry;
 mod worker;
@@ -383,7 +384,6 @@ enum RunCommand {
     },
 }
 
-
 #[derive(Debug, Subcommand)]
 enum CleanupCommand {
     /// Summarize or remove rebuildable Cargo target/ directories under Local Worktrees.
@@ -431,6 +431,11 @@ enum MergeCommand {
     },
     /// Print a temporary Manual Dogfood Merge inspection plan for a Task.
     Inspect { identifier: String },
+    /// Manage the queue-scoped Managed Source Repository operation lock.
+    Lock {
+        #[command(subcommand)]
+        command: MergeLockCommand,
+    },
     /// Integrate an already-Integrating Task through runner-side Local Worktree Delivery.
     Integrate {
         /// Task Identifier.
@@ -449,6 +454,34 @@ enum MergeCommand {
         /// Operator actor display name for audit attribution.
         #[arg(long, default_value = "local-operator")]
         actor: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MergeLockCommand {
+    /// Acquire a manual Managed Source Repository operation lock.
+    Acquire {
+        /// Task Queue Key whose Managed Source Repository should be protected.
+        #[arg(long)]
+        queue: String,
+        /// Operation description recorded in the lock file.
+        #[arg(long, default_value = "manual_integration")]
+        operation: String,
+        /// Optional Task Identifier associated with the manual operation.
+        #[arg(long)]
+        task: Option<String>,
+    },
+    /// Show the current Managed Source Repository operation lock for a queue.
+    Status {
+        /// Task Queue Key.
+        #[arg(long)]
+        queue: String,
+    },
+    /// Release a manual Managed Source Repository operation lock after operator verification.
+    Release {
+        /// Task Queue Key.
+        #[arg(long)]
+        queue: String,
     },
 }
 
@@ -702,7 +735,12 @@ fn command_is_unsafe_mutation(command: &Option<Command>) -> bool {
         Some(Command::Merge { command }) => {
             matches!(
                 command,
-                MergeCommand::Integrate { .. } | MergeCommand::Done { .. }
+                MergeCommand::Integrate { .. }
+                    | MergeCommand::Done { .. }
+                    | MergeCommand::Lock {
+                        command: MergeLockCommand::Acquire { .. }
+                            | MergeLockCommand::Release { .. }
+                    }
             )
         }
         Some(
@@ -778,6 +816,11 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
             MergeCommand::Integrate { identifier, .. } | MergeCommand::Done { identifier, .. } => {
                 queue_key_from_task_identifier(identifier)
             }
+            MergeCommand::Lock { command } => match command {
+                MergeLockCommand::Acquire { queue, .. }
+                | MergeLockCommand::Status { queue }
+                | MergeLockCommand::Release { queue } => Some(queue.clone()),
+            },
         },
         Some(Command::Init | Command::Run { .. } | Command::Serve { .. })
         | Some(Command::Status { .. } | Command::Version)
@@ -1450,6 +1493,10 @@ async fn work(paths: &TaskerPaths, db_path_overridden: bool, options: WorkOption
         worker::WorkOnceOutcome::NoEligibleTask { queue } => {
             println!("no eligible Tasks found for Task Queue {queue}");
         }
+        worker::WorkOnceOutcome::RepoOperationLocked { queue, message } => {
+            println!("Task Queue {queue} is blocked by a Managed Source Repository operation lock");
+            println!("{message}");
+        }
         worker::WorkOnceOutcome::Finished {
             task_identifier,
             run_id,
@@ -1493,6 +1540,7 @@ async fn supervise(
             poll_seconds: options.poll_seconds,
             worker_command: command,
             lock_dir: paths.data_dir.join("supervisors"),
+            data_dir: paths.data_dir.clone(),
             allow_overlap: options.allow_overlap,
             watch: options.watch,
             #[cfg(test)]
@@ -1502,7 +1550,7 @@ async fn supervise(
     .await?;
 
     println!(
-        "supervisor summary: started={} completed={} failed={} no_eligible={} completed_handoffs={} blocked_reports={} retryable_failures={} stuck_runs={} timed_out={}",
+        "supervisor summary: started={} completed={} failed={} no_eligible={} completed_handoffs={} blocked_reports={} retryable_failures={} stuck_runs={} repo_lock_blocks={} timed_out={}",
         outcome.started_workers,
         outcome.completed_workers,
         outcome.failed_workers,
@@ -1511,6 +1559,7 @@ async fn supervise(
         outcome.blocked_reports,
         outcome.retryable_failure_reports,
         outcome.stuck_runs.len(),
+        outcome.repo_operation_lock_blocks,
         outcome.timed_out
     );
     Ok(())
@@ -1697,9 +1746,51 @@ async fn merge(paths: &TaskerPaths, db_path_overridden: bool, command: MergeComm
                 tasker_db::get_latest_agent_run_detail_for_task(&pool, &identifier).await?;
             print_manual_merge_inspection(&detail, &queue, latest_run.as_ref());
         }
+        MergeCommand::Lock { command } => match command {
+            MergeLockCommand::Acquire {
+                queue,
+                operation,
+                task,
+            } => {
+                let active = repo_lock::acquire_manual(
+                    &paths.data_dir,
+                    &queue,
+                    &operation,
+                    task.as_deref(),
+                )?;
+                println!(
+                    "acquired Managed Source Repository operation lock for Task Queue {} at {}",
+                    active.lock.queue,
+                    active.path.display()
+                );
+                println!(
+                    "release after operator verification: tasker merge lock release --queue {}",
+                    active.lock.queue
+                );
+            }
+            MergeLockCommand::Status { queue } => {
+                if let Some(active) = repo_lock::active_lock(&paths.data_dir, &queue)? {
+                    println!("{}", repo_lock::blocked_message(&active));
+                } else {
+                    println!("no Managed Source Repository operation lock for Task Queue {queue}");
+                }
+            }
+            MergeLockCommand::Release { queue } => {
+                if let Some(active) = repo_lock::release_manual(&paths.data_dir, &queue)? {
+                    println!(
+                        "released Managed Source Repository operation lock for Task Queue {} from {}",
+                        active.lock.queue,
+                        active.path.display()
+                    );
+                } else {
+                    println!("no Managed Source Repository operation lock for Task Queue {queue}");
+                }
+            }
+        },
         MergeCommand::Integrate { identifier, actor } => {
             let actor = tasker_db::Actor::operator(actor);
-            let outcome = integrate_local_worktree(&pool, &identifier, &actor).await?;
+            let outcome =
+                integrate_local_worktree(&pool, &identifier, &actor, &paths.data_dir).await?;
             println!("{}", outcome.summary);
         }
         MergeCommand::Done {
@@ -1749,6 +1840,7 @@ async fn integrate_local_worktree(
     pool: &sqlx::SqlitePool,
     identifier: &str,
     actor: &tasker_db::Actor,
+    data_dir: &Path,
 ) -> Result<LocalIntegrationResult> {
     let detail = tasker_db::get_task_detail(pool, identifier)
         .await?
@@ -1767,6 +1859,12 @@ async fn integrate_local_worktree(
     let latest_run = tasker_db::get_latest_agent_run_detail_for_task(pool, identifier).await?;
     let agent_run_id = latest_run.map(|run| run.run.id);
 
+    let _repo_operation_lock = repo_lock::acquire_guard(
+        data_dir,
+        &detail.task.task_queue_key,
+        "integration",
+        Some(identifier),
+    )?;
     let repo = Path::new(&queue.managed_source_repository);
     let worktree = Path::new(&local_worktree);
     let mut adapter = LocalWorktreeIntegrationAdapter {
@@ -2417,13 +2515,18 @@ fn print_manual_merge_inspection(
     }
     println!();
     println!("Operator-side checklist:");
-    println!("  1. Inspect Tasker state, latest Agent Run, Run Transcript, and Workpad Note.");
-    println!("  2. From the Local Worktree, verify a clean working tree and focused Task Commits.");
-    println!("  3. Run current validation from the Local Worktree after any refresh.");
-    println!("  4. Perform the Local Merge into the Main Branch outside Tasker.");
-    println!("  5. From the Managed Source Repository, run post-merge batch validation before marking the batch Done.");
+    println!("  1. Before mutating Main Branch manually, run: tasker merge lock acquire --queue {} --operation manual_integration --task {}", detail.task.task_queue_key, detail.task.identifier);
+    println!("  2. Inspect Tasker state, latest Agent Run, Run Transcript, and Workpad Note.");
+    println!("  3. From the Local Worktree, verify a clean working tree and focused Task Commits.");
+    println!("  4. Run current validation from the Local Worktree after any refresh.");
+    println!("  5. Perform the Local Merge into the Main Branch outside Tasker.");
+    println!("  6. From the Managed Source Repository, run post-merge batch validation before marking the batch Done.");
     println!(
-        "  6. After validation, run: tasker merge done {} --manual",
+        "  7. Release the operation lock: tasker merge lock release --queue {}",
+        detail.task.task_queue_key
+    );
+    println!(
+        "  8. After validation, run: tasker merge done {} --manual",
         detail.task.identifier
     );
 }
@@ -3380,10 +3483,14 @@ Implement Bootstrap Task Creation.
         tasker_db::run_migrations(&pool).await.expect("migrate");
         let (repo, worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
 
-        let result =
-            integrate_local_worktree(&pool, "TASK-1", &tasker_db::Actor::operator("tester"))
-                .await
-                .expect("integrate");
+        let result = integrate_local_worktree(
+            &pool,
+            "TASK-1",
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
 
         assert!(result.summary.contains("Final Commit"));
         let detail = tasker_db::get_task_detail(&pool, "TASK-1")
@@ -3425,10 +3532,14 @@ Implement Bootstrap Task Creation.
         let (repo, _worktree) = seed_integrating_local_task(&pool, temp.path(), false, false).await;
         let before = git_output(&repo, &["rev-parse", "HEAD"]).expect("head");
 
-        let result =
-            integrate_local_worktree(&pool, "TASK-1", &tasker_db::Actor::operator("tester"))
-                .await
-                .expect("integrate");
+        let result = integrate_local_worktree(
+            &pool,
+            "TASK-1",
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
 
         assert!(result.summary.contains("No-Change Integration"));
         let after = git_output(&repo, &["rev-parse", "HEAD"]).expect("head");
@@ -3456,10 +3567,14 @@ Implement Bootstrap Task Creation.
         let (repo, _worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
         fs::write(repo.join("operator-scratch.txt"), "dirty\n").expect("dirty repo");
 
-        let result =
-            integrate_local_worktree(&pool, "TASK-1", &tasker_db::Actor::operator("tester"))
-                .await
-                .expect("integrate");
+        let result = integrate_local_worktree(
+            &pool,
+            "TASK-1",
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
 
         assert!(result.summary.contains("operational Delivery Failure"));
         let detail = tasker_db::get_task_detail(&pool, "TASK-1")
@@ -3485,10 +3600,14 @@ Implement Bootstrap Task Creation.
         let (_repo, worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
         fs::write(worktree.join("dirty.txt"), "dirty\n").expect("dirty worktree");
 
-        let result =
-            integrate_local_worktree(&pool, "TASK-1", &tasker_db::Actor::operator("tester"))
-                .await
-                .expect("integrate");
+        let result = integrate_local_worktree(
+            &pool,
+            "TASK-1",
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
 
         assert!(result.summary.contains("work-change Delivery Failure"));
         let detail = tasker_db::get_task_detail(&pool, "TASK-1")
@@ -3533,10 +3652,14 @@ Implement Bootstrap Task Creation.
         .await
         .expect("record validated base");
 
-        let result =
-            integrate_local_worktree(&pool, "TASK-1", &tasker_db::Actor::operator("tester"))
-                .await
-                .expect("integrate");
+        let result = integrate_local_worktree(
+            &pool,
+            "TASK-1",
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
 
         assert!(result.summary.contains("Final Commit"));
         let detail = tasker_db::get_task_detail(&pool, "TASK-1")
@@ -3578,10 +3701,14 @@ Implement Bootstrap Task Creation.
         git(&repo, &["add", "main-only.txt"]);
         git(&repo, &["commit", "-m", "move main"]);
 
-        let result =
-            integrate_local_worktree(&pool, "TASK-1", &tasker_db::Actor::operator("tester"))
-                .await
-                .expect("integrate");
+        let result = integrate_local_worktree(
+            &pool,
+            "TASK-1",
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
 
         assert!(result.summary.contains("work-change Delivery Failure"));
         assert!(result.summary.contains("Validated Base Commit"));
@@ -3603,10 +3730,14 @@ Implement Bootstrap Task Creation.
         git(&repo, &["add", "main-only.txt"]);
         git(&repo, &["commit", "-m", "move main"]);
 
-        let result =
-            integrate_local_worktree(&pool, "TASK-1", &tasker_db::Actor::operator("tester"))
-                .await
-                .expect("integrate");
+        let result = integrate_local_worktree(
+            &pool,
+            "TASK-1",
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
 
         assert!(result.summary.contains("work-change Delivery Failure"));
         assert!(result
@@ -3639,10 +3770,14 @@ Implement Bootstrap Task Creation.
             fs::set_permissions(hooks.join("pre-commit"), permissions).expect("chmod hook");
         }
 
-        let result =
-            integrate_local_worktree(&pool, "TASK-1", &tasker_db::Actor::operator("tester"))
-                .await
-                .expect("integrate");
+        let result = integrate_local_worktree(
+            &pool,
+            "TASK-1",
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
 
         assert!(result.summary.contains("Final Commit failed"));
         let after_head = git_output(&repo, &["rev-parse", "HEAD"]).expect("head");

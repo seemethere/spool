@@ -4,20 +4,39 @@ Manual Dogfood Merge is a temporary dogfooding escape hatch until automatic **In
 
 This workflow stays local-first. It is for reviewing completed **Local Worktrees** and integrating them into the **Main Branch** of the **Managed Source Repository** before the Delivery Adapter can do that automatically.
 
+## Managed Source Repository operation lock
+
+Before manually mutating the **Managed Source Repository** during a Manual Dogfood Merge window, acquire the queue-scoped operation lock so supervisors and Worker Loops pause before spawning or claiming new work:
+
+```bash
+cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data merge lock acquire --queue TASKER --operation manual_integration
+```
+
+Check or release it with:
+
+```bash
+cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data merge lock status --queue TASKER
+cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data merge lock release --queue TASKER
+```
+
+The lock file lives under the active Tasker data directory, records pid/operation/queue/optional Task context, and is scoped by **Task Queue Key**. Manual locks require explicit operator release after the integration window is complete; automatic delivery locks are removed by the process that acquired them, with stale automatic lock cleanup when the recorded process has exited.
+
 ## Parallel Local Worktree review checklist
 
 When multiple **Task Branches** are produced in parallel, review them one at a time from the **Managed Source Repository**:
 
-1. Confirm the **Task Identifier**, title, and current **Task State** for the candidate work.
-2. Inspect all **Task Links** and identify the **Local Worktree** path and **Task Branch**.
-3. Inspect the latest **Agent Run**, its **Run Transcript**, and any **Launcher Session Data** or failure reason.
-4. Read the **Workpad Note** for plan, evidence, handoff notes, and known risks.
-5. Verify every **Acceptance Criterion** is satisfied or explicitly handled by the workflow, and every **Validation Item** has current proof.
-6. Check the **Local Worktree** for a clean working tree and focused **Task Commits** on the **Task Branch**.
-7. Rebase, merge, or otherwise refresh only as an operator Git action outside the **Tasker Service** if the **Main Branch** moved while other Tasks were reviewed.
-8. Run the relevant validation from the **Local Worktree** after any refresh.
-9. Perform the chosen **Local Merge** into the **Main Branch**, then run post-merge validation from the **Managed Source Repository** before marking the batch **Done**.
-10. Record final handoff context in Tasker.
+1. Acquire or confirm the **Managed Source Repository** operation lock for the Task Queue before mutating the **Main Branch**.
+2. Confirm the **Task Identifier**, title, and current **Task State** for the candidate work.
+3. Inspect all **Task Links** and identify the **Local Worktree** path and **Task Branch**.
+4. Inspect the latest **Agent Run**, its **Run Transcript**, and any **Launcher Session Data** or failure reason.
+5. Read the **Workpad Note** for plan, evidence, handoff notes, and known risks.
+6. Verify every **Acceptance Criterion** is satisfied or explicitly handled by the workflow, and every **Validation Item** has current proof.
+7. Check the **Local Worktree** for a clean working tree and focused **Task Commits** on the **Task Branch**.
+8. Rebase, merge, or otherwise refresh only as an operator Git action outside the **Tasker Service** if the **Main Branch** moved while other Tasks were reviewed.
+9. Run the relevant validation from the **Local Worktree** after any refresh.
+10. Perform the chosen **Local Merge** into the **Main Branch**, then run post-merge validation from the **Managed Source Repository** before marking the batch **Done**.
+11. Release the operation lock after the manual integration window is complete.
+12. Record final handoff context in Tasker.
 
 Do not batch-merge several **Task Branches** without separately inspecting their Tasker state and validation evidence. Parallel agent execution can produce overlapping changes; each **Local Worktree** needs an independent review against the current **Main Branch**.
 
