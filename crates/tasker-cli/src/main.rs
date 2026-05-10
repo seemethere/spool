@@ -2588,21 +2588,33 @@ fn print_manual_merge_inspection(
         println!("  {line}");
     }
     println!();
-    println!("Operator-side checklist:");
-    println!("  1. Before mutating Main Branch manually, run: tasker merge lock acquire --queue {} --operation manual_integration --task {}", detail.task.task_queue_key, detail.task.identifier);
-    println!("  2. Inspect Tasker state, latest Agent Run, Run Transcript, and Workpad Note.");
-    println!("  3. From the Local Worktree, verify a clean working tree and focused Task Commits.");
-    println!("  4. Run current validation from the Local Worktree after any refresh.");
-    println!("  5. Perform the Local Merge into the Main Branch outside Tasker.");
-    println!("  6. From the Managed Source Repository, run post-merge batch validation before marking the batch Done.");
-    println!(
-        "  7. Release the operation lock: tasker merge lock release --queue {}",
-        detail.task.task_queue_key
-    );
-    println!(
-        "  8. After validation, run: tasker merge done {} --manual",
-        detail.task.identifier
-    );
+    println!("Operator-side squash integration checklist:");
+    for (index, line) in
+        manual_squash_integration_guidance(&detail.task.task_queue_key, &detail.task.identifier)
+            .iter()
+            .enumerate()
+    {
+        println!("  {}. {line}", index + 1);
+    }
+}
+
+fn manual_squash_integration_guidance(queue_key: &str, task_identifier: &str) -> Vec<String> {
+    vec![
+        format!(
+            "Before mutating Main Branch manually, run: tasker merge lock acquire --queue {queue_key} --operation manual_integration --task {task_identifier}."
+        ),
+        "Inspect Tasker state, latest Agent Run, Run Transcript, and Workpad Note.".to_string(),
+        "From the Local Worktree, verify a clean working tree and focused Task Commits.".to_string(),
+        "Run current validation from the Local Worktree after any refresh.".to_string(),
+        "From the Managed Source Repository, prefer squash integration: git merge --squash <task-branch>.".to_string(),
+        format!(
+            "Commit one Final Commit with a concise Conventional Commit subject that includes {task_identifier}, for example: git commit -m \"docs: update Manual Dogfood Merge guidance ({task_identifier})\"."
+        ),
+        "Do not use Task Branch ancestry as completion proof after a squash integration; Tasker DB state, Integration Outcomes, Audit Events, and the Final Commit are authoritative.".to_string(),
+        "From the Managed Source Repository, run post-merge batch validation before marking the batch Done.".to_string(),
+        format!("Release the operation lock: tasker merge lock release --queue {queue_key}"),
+        format!("After validation, run: tasker merge done {task_identifier} --manual"),
+    ]
 }
 
 fn post_merge_batch_validation_guidance() -> &'static [&'static str] {
@@ -2799,6 +2811,17 @@ mod tests {
         assert!(guidance.contains("cargo clippy --all-targets --all-features -- -D warnings"));
         assert!(guidance.contains("overlapping CLI/API changes"));
         assert!(guidance.contains("does not replace the target Integrating implementation"));
+    }
+
+    #[test]
+    fn merge_inspect_guidance_prefers_squash_and_tasker_authority() {
+        let guidance = manual_squash_integration_guidance("TASKER", "TASKER-60").join("\n");
+
+        assert!(guidance.contains("git merge --squash <task-branch>"));
+        assert!(guidance.contains("Conventional Commit subject"));
+        assert!(guidance.contains("TASKER-60"));
+        assert!(guidance.contains("Do not use Task Branch ancestry as completion proof"));
+        assert!(guidance.contains("Tasker DB state, Integration Outcomes, Audit Events, and the Final Commit are authoritative"));
     }
 
     #[test]

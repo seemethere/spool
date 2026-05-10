@@ -1895,9 +1895,15 @@ mod tests {
         fs::remove_file(repo.join("dirty-managed-source.txt")).expect("clean managed source");
 
         let actor = tasker_db::Actor::operator("retry-adapter");
-        let retry = integrate_local_worktree_for_run(&pool, "TASK-1", None, &actor)
-            .await
-            .expect("retry integration");
+        let retry = integrate_local_worktree_for_run(
+            &pool,
+            "TASK-1",
+            None,
+            &actor,
+            &temp.path().join("data"),
+        )
+        .await
+        .expect("retry integration");
 
         assert!(
             retry.summary.contains("Integrated Task TASK-1")
@@ -1950,10 +1956,11 @@ mod tests {
         .await
         .expect("run worker");
         let actor = tasker_db::Actor::operator("retry-adapter");
-        integrate_local_worktree_for_run(&pool, "TASK-1", None, &actor)
+        let data_dir = temp.path().join("data");
+        integrate_local_worktree_for_run(&pool, "TASK-1", None, &actor, &data_dir)
             .await
             .expect("second failure");
-        integrate_local_worktree_for_run(&pool, "TASK-1", None, &actor)
+        integrate_local_worktree_for_run(&pool, "TASK-1", None, &actor, &data_dir)
             .await
             .expect("third failure");
 

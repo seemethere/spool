@@ -34,7 +34,7 @@ When multiple **Task Branches** are produced in parallel, review them one at a t
 7. Check the **Local Worktree** for a clean working tree and focused **Task Commits** on the **Task Branch**.
 8. Rebase, merge, or otherwise refresh only as an operator Git action outside the **Tasker Service** if the **Main Branch** moved while other Tasks were reviewed.
 9. Run the relevant validation from the **Local Worktree** after any refresh.
-10. Perform the chosen **Local Merge** into the **Main Branch**, then run post-merge validation from the **Managed Source Repository** before marking the batch **Done**.
+10. Prefer a squash-style **Local Merge** into the **Main Branch** that produces one **Final Commit** for the Task, then run post-merge validation from the **Managed Source Repository** before marking the batch **Done**.
 11. Release the operation lock after the manual integration window is complete.
 12. Record final handoff context in Tasker.
 
@@ -125,7 +125,19 @@ cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data 
 
 This helper runs in the CLI/worker process, not in the **Tasker Service**. Operational failures leave the Task in **Integrating** for retry; work-change failures such as dirty worktrees, stale branches, or merge conflicts move the Task to **Rework**.
 
-For the remaining fully manual path, from the **Managed Source Repository**, inspect the **Task Branch** against the **Main Branch** and perform the local merge strategy chosen by the operator. Prefer the planned v1 shape: a squash-style **Local Merge** that produces one **Final Commit** containing Tasker metadata such as **Task Identifier**, title, and optionally run ID.
+For the remaining fully manual path, from the **Managed Source Repository**, inspect the **Task Branch** against the **Main Branch** and prefer the planned v1 shape: a squash-style **Local Merge** that produces one **Final Commit** containing Tasker metadata such as **Task Identifier**, title, and optionally run ID.
+
+Example operator-side squash integration:
+
+```bash
+git switch <main-branch>
+git merge --squash <task-branch>
+git commit -m "docs: update manual merge guidance (TASKER-60)"
+```
+
+Use a concise Conventional Commit subject and include the **Task Identifier** in the subject or body so the **Final Commit** can be traced back to Tasker. Avoid `git merge --no-ff` merge commits for routine Manual Dogfood Merge work unless an operator intentionally needs to preserve branch topology for an exceptional investigation.
+
+After a squash integration, the **Task Branch** is not an ancestor of the **Main Branch**. Do not use branch ancestry as completion proof in the manual path; Tasker database state, **Integration Outcomes**, **Audit Events**, and the **Final Commit** are authoritative for completion and delivery history. This matches the automatic runner-side **Squash Merge** behavior, which also produces one **Final Commit** rather than preserving every **Task Commit** on the **Main Branch**.
 
 Tasker does not perform Git mutations in the **Tasker Service**. During Manual Dogfood Merge, manual Git commands are operator actions performed in the local repository, not hidden Tasker Service behavior.
 

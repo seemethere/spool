@@ -129,7 +129,7 @@ pub async fn supervise_batch(
     };
 
     while Instant::now() < deadline {
-        retry_due_integrations(pool, &options.queue, &run_prefix).await?;
+        retry_due_integrations(pool, &options.queue, &run_prefix, &options.data_dir).await?;
         let task_titles = task_titles_for_queue(pool, &options.queue).await?;
         reports.refresh(&mut outcome, &task_titles)?;
         let unblock = unblocking_state(pool, &options.queue, &reports).await?;
@@ -574,7 +574,12 @@ fn supervisor_status_dir(run_prefix: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-async fn retry_due_integrations(pool: &SqlitePool, queue: &str, run_prefix: &str) -> Result<()> {
+async fn retry_due_integrations(
+    pool: &SqlitePool,
+    queue: &str,
+    run_prefix: &str,
+    data_dir: &Path,
+) -> Result<()> {
     let retries = tasker_db::due_integration_retries(pool, queue).await?;
     if retries.is_empty() {
         return Ok(());
@@ -587,9 +592,14 @@ async fn retry_due_integrations(pool: &SqlitePool, queue: &str, run_prefix: &str
             retry.retry_attempt.unwrap_or_default(),
             retry.next_retry_at.as_deref().unwrap_or("due")
         );
-        let outcome =
-            worker::integrate_local_worktree_for_run(pool, &retry.task_identifier, None, &actor)
-                .await?;
+        let outcome = worker::integrate_local_worktree_for_run(
+            pool,
+            &retry.task_identifier,
+            None,
+            &actor,
+            data_dir,
+        )
+        .await?;
         println!("{}", outcome.summary);
     }
     Ok(())
