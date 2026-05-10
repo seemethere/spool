@@ -1,0 +1,21 @@
+#!/usr/bin/env sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)
+TASKER_BIN="$REPO_ROOT/target/debug/tasker"
+TASKER_CONFIG="$REPO_ROOT/.tasker/config.toml"
+
+if [ ! -x "$TASKER_BIN" ]; then
+  echo "error: expected Tasker CLI binary not found at $TASKER_BIN" >&2
+  echo "hint: run 'cargo build -p tasker-cli' from $REPO_ROOT" >&2
+  exit 127
+fi
+
+if [ ! -f "$TASKER_CONFIG" ]; then
+  echo "error: expected project Tasker config not found at $TASKER_CONFIG" >&2
+  echo "hint: run this wrapper from a repository with .tasker/config.toml initialized" >&2
+  exit 78
+fi
+
+exec "$TASKER_BIN" --config "$TASKER_CONFIG" "$@"

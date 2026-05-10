@@ -69,6 +69,10 @@ Temporary dogfooding escape hatches are allowed only when clearly marked:
 
 These do not replace the target model.
 
+## Project dogfood CLI
+
+Prefer `bin/tasker-local` for project dogfood CLI reads and operator/debug commands. It runs the workspace-built `target/debug/tasker` binary with the repository's `.tasker/config.toml`, which helps avoid accidental reads or mutations against the default user Tasker database. Build it first with `cargo build -p tasker-cli` when the wrapper reports the binary is missing.
+
 ## Architectural rules
 
 - Tasker records delivery configuration and outcomes; Delivery Adapters perform filesystem/Git operations outside Tasker.
