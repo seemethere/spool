@@ -16,9 +16,31 @@ When multiple **Task Branches** are produced in parallel, review them one at a t
 6. Check the **Local Worktree** for a clean working tree and focused **Task Commits** on the **Task Branch**.
 7. Rebase, merge, or otherwise refresh only as an operator Git action outside the **Tasker Service** if the **Main Branch** moved while other Tasks were reviewed.
 8. Run the relevant validation from the **Local Worktree** after any refresh.
-9. Perform the chosen **Local Merge** into the **Main Branch**, then record final handoff context in Tasker.
+9. Perform the chosen **Local Merge** into the **Main Branch**, then run post-merge validation from the **Managed Source Repository** before marking the batch **Done**.
+10. Record final handoff context in Tasker.
 
 Do not batch-merge several **Task Branches** without separately inspecting their Tasker state and validation evidence. Parallel agent execution can produce overlapping changes; each **Local Worktree** needs an independent review against the current **Main Branch**.
+
+## Post-merge batch validation checklist
+
+Individual **Local Worktree** validation is necessary but not sufficient for a Manual Dogfood Merge batch. After each **Local Merge**, or at minimum before marking the merged batch **Done**, validate the combined **Main Branch** from the **Managed Source Repository**. This catches overlapping CLI/API changes where each **Task Branch** passed on its own but the combined **Main Branch** can fail to compile.
+
+Run at least:
+
+```bash
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+Run extension checks when TypeScript extension files changed in the batch:
+
+```bash
+cd extensions/tasker-pi
+bun test
+bun run build
+```
+
+If post-merge validation fails, treat it as unresolved Manual Dogfood Merge work: fix the **Main Branch** before marking affected **Tasks** **Done**, or move the affected **Tasks** back through supported Tasker gates when the work must return to a **Worker Agent**. This checklist is temporary dogfooding guidance and does not replace the target **Integrating** implementation, **Agent-Gated Integration**, or automated **Squash Merge**.
 
 ## Inspect the Task and Agent Run
 
@@ -72,7 +94,7 @@ From the **Managed Source Repository**, inspect the **Task Branch** against the 
 
 Tasker does not perform Git mutations in the **Tasker Service**. During Manual Dogfood Merge, Git commands are operator actions performed in the local repository, not hidden Tasker behavior.
 
-After merge and validation, record a final **Workpad Note** or audit-relevant context through the CLI/API, then request **Task State** transitions only through supported Tasker gates. The temporary confirmation helper only marks an already-merged **Integrating** Task as **Done** when the operator explicitly confirms `--manual`:
+After merge and post-merge validation on the combined **Main Branch**, record a final **Workpad Note** or audit-relevant context through the CLI/API, then request **Task State** transitions only through supported Tasker gates. The temporary confirmation helper only marks an already-merged **Integrating** Task as **Done** when the operator explicitly confirms `--manual`:
 
 ```bash
 cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data merge done <task-identifier> --manual

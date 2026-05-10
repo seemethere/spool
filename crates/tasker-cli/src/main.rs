@@ -1539,15 +1539,31 @@ fn print_manual_merge_inspection(
     println!("  cargo clippy --all-targets --all-features -- -D warnings");
     println!("  if TypeScript extension files changed: (cd extensions/tasker-pi && bun test && bun run build)");
     println!();
+    println!("Post-merge batch validation:");
+    for line in post_merge_batch_validation_guidance() {
+        println!("  {line}");
+    }
+    println!();
     println!("Operator-side checklist:");
     println!("  1. Inspect Tasker state, latest Agent Run, Run Transcript, and Workpad Note.");
     println!("  2. From the Local Worktree, verify a clean working tree and focused Task Commits.");
     println!("  3. Run current validation from the Local Worktree after any refresh.");
     println!("  4. Perform the Local Merge into the Main Branch outside Tasker.");
+    println!("  5. From the Managed Source Repository, run post-merge batch validation before marking the batch Done.");
     println!(
-        "  5. After the manual merge, run: tasker merge done {} --manual",
+        "  6. After validation, run: tasker merge done {} --manual",
         detail.task.identifier
     );
+}
+
+fn post_merge_batch_validation_guidance() -> &'static [&'static str] {
+    &[
+        "After each Local Merge in a Manual Dogfood Merge batch, validate the combined Main Branch; do not rely only on per-Task Local Worktree validation.",
+        "Run at least: cargo test",
+        "Run at least: cargo clippy --all-targets --all-features -- -D warnings",
+        "This catches overlapping CLI/API changes where individual Task Branches passed but the combined Main Branch can fail to compile.",
+        "Temporary Manual Dogfood Merge guidance only; it does not replace the target Integrating implementation or automated Squash Merge.",
+    ]
 }
 
 fn print_local_worktree_git_inspection(
@@ -1695,6 +1711,17 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn merge_inspect_guidance_includes_post_merge_batch_validation() {
+        let guidance = post_merge_batch_validation_guidance().join("\n");
+
+        assert!(guidance.contains("combined Main Branch"));
+        assert!(guidance.contains("cargo test"));
+        assert!(guidance.contains("cargo clippy --all-targets --all-features -- -D warnings"));
+        assert!(guidance.contains("overlapping CLI/API changes"));
+        assert!(guidance.contains("does not replace the target Integrating implementation"));
     }
 
     #[test]
