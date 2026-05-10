@@ -454,10 +454,12 @@ pub fn write_run_detail(mut writer: impl Write, detail: &tasker_db::AgentRunDeta
         if metrics.input_tokens.is_some()
             || metrics.output_tokens.is_some()
             || metrics.total_tokens.is_some()
+            || metrics.cache_read_tokens.is_some()
+            || metrics.cache_write_tokens.is_some()
         {
             writeln!(
                 writer,
-                "  tokens: input={} output={} total={}",
+                "  tokens: input={} output={} total={} cache_read={} cache_write={}",
                 metrics
                     .input_tokens
                     .map(|value| value.to_string())
@@ -468,6 +470,14 @@ pub fn write_run_detail(mut writer: impl Write, detail: &tasker_db::AgentRunDeta
                     .unwrap_or_else(|| "unknown".to_string()),
                 metrics
                     .total_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                metrics
+                    .cache_read_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                metrics
+                    .cache_write_tokens
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "unknown".to_string())
             )?;

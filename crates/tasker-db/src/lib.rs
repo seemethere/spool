@@ -779,6 +779,8 @@ pub struct AgentRunMetrics {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
     pub tool_call_count: Option<i64>,
     pub tool_error_count: Option<i64>,
     pub repeated_failed_tool_attempt_count: Option<i64>,
@@ -2846,8 +2848,9 @@ pub async fn get_agent_run_metrics(
         SELECT agent_run_id, duration_ms, launcher_kind, final_status, exit_code, timed_out,
                unattended_question_detected, blocking_ui_detected, transcript_path,
                transcript_byte_size, transcript_jsonl_event_count, input_tokens, output_tokens,
-               total_tokens, tool_call_count, tool_error_count, repeated_failed_tool_attempt_count,
-               assistant_turn_count, user_turn_count, max_context_tokens, efficiency_hints_json,
+               total_tokens, cache_read_tokens, cache_write_tokens, tool_call_count, tool_error_count,
+               repeated_failed_tool_attempt_count, assistant_turn_count, user_turn_count,
+               max_context_tokens, efficiency_hints_json,
                warnings_json, created_at, updated_at
         FROM agent_run_metrics
         WHERE agent_run_id = ?
@@ -2894,14 +2897,14 @@ pub async fn refresh_agent_run_metrics(
             agent_run_id, duration_ms, launcher_kind, final_status, exit_code, timed_out,
             unattended_question_detected, blocking_ui_detected, transcript_path,
             transcript_byte_size, transcript_jsonl_event_count, input_tokens, output_tokens,
-            total_tokens, tool_call_count, tool_error_count, repeated_failed_tool_attempt_count,
-            assistant_turn_count, user_turn_count, max_context_tokens, efficiency_hints_json,
-            warnings_json
+            total_tokens, cache_read_tokens, cache_write_tokens, tool_call_count, tool_error_count,
+            repeated_failed_tool_attempt_count, assistant_turn_count, user_turn_count,
+            max_context_tokens, efficiency_hints_json, warnings_json
         )
         SELECT
             agent_runs.id,
             CAST((julianday(agent_runs.finished_at) - julianday(agent_runs.created_at)) * 86400000 AS INTEGER),
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         FROM agent_runs
         WHERE agent_runs.id = ? AND agent_runs.outcome IS NOT NULL
         ON CONFLICT(agent_run_id) DO UPDATE SET
@@ -2918,6 +2921,8 @@ pub async fn refresh_agent_run_metrics(
             input_tokens = excluded.input_tokens,
             output_tokens = excluded.output_tokens,
             total_tokens = excluded.total_tokens,
+            cache_read_tokens = excluded.cache_read_tokens,
+            cache_write_tokens = excluded.cache_write_tokens,
             tool_call_count = excluded.tool_call_count,
             tool_error_count = excluded.tool_error_count,
             repeated_failed_tool_attempt_count = excluded.repeated_failed_tool_attempt_count,
@@ -2941,6 +2946,8 @@ pub async fn refresh_agent_run_metrics(
     .bind(summary.input_tokens)
     .bind(summary.output_tokens)
     .bind(summary.total_tokens)
+    .bind(summary.cache_read_tokens)
+    .bind(summary.cache_write_tokens)
     .bind(summary.tool_call_count)
     .bind(summary.tool_error_count)
     .bind(summary.repeated_failed_tool_attempt_count)
@@ -2970,6 +2977,8 @@ struct AgentRunMetricsSummary {
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
     total_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
     tool_call_count: Option<i64>,
     tool_error_count: Option<i64>,
     repeated_failed_tool_attempt_count: Option<i64>,
@@ -2990,40 +2999,7 @@ impl AgentRunMetricsSummary {
                 self.unattended_question_detected = self
                     .unattended_question_detected
                     .or_else(|| json_bool(&value, &["unattended_question_detected"]));
-                self.input_tokens = self.input_tokens.or_else(|| {
-                    first_json_i64(
-                        &value,
-                        &[
-                            &["input_tokens"],
-                            &["usage", "input_tokens"],
-                            &["usage", "prompt_tokens"],
-                        ],
-                    )
-                });
-                self.output_tokens = self.output_tokens.or_else(|| {
-                    first_json_i64(
-                        &value,
-                        &[
-                            &["output_tokens"],
-                            &["usage", "output_tokens"],
-                            &["usage", "completion_tokens"],
-                        ],
-                    )
-                });
-                self.total_tokens = self.total_tokens.or_else(|| {
-                    first_json_i64(&value, &[&["total_tokens"], &["usage", "total_tokens"]])
-                });
-                self.max_context_tokens = self.max_context_tokens.or_else(|| {
-                    first_json_i64(
-                        &value,
-                        &[
-                            &["context_tokens"],
-                            &["max_context_tokens"],
-                            &["usage", "context_tokens"],
-                            &["usage", "total_tokens"],
-                        ],
-                    )
-                });
+                self.observe_token_usage(&value);
             }
             Err(error) => self.warnings.push(format!(
                 "ignored malformed Launcher Session Data raw JSON: {error}"
@@ -3124,39 +3100,110 @@ impl AgentRunMetricsSummary {
                 _ => {}
             }
         }
-        self.input_tokens = self.input_tokens.or_else(|| {
-            first_json_i64(
-                value,
-                &[
-                    &["input_tokens"],
-                    &["usage", "input_tokens"],
-                    &["usage", "prompt_tokens"],
-                ],
-            )
-        });
-        self.output_tokens = self.output_tokens.or_else(|| {
-            first_json_i64(
-                value,
-                &[
-                    &["output_tokens"],
-                    &["usage", "output_tokens"],
-                    &["usage", "completion_tokens"],
-                ],
-            )
-        });
-        self.total_tokens = self
-            .total_tokens
-            .or_else(|| first_json_i64(value, &[&["total_tokens"], &["usage", "total_tokens"]]));
+        self.observe_token_usage(value);
+    }
+
+    fn observe_token_usage(&mut self, value: &serde_json::Value) {
+        if let Some(input) = first_json_i64(
+            value,
+            &[
+                &["input_tokens"],
+                &["inputTokens"],
+                &["usage", "input_tokens"],
+                &["usage", "inputTokens"],
+                &["usage", "input"],
+                &["usage", "prompt_tokens"],
+                &["message", "usage", "input"],
+                &["message", "usage", "input_tokens"],
+                &["message", "usage", "inputTokens"],
+                &["assistantMessageEvent", "partial", "usage", "input"],
+                &["assistantMessageEvent", "partial", "usage", "input_tokens"],
+                &["assistantMessageEvent", "partial", "usage", "inputTokens"],
+            ],
+        ) {
+            self.input_tokens = Some(self.input_tokens.unwrap_or(0).max(input));
+        }
+        if let Some(output) = first_json_i64(
+            value,
+            &[
+                &["output_tokens"],
+                &["outputTokens"],
+                &["usage", "output_tokens"],
+                &["usage", "outputTokens"],
+                &["usage", "output"],
+                &["usage", "completion_tokens"],
+                &["message", "usage", "output"],
+                &["message", "usage", "output_tokens"],
+                &["message", "usage", "outputTokens"],
+                &["assistantMessageEvent", "partial", "usage", "output"],
+                &["assistantMessageEvent", "partial", "usage", "output_tokens"],
+                &["assistantMessageEvent", "partial", "usage", "outputTokens"],
+            ],
+        ) {
+            self.output_tokens = Some(self.output_tokens.unwrap_or(0).max(output));
+        }
         if let Some(total) = first_json_i64(
             value,
             &[
-                &["context_tokens"],
-                &["max_context_tokens"],
-                &["usage", "context_tokens"],
+                &["total_tokens"],
+                &["totalTokens"],
                 &["usage", "total_tokens"],
+                &["usage", "totalTokens"],
+                &["message", "usage", "total_tokens"],
+                &["message", "usage", "totalTokens"],
+                &["assistantMessageEvent", "partial", "usage", "total_tokens"],
+                &["assistantMessageEvent", "partial", "usage", "totalTokens"],
             ],
         ) {
+            self.total_tokens = Some(self.total_tokens.unwrap_or(0).max(total));
             self.max_context_tokens = Some(self.max_context_tokens.unwrap_or(0).max(total));
+        }
+        if let Some(cache_read) = first_json_i64(
+            value,
+            &[
+                &["cache_read_tokens"],
+                &["cacheReadTokens"],
+                &["usage", "cache_read_tokens"],
+                &["usage", "cacheReadTokens"],
+                &["usage", "cacheRead"],
+                &["message", "usage", "cacheRead"],
+                &["assistantMessageEvent", "partial", "usage", "cacheRead"],
+            ],
+        ) {
+            self.cache_read_tokens = Some(self.cache_read_tokens.unwrap_or(0).max(cache_read));
+        }
+        if let Some(cache_write) = first_json_i64(
+            value,
+            &[
+                &["cache_write_tokens"],
+                &["cacheWriteTokens"],
+                &["usage", "cache_write_tokens"],
+                &["usage", "cacheWriteTokens"],
+                &["usage", "cacheWrite"],
+                &["message", "usage", "cacheWrite"],
+                &["assistantMessageEvent", "partial", "usage", "cacheWrite"],
+            ],
+        ) {
+            self.cache_write_tokens = Some(self.cache_write_tokens.unwrap_or(0).max(cache_write));
+        }
+        if let Some(context) = first_json_i64(
+            value,
+            &[
+                &["context_tokens"],
+                &["contextTokens"],
+                &["max_context_tokens"],
+                &["maxContextTokens"],
+                &["usage", "context_tokens"],
+                &["usage", "contextTokens"],
+                &["usage", "max_context_tokens"],
+                &["usage", "maxContextTokens"],
+                &["message", "usage", "context_tokens"],
+                &["message", "usage", "contextTokens"],
+                &["assistantMessageEvent", "partial", "usage", "context_tokens"],
+                &["assistantMessageEvent", "partial", "usage", "contextTokens"],
+            ],
+        ) {
+            self.max_context_tokens = Some(self.max_context_tokens.unwrap_or(0).max(context));
         }
     }
 
@@ -5700,7 +5747,7 @@ mod tests {
             serde_json::json!({
                 "launcher":"pi",
                 "status":0,
-                "stdout":"{\"role\":\"user\",\"content\":\"brief\"}\n{\"role\":\"assistant\",\"content\":\"plan\",\"usage\":{\"input_tokens\":30,\"output_tokens\":12,\"total_tokens\":42}}\n{\"type\":\"tool_call\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"}}\n{\"type\":\"tool_error\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"},\"status\":\"error\"}\n{\"type\":\"tool_error\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"},\"status\":\"error\"}\n{\"type\":\"agent_end\"}\n",
+                "stdout":"{\"role\":\"user\",\"content\":\"brief\"}\n{\"role\":\"assistant\",\"content\":\"plan\",\"usage\":{\"input_tokens\":30,\"output_tokens\":12,\"total_tokens\":42}}\n{\"type\":\"message_update\",\"assistantMessageEvent\":{\"partial\":{\"usage\":{\"input\":45,\"output\":15,\"totalTokens\":60,\"cacheRead\":1000,\"cacheWrite\":50}}}}\n{\"type\":\"tool_call\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"}}\n{\"type\":\"tool_error\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"},\"status\":\"error\"}\n{\"type\":\"tool_error\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"},\"status\":\"error\"}\n{\"type\":\"agent_end\"}\n",
                 "stderr":"",
                 "unattended_question_detected":false,
                 "timed_out":false
@@ -5757,9 +5804,12 @@ mod tests {
         assert_eq!(metrics.repeated_failed_tool_attempt_count, Some(1));
         assert_eq!(metrics.assistant_turn_count, Some(1));
         assert_eq!(metrics.user_turn_count, Some(1));
-        assert_eq!(metrics.input_tokens, Some(30));
-        assert_eq!(metrics.output_tokens, Some(12));
-        assert_eq!(metrics.total_tokens, Some(42));
+        assert_eq!(metrics.input_tokens, Some(45));
+        assert_eq!(metrics.output_tokens, Some(15));
+        assert_eq!(metrics.total_tokens, Some(60));
+        assert_eq!(metrics.cache_read_tokens, Some(1000));
+        assert_eq!(metrics.cache_write_tokens, Some(50));
+        assert_eq!(metrics.max_context_tokens, Some(60));
         let hints: Vec<String> =
             serde_json::from_str(&metrics.efficiency_hints_json).expect("hints");
         assert!(hints

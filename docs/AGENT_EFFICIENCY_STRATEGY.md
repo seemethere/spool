@@ -115,6 +115,24 @@ The gap is expected for a young local-first system, but it means future efficien
    - Acceptance idea: supervisor reports dirty repo / operation lock before claiming when possible, avoiding zero-duration failed Agent Runs.
    - Validation idea: temp Git repository test covers clean, dirty, and stale-lock conditions.
 
+## Token and context telemetry spike update
+
+Local pi Run Transcripts do expose exact provider-style usage signals in JSONL stdout events. Recent sampled transcripts include `message.usage.input`, `message.usage.output`, `message.usage.totalTokens`, `message.usage.cacheRead`, and `message.usage.cacheWrite`, with the same fields repeated in streaming `assistantMessageEvent.partial.usage` payloads. Tasker now parses these fields, stores normalized input/output/total/cache-read/cache-write tokens, and treats the maximum observed `totalTokens` as the best available per-run context pressure signal. Raw prompt, transcript, and tool argument bodies remain in local Run Transcript artifacts only; human and JSON telemetry output expose numeric summaries rather than raw bodies.
+
+Exact metrics currently available from local artifacts:
+
+- Input tokens, output tokens, total tokens, cache-read tokens, and cache-write tokens from pi usage events.
+- Maximum observed context pressure from `totalTokens` or explicit context-token fields when present.
+- Tool-call count, tool-error count, repeated failed tool attempts, assistant/user turn counts, blocking UI signals, Run Transcript byte size, and JSONL event count.
+
+Metrics still unavailable or approximate:
+
+- Provider context-window size / maximum possible context tokens is not present in sampled pi artifacts.
+- Per-file read duplication, shell output volume, duplicate Tasker context fetches, and validation-loop categories are still proxy metrics to derive later from transcript/tool events.
+- Existing Agent Runs may need a metrics refresh path before old rows show newly parsed token/cache fields.
+
+Near-term dogfooding can continue, but broadening dogfooding should prioritize first-class proxy metrics next: repeated file reads, repeated Tasker context fetches, shell output volume, and per-tool category counts. Current evidence says the largest waste drivers remain repeated context discovery, broad shell/CLI inspection, duplicate Agent Runs, and local-state setup failures; exact token telemetry now makes those hypotheses testable on new Agent Runs.
+
 ## Guidance for near-term dogfooding
 
 - Prefer small implementation Tasks with explicit relevant ADRs, likely files, and validation commands.
@@ -127,5 +145,5 @@ The gap is expected for a young local-first system, but it means future efficien
 
 - Only recent runs have normalized Agent Run efficiency metrics; older evidence is transcript-derived and may undercount or overcount if event formats changed.
 - Transcript files can be very large and contain prompt/tool content, so strategy documents should cite paths and summaries rather than embedding raw bodies.
-- Token and cache usage are mostly unavailable in current persisted metrics, so claims about context-window waste remain hypotheses.
+- Earlier Tasker metrics did not parse pi's camelCase usage fields, so older database rows may still show unknown token/cache values until their metrics are refreshed or new Agent Runs finish.
 - Some duplicate Agent Runs were caused by known dogfooding transitions and may not recur after recent supervisor, monitor, and integration fixes.

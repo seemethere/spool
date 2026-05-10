@@ -44,6 +44,11 @@ pub struct TelemetryRun {
     pub repeated_failed_tool_attempt_count: Option<i64>,
     pub assistant_turn_count: Option<i64>,
     pub user_turn_count: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
     pub max_context_tokens: Option<i64>,
     pub efficiency_hints_json: Option<String>,
 }
@@ -56,6 +61,11 @@ pub struct EfficiencyTelemetrySummary {
     pub total_repeated_failed_tool_attempts: i64,
     pub total_assistant_turns: i64,
     pub total_user_turns: i64,
+    pub max_input_tokens: Option<i64>,
+    pub max_output_tokens: Option<i64>,
+    pub max_total_tokens: Option<i64>,
+    pub max_cache_read_tokens: Option<i64>,
+    pub max_cache_write_tokens: Option<i64>,
     pub max_context_tokens: Option<i64>,
     pub inefficient_runs: Vec<TelemetryRun>,
 }
@@ -76,6 +86,11 @@ struct TelemetryRunRow {
     repeated_failed_tool_attempt_count: Option<i64>,
     assistant_turn_count: Option<i64>,
     user_turn_count: Option<i64>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
     max_context_tokens: Option<i64>,
     efficiency_hints_json: Option<String>,
 }
@@ -115,6 +130,11 @@ pub async fn summarize_agent_runs(
             agent_run_metrics.repeated_failed_tool_attempt_count AS repeated_failed_tool_attempt_count,
             agent_run_metrics.assistant_turn_count AS assistant_turn_count,
             agent_run_metrics.user_turn_count AS user_turn_count,
+            agent_run_metrics.input_tokens AS input_tokens,
+            agent_run_metrics.output_tokens AS output_tokens,
+            agent_run_metrics.total_tokens AS total_tokens,
+            agent_run_metrics.cache_read_tokens AS cache_read_tokens,
+            agent_run_metrics.cache_write_tokens AS cache_write_tokens,
             agent_run_metrics.max_context_tokens AS max_context_tokens,
             agent_run_metrics.efficiency_hints_json AS efficiency_hints_json
         FROM agent_runs
@@ -248,6 +268,11 @@ fn run_from_row(row: &TelemetryRunRow) -> TelemetryRun {
         repeated_failed_tool_attempt_count: row.repeated_failed_tool_attempt_count,
         assistant_turn_count: row.assistant_turn_count,
         user_turn_count: row.user_turn_count,
+        input_tokens: row.input_tokens,
+        output_tokens: row.output_tokens,
+        total_tokens: row.total_tokens,
+        cache_read_tokens: row.cache_read_tokens,
+        cache_write_tokens: row.cache_write_tokens,
         max_context_tokens: row.max_context_tokens,
         efficiency_hints_json: row.efficiency_hints_json.clone(),
     }
@@ -261,6 +286,11 @@ fn build_efficiency_summary(rows: &[TelemetryRunRow]) -> EfficiencyTelemetrySumm
         total_repeated_failed_tool_attempts: 0,
         total_assistant_turns: 0,
         total_user_turns: 0,
+        max_input_tokens: None,
+        max_output_tokens: None,
+        max_total_tokens: None,
+        max_cache_read_tokens: None,
+        max_cache_write_tokens: None,
         max_context_tokens: None,
         inefficient_runs: Vec::new(),
     };
@@ -269,6 +299,11 @@ fn build_efficiency_summary(rows: &[TelemetryRunRow]) -> EfficiencyTelemetrySumm
             || row.tool_error_count.is_some()
             || row.assistant_turn_count.is_some()
             || row.user_turn_count.is_some()
+            || row.input_tokens.is_some()
+            || row.output_tokens.is_some()
+            || row.total_tokens.is_some()
+            || row.cache_read_tokens.is_some()
+            || row.cache_write_tokens.is_some()
             || row.max_context_tokens.is_some();
         if has_metrics {
             summary.runs_with_metrics += 1;
@@ -279,6 +314,21 @@ fn build_efficiency_summary(rows: &[TelemetryRunRow]) -> EfficiencyTelemetrySumm
             row.repeated_failed_tool_attempt_count.unwrap_or(0);
         summary.total_assistant_turns += row.assistant_turn_count.unwrap_or(0);
         summary.total_user_turns += row.user_turn_count.unwrap_or(0);
+        if let Some(tokens) = row.input_tokens {
+            summary.max_input_tokens = Some(summary.max_input_tokens.unwrap_or(0).max(tokens));
+        }
+        if let Some(tokens) = row.output_tokens {
+            summary.max_output_tokens = Some(summary.max_output_tokens.unwrap_or(0).max(tokens));
+        }
+        if let Some(tokens) = row.total_tokens {
+            summary.max_total_tokens = Some(summary.max_total_tokens.unwrap_or(0).max(tokens));
+        }
+        if let Some(tokens) = row.cache_read_tokens {
+            summary.max_cache_read_tokens = Some(summary.max_cache_read_tokens.unwrap_or(0).max(tokens));
+        }
+        if let Some(tokens) = row.cache_write_tokens {
+            summary.max_cache_write_tokens = Some(summary.max_cache_write_tokens.unwrap_or(0).max(tokens));
+        }
         if let Some(tokens) = row.max_context_tokens {
             summary.max_context_tokens = Some(summary.max_context_tokens.unwrap_or(0).max(tokens));
         }
@@ -387,13 +437,18 @@ pub fn render_summary(summary: &TelemetrySummary) -> String {
 
     writeln!(
         output,
-        "efficiency metrics: {} run(s), {} tool call(s), {} tool error(s), {} repeated failed tool attempt(s), assistant/user turns {}/{}, max context tokens {}",
+        "efficiency metrics: {} run(s), {} tool call(s), {} tool error(s), {} repeated failed tool attempt(s), assistant/user turns {}/{}, max tokens input/output/total {}/{}/{}, cache read/write {}/{}, max context tokens {}",
         summary.efficiency.runs_with_metrics,
         summary.efficiency.total_tool_calls,
         summary.efficiency.total_tool_errors,
         summary.efficiency.total_repeated_failed_tool_attempts,
         summary.efficiency.total_assistant_turns,
         summary.efficiency.total_user_turns,
+        summary.efficiency.max_input_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+        summary.efficiency.max_output_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+        summary.efficiency.max_total_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+        summary.efficiency.max_cache_read_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+        summary.efficiency.max_cache_write_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
         summary.efficiency.max_context_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string())
     )
     .expect("write string");
