@@ -330,6 +330,15 @@ enum WorkpadCommand {
 
 #[derive(Debug, Subcommand)]
 enum TelemetryCommand {
+    /// Summarize Agent Run waste and latency for a Task Queue.
+    Summary {
+        /// Task Queue Key to summarize.
+        #[arg(long)]
+        queue: String,
+        /// Number of slow completed Agent Runs to list.
+        #[arg(long, default_value_t = 5)]
+        slow_limit: usize,
+    },
     /// Summarize Task lifecycle latency from Task State transition Audit Events.
     Lifecycle {
         /// Optional Task Queue Key filter.
@@ -360,6 +369,7 @@ enum RunCommand {
         actor: String,
     },
 }
+
 
 #[derive(Debug, Subcommand)]
 enum CleanupCommand {
@@ -682,12 +692,7 @@ fn command_is_unsafe_mutation(command: &Option<Command>) -> bool {
                 MergeCommand::Integrate { .. } | MergeCommand::Done { .. }
             )
         }
-        Some(
-            Command::Status
-            | Command::Telemetry { .. }
-            | Command::Monitor { .. }
-            | Command::Version,
-        )
+        Some(Command::Status | Command::Telemetry { .. } | Command::Monitor { .. } | Command::Version)
         | None => false,
     }
 }
@@ -745,6 +750,7 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
             },
         ) => Some(queue.clone()),
         Some(Command::Telemetry { command }) => match command {
+            TelemetryCommand::Summary { queue, .. } => Some(queue.clone()),
             TelemetryCommand::Lifecycle { queue, .. } => queue.clone(),
         },
         Some(Command::Monitor { queue: None, .. } | Command::Cleanup { .. }) => None,
@@ -1096,6 +1102,14 @@ async fn telemetry(
 ) -> Result<()> {
     let pool = open_pool(paths, db_path_overridden).await?;
     match command {
+        TelemetryCommand::Summary { queue, slow_limit } => {
+            let summary = telemetry::summarize_agent_runs(
+                &pool,
+                &telemetry::TelemetryOptions { queue, slow_limit },
+            )
+            .await?;
+            print!("{}", telemetry::render_summary(&summary));
+        }
         TelemetryCommand::Lifecycle { queue, limit } => {
             let summary = telemetry::lifecycle_summary(
                 &pool,
