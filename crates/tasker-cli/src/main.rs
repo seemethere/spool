@@ -15,6 +15,7 @@ mod display;
 mod monitor;
 mod output;
 mod supervisor;
+mod telemetry;
 mod worker;
 
 #[derive(Debug, Parser)]
@@ -142,6 +143,11 @@ enum Command {
     Run {
         #[command(subcommand)]
         command: RunCommand,
+    },
+    /// Summarize Agent Run waste and latency telemetry.
+    Telemetry {
+        #[command(subcommand)]
+        command: TelemetryCommand,
     },
     /// Explicit operator cleanup for local dogfood storage artifacts.
     Cleanup {
@@ -339,6 +345,19 @@ enum RunCommand {
         /// Operator actor display name for audit attribution.
         #[arg(long, default_value = "local-operator")]
         actor: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TelemetryCommand {
+    /// Summarize Agent Run waste and latency for a Task Queue.
+    Summary {
+        /// Task Queue Key to summarize.
+        #[arg(long)]
+        queue: String,
+        /// Number of slow completed Agent Runs to list.
+        #[arg(long, default_value_t = 5)]
+        slow_limit: usize,
     },
 }
 
@@ -542,6 +561,9 @@ async fn main() -> Result<()> {
             .await
         }
         Some(Command::Run { command }) => run(&paths, db_path_overridden, command).await,
+        Some(Command::Telemetry { command }) => {
+            telemetry(&paths, db_path_overridden, command).await
+        }
         Some(Command::Cleanup { command }) => cleanup(&paths, db_path_overridden, command).await,
         Some(Command::Merge { command }) => merge(&paths, db_path_overridden, command).await,
         Some(Command::Serve { bind }) => serve(&paths, bind, db_path_overridden).await,
@@ -653,6 +675,7 @@ fn command_is_unsafe_mutation(command: &Option<Command>) -> bool {
             TaskCommand::Show { .. } | TaskCommand::Audit { .. }
         ),
         Some(Command::Run { command }) => matches!(command, RunCommand::Fail { .. }),
+        Some(Command::Telemetry { .. }) => false,
         Some(Command::Cleanup { command }) => cleanup_command_is_unsafe_mutation(command),
         Some(Command::Merge { command }) => {
             matches!(
@@ -717,6 +740,9 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
             },
         ) => Some(queue.clone()),
         Some(Command::Monitor { queue: None, .. } | Command::Cleanup { .. }) => None,
+        Some(Command::Telemetry { command }) => match command {
+            TelemetryCommand::Summary { queue, .. } => Some(queue.clone()),
+        },
         Some(Command::Merge { command }) => match command {
             MergeCommand::Queue { queue } => queue.clone(),
             MergeCommand::Inspect { .. } => None,
@@ -1388,6 +1414,25 @@ async fn run(paths: &TaskerPaths, db_path_overridden: bool, command: RunCommand)
                 "retry hold created for Task {}",
                 detail.task.task.identifier
             );
+        }
+    }
+    Ok(())
+}
+
+async fn telemetry(
+    paths: &TaskerPaths,
+    db_path_overridden: bool,
+    command: TelemetryCommand,
+) -> Result<()> {
+    let pool = open_pool(paths, db_path_overridden).await?;
+    match command {
+        TelemetryCommand::Summary { queue, slow_limit } => {
+            let summary = telemetry::summarize_agent_runs(
+                &pool,
+                &telemetry::TelemetryOptions { queue, slow_limit },
+            )
+            .await?;
+            print!("{}", telemetry::render_summary(&summary));
         }
     }
     Ok(())
