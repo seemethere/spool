@@ -422,6 +422,18 @@ enum RunCommand {
 
 #[derive(Debug, Subcommand)]
 enum CleanupCommand {
+    /// Summarize or remove Done/Canceled Local Worktrees and Task Branches.
+    LocalWorktrees {
+        /// Task Queue Key whose Local Worktree Delivery configuration should be used.
+        #[arg(long)]
+        queue: String,
+        /// Explicitly keep files/branches and only report cleanup candidates.
+        #[arg(long, conflicts_with = "delete")]
+        dry_run: bool,
+        /// Delete verified safe Local Worktrees and Task Branches.
+        #[arg(long)]
+        delete: bool,
+    },
     /// Summarize or remove rebuildable Cargo target/ directories under Local Worktrees.
     CargoTargets {
         /// Task Queue Key whose configured Worktree Root should be scanned.
@@ -759,9 +771,9 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
 
 fn cleanup_command_is_unsafe_mutation(command: &CleanupCommand) -> bool {
     match command {
-        CleanupCommand::CargoTargets { delete, .. } | CleanupCommand::Runs { delete, .. } => {
-            *delete
-        }
+        CleanupCommand::LocalWorktrees { delete, .. }
+        | CleanupCommand::CargoTargets { delete, .. }
+        | CleanupCommand::Runs { delete, .. } => *delete,
     }
 }
 
@@ -1840,6 +1852,18 @@ async fn cleanup(
     command: CleanupCommand,
 ) -> Result<()> {
     match command {
+        CleanupCommand::LocalWorktrees {
+            queue,
+            dry_run: _,
+            delete,
+        } => {
+            let pool = open_pool(paths, db_path_overridden).await?;
+            let queue_record = tasker_db::get_task_queue(&pool, &queue)
+                .await?
+                .with_context(|| format!("Task Queue {queue} not found"))?;
+            let report = cleanup::cleanup_local_worktrees(&pool, &queue_record, delete).await?;
+            print_local_worktree_cleanup_report(&report);
+        }
         CleanupCommand::CargoTargets {
             queue,
             worktree_root,
@@ -1915,6 +1939,63 @@ fn print_cleanup_report(report: &cleanup::CleanupReport) {
             cleanup::human_bytes(entry.bytes),
             entry.path.display()
         );
+    }
+}
+
+fn print_local_worktree_cleanup_report(report: &cleanup::LocalWorktreeCleanupReport) {
+    println!("Done/Canceled Local Worktree and Task Branch cleanup");
+    println!("Task Queue: {}", report.queue_key);
+    println!(
+        "Managed Source Repository: {}",
+        report.managed_source_repository.display()
+    );
+    println!("Worktree Root: {}", report.worktree_root.display());
+    println!(
+        "Done Worktree Retention: {}",
+        report.done_worktree_retention
+    );
+    println!(
+        "mode: {}",
+        if report.deleted { "delete" } else { "dry-run" }
+    );
+    println!("preserved authoritative data: Task records, Audit Events, Agent Run rows, Run Transcripts, and Launcher Session Data");
+    let safe = report
+        .entries
+        .iter()
+        .filter(|entry| entry.safe_to_delete)
+        .count();
+    let attention = report.entries.len().saturating_sub(safe);
+    println!(
+        "{} safe cleanup candidate(s), {} need attention",
+        safe, attention
+    );
+    for entry in &report.entries {
+        println!(
+            "  [{}] {} ({})",
+            if entry.safe_to_delete {
+                "safe"
+            } else {
+                "attention"
+            },
+            entry.identifier,
+            entry.state
+        );
+        if let Some(worktree) = &entry.local_worktree {
+            println!("    Local Worktree: {}", worktree.display());
+        } else {
+            println!("    Local Worktree: <missing link>");
+        }
+        if let Some(branch) = &entry.task_branch {
+            println!("    Task Branch: {branch}");
+        } else {
+            println!("    Task Branch: <missing link>");
+        }
+        for reason in &entry.reasons {
+            println!("    needs attention: {reason}");
+        }
+        for action in &entry.actions {
+            println!("    action: {action}");
+        }
     }
 }
 
