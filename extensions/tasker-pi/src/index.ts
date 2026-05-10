@@ -39,6 +39,7 @@ const ValidationItemStatusParams = Type.Object({
   position: Type.Number({ description: "1-based requirement position" }),
   status: ValidationStatus,
   waiver_reason: Type.Optional(Type.String()),
+  validated_base_commit: Type.Optional(Type.String({ description: "Main Branch commit that the validation evidence was run against." })),
 });
 const ChildTaskParams = Type.Object({
   parent_identifier: Identifier,

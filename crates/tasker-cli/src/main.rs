@@ -294,6 +294,9 @@ enum RequirementCommand {
         /// Explicit reason required when setting waived.
         #[arg(long)]
         waiver_reason: Option<String>,
+        /// Main Branch commit that the validation evidence was run against.
+        #[arg(long)]
+        validated_base_commit: Option<String>,
         /// Operator actor display name for audit attribution.
         #[arg(long, default_value = "local-operator")]
         actor: String,
@@ -954,11 +957,13 @@ async fn task(paths: &TaskerPaths, db_path_overridden: bool, command: TaskComman
                 position,
                 status,
                 waiver_reason,
+                validated_base_commit: _,
                 actor,
             } => {
                 let input = tasker_db::UpdateRequirementStatus {
                     status: bootstrap::normalize_label(&status),
                     waiver_reason,
+                    validated_base_commit: None,
                 };
                 let detail = tasker_db::update_acceptance_criterion_status(
                     &pool,
@@ -980,11 +985,21 @@ async fn task(paths: &TaskerPaths, db_path_overridden: bool, command: TaskComman
                 position,
                 status,
                 waiver_reason,
+                validated_base_commit,
                 actor,
             } => {
+                let status = bootstrap::normalize_label(&status);
+                let validated_base_commit = validation_base_commit_for_status(
+                    &pool,
+                    &identifier,
+                    &status,
+                    validated_base_commit,
+                )
+                .await?;
                 let input = tasker_db::UpdateRequirementStatus {
-                    status: bootstrap::normalize_label(&status),
+                    status,
                     waiver_reason,
+                    validated_base_commit,
                 };
                 let detail = tasker_db::update_validation_item_status(
                     &pool,
@@ -1539,6 +1554,37 @@ async fn integrate_local_worktree(
     adapter.integrate().await
 }
 
+async fn validation_base_commit_for_status(
+    pool: &sqlx::SqlitePool,
+    identifier: &str,
+    status: &str,
+    provided: Option<String>,
+) -> Result<Option<String>> {
+    if status != "passed" {
+        return Ok(None);
+    }
+    if let Some(commit) = provided {
+        let commit = commit.trim().to_string();
+        if !commit.is_empty() {
+            return Ok(Some(commit));
+        }
+    }
+
+    let detail = tasker_db::get_task_detail(pool, identifier)
+        .await?
+        .with_context(|| format!("Task {identifier} not found"))?;
+    let queue = tasker_db::get_task_queue(pool, &detail.task.task_queue_key)
+        .await?
+        .with_context(|| format!("Task Queue {} not found", detail.task.task_queue_key))?;
+    let commit = git_output(
+        Path::new(&queue.managed_source_repository),
+        &["rev-parse", &queue.main_branch],
+    )?
+    .trim()
+    .to_string();
+    Ok(Some(commit))
+}
+
 fn required_task_link(detail: &tasker_db::TaskDetail, kind: &str) -> Result<String> {
     detail
         .task_links
@@ -1734,6 +1780,9 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
                 self.task_branch
             );
         }
+        let current_main = git_output(self.repo, &["rev-parse", &self.queue.main_branch])?
+            .trim()
+            .to_string();
         if !git_status(
             self.repo,
             &[
@@ -1744,11 +1793,18 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
             ],
         )?
         .success()
+            && self.task.task.validated_base_commit.as_deref() != Some(current_main.as_str())
         {
             anyhow::bail!(
-                "Task Branch {} does not include current Main Branch {}",
+                "Task Branch {} does not include current Main Branch {} and Validated Base Commit {} is stale or missing (current Main Branch is {})",
                 self.task_branch,
-                self.queue.main_branch
+                self.queue.main_branch,
+                self.task
+                    .task
+                    .validated_base_commit
+                    .as_deref()
+                    .unwrap_or("not recorded"),
+                current_main
             );
         }
         Ok(())
@@ -2047,6 +2103,14 @@ fn print_manual_merge_inspection(
         queue.managed_source_repository
     );
     println!("Main Branch: {}", queue.main_branch);
+    println!(
+        "Validated Base Commit: {}",
+        detail
+            .task
+            .validated_base_commit
+            .as_deref()
+            .unwrap_or("not recorded")
+    );
     println!(
         "Local Worktree: {}",
         local_worktree.unwrap_or("missing Task Link")
@@ -2761,6 +2825,7 @@ Implement Bootstrap Task Creation.
                     position: 1,
                     status: "satisfied".to_string(),
                     waiver_reason: None,
+                    validated_base_commit: None,
                     actor: "tester".to_string(),
                 },
             },
@@ -2776,6 +2841,7 @@ Implement Bootstrap Task Creation.
                     position: 1,
                     status: "passed".to_string(),
                     waiver_reason: None,
+                    validated_base_commit: None,
                     actor: "tester".to_string(),
                 },
             },
@@ -3111,6 +3177,93 @@ Implement Bootstrap Task Creation.
     }
 
     #[tokio::test]
+    async fn merge_integrate_allows_current_validated_base_without_branch_ancestry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, _worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        fs::write(repo.join("main-only.txt"), "main moved\n").expect("main change");
+        git(&repo, &["add", "main-only.txt"]);
+        git(&repo, &["commit", "-m", "move main"]);
+        let current_main = git_output(&repo, &["rev-parse", "main"])
+            .expect("main head")
+            .trim()
+            .to_string();
+        tasker_db::update_validation_item_status(
+            &pool,
+            "TASK-1",
+            1,
+            &tasker_db::UpdateRequirementStatus {
+                status: "passed".to_string(),
+                waiver_reason: None,
+                validated_base_commit: Some(current_main.clone()),
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("record validated base");
+
+        let result =
+            integrate_local_worktree(&pool, "TASK-1", &tasker_db::Actor::operator("tester"))
+                .await
+                .expect("integrate");
+
+        assert!(result.summary.contains("Final Commit"));
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "done");
+        assert_eq!(
+            detail.task.validated_base_commit.as_deref(),
+            Some(current_main.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_integrate_stale_validated_base_moves_to_rework() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, _worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        let old_main = git_output(&repo, &["rev-parse", "main"])
+            .expect("main head")
+            .trim()
+            .to_string();
+        tasker_db::update_validation_item_status(
+            &pool,
+            "TASK-1",
+            1,
+            &tasker_db::UpdateRequirementStatus {
+                status: "passed".to_string(),
+                waiver_reason: None,
+                validated_base_commit: Some(old_main),
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("record stale base");
+        fs::write(repo.join("main-only.txt"), "main moved\n").expect("main change");
+        git(&repo, &["add", "main-only.txt"]);
+        git(&repo, &["commit", "-m", "move main"]);
+
+        let result =
+            integrate_local_worktree(&pool, "TASK-1", &tasker_db::Actor::operator("tester"))
+                .await
+                .expect("integrate");
+
+        assert!(result.summary.contains("work-change Delivery Failure"));
+        assert!(result.summary.contains("Validated Base Commit"));
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "rework");
+    }
+
+    #[tokio::test]
     async fn merge_integrate_stale_task_branch_moves_to_rework() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("tasker.db");
@@ -3270,6 +3423,7 @@ Implement Bootstrap Task Creation.
             &tasker_db::UpdateRequirementStatus {
                 status: "satisfied".to_string(),
                 waiver_reason: None,
+                validated_base_commit: None,
             },
             &actor,
         )
@@ -3282,6 +3436,7 @@ Implement Bootstrap Task Creation.
             &tasker_db::UpdateRequirementStatus {
                 status: "passed".to_string(),
                 waiver_reason: None,
+                validated_base_commit: None,
             },
             &actor,
         )

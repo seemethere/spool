@@ -473,6 +473,7 @@ pub struct Task {
     pub priority: String,
     pub state: String,
     pub review_required: bool,
+    pub validated_base_commit: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -614,6 +615,7 @@ pub struct MergeQueueTask {
 pub struct UpdateRequirementStatus {
     pub status: String,
     pub waiver_reason: Option<String>,
+    pub validated_base_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -896,7 +898,7 @@ pub async fn create_child_task(
         r#"
         SELECT tasks.id, tasks.task_queue_id, task_queues.key AS task_queue_key, tasks.identifier,
                tasks.sequence, tasks.title, tasks.brief, tasks.priority, tasks.state,
-               tasks.review_required, tasks.created_at, tasks.updated_at
+               tasks.review_required, tasks.validated_base_commit, tasks.created_at, tasks.updated_at
         FROM tasks
         JOIN task_queues ON task_queues.id = tasks.task_queue_id
         WHERE tasks.identifier = ?
@@ -1067,6 +1069,7 @@ pub async fn get_task_detail(pool: &SqlitePool, identifier: &str) -> Result<Opti
             tasks.priority,
             tasks.state,
             tasks.review_required,
+            tasks.validated_base_commit,
             tasks.created_at,
             tasks.updated_at
         FROM tasks
@@ -1376,6 +1379,7 @@ pub async fn transition_task_state(
             tasks.priority,
             tasks.state,
             tasks.review_required,
+            tasks.validated_base_commit,
             tasks.created_at,
             tasks.updated_at
         FROM tasks
@@ -1581,12 +1585,31 @@ async fn update_requirement_status(
         .await
         .context("failed to update requirement status")?;
 
+    if kind.table == "validation_items" {
+        let validated_base_commit = if input.status == "passed" {
+            input
+                .validated_base_commit
+                .as_deref()
+                .map(str::trim)
+                .filter(|commit| !commit.is_empty())
+        } else {
+            None
+        };
+        sqlx::query("UPDATE tasks SET validated_base_commit = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+            .bind(validated_base_commit)
+            .bind(&task_id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to update Validated Base Commit")?;
+    }
+
     let payload_json = serde_json::json!({
         "identifier": identifier,
         "position": position,
         "previous_status": previous_status,
         "status": input.status,
         "waiver_reason": waiver_reason,
+        "validated_base_commit": input.validated_base_commit,
     })
     .to_string();
     sqlx::query(
@@ -1890,7 +1913,7 @@ async fn claim_next_once(
         r#"
         SELECT tasks.id, tasks.task_queue_id, task_queues.key AS task_queue_key, tasks.identifier,
                tasks.sequence, tasks.title, tasks.brief, tasks.priority, tasks.state,
-               tasks.review_required, tasks.created_at, tasks.updated_at
+               tasks.review_required, tasks.validated_base_commit, tasks.created_at, tasks.updated_at
         FROM tasks
         JOIN task_queues ON task_queues.id = tasks.task_queue_id
         WHERE tasks.task_queue_id = ?
@@ -2251,7 +2274,7 @@ pub async fn retry_task(
         r#"
         SELECT tasks.id, tasks.task_queue_id, task_queues.key AS task_queue_key,
                tasks.identifier, tasks.sequence, tasks.title, tasks.brief, tasks.priority,
-               tasks.state, tasks.review_required, tasks.created_at, tasks.updated_at
+               tasks.state, tasks.review_required, tasks.validated_base_commit, tasks.created_at, tasks.updated_at
         FROM tasks
         JOIN task_queues ON task_queues.id = tasks.task_queue_id
         WHERE tasks.identifier = ?
@@ -3755,6 +3778,7 @@ mod tests {
             &UpdateRequirementStatus {
                 status: "satisfied".to_string(),
                 waiver_reason: None,
+                validated_base_commit: None,
             },
             &worker_actor(),
         )
@@ -3767,6 +3791,7 @@ mod tests {
             &UpdateRequirementStatus {
                 status: "passed".to_string(),
                 waiver_reason: None,
+                validated_base_commit: None,
             },
             &worker_actor(),
         )
@@ -3996,6 +4021,7 @@ mod tests {
             &UpdateRequirementStatus {
                 status: "satisfied".to_string(),
                 waiver_reason: None,
+                validated_base_commit: None,
             },
             &Actor::operator("tester"),
         )
@@ -4008,6 +4034,7 @@ mod tests {
             &UpdateRequirementStatus {
                 status: "passed".to_string(),
                 waiver_reason: None,
+                validated_base_commit: None,
             },
             &Actor::operator("tester"),
         )
@@ -4068,6 +4095,7 @@ mod tests {
             &UpdateRequirementStatus {
                 status: "satisfied".to_string(),
                 waiver_reason: None,
+                validated_base_commit: None,
             },
             &worker_actor(),
         )
@@ -4080,6 +4108,7 @@ mod tests {
             &UpdateRequirementStatus {
                 status: "passed".to_string(),
                 waiver_reason: None,
+                validated_base_commit: None,
             },
             &worker_actor(),
         )
@@ -4124,6 +4153,7 @@ mod tests {
             &UpdateRequirementStatus {
                 status: "satisfied".to_string(),
                 waiver_reason: Some("ignored".to_string()),
+                validated_base_commit: None,
             },
             &Actor {
                 kind: "worker_agent".to_string(),
@@ -4143,6 +4173,7 @@ mod tests {
             &UpdateRequirementStatus {
                 status: "passed".to_string(),
                 waiver_reason: None,
+                validated_base_commit: Some("abc123".to_string()),
             },
             &Actor {
                 kind: "worker_agent".to_string(),
@@ -4153,6 +4184,7 @@ mod tests {
         .await
         .expect("update validation");
         assert_eq!(detail.validation_items[0].status, "passed");
+        assert_eq!(detail.task.validated_base_commit.as_deref(), Some("abc123"));
 
         let events = list_task_audit_events(&pool, "TASK-1")
             .await
@@ -4163,6 +4195,42 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "validation_item.status_updated"));
+    }
+
+    #[tokio::test]
+    async fn records_validated_base_commit_on_validation_status_update() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Requirements"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
+
+        let detail = update_validation_item_status(
+            &pool,
+            "TASK-1",
+            1,
+            &UpdateRequirementStatus {
+                status: "passed".to_string(),
+                waiver_reason: None,
+                validated_base_commit: Some("abc123".to_string()),
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("update validation");
+
+        assert_eq!(detail.validation_items[0].status, "passed");
+        assert_eq!(detail.task.validated_base_commit.as_deref(), Some("abc123"));
     }
 
     #[tokio::test]
@@ -4190,6 +4258,7 @@ mod tests {
         let waiver = UpdateRequirementStatus {
             status: "waived".to_string(),
             waiver_reason: Some("not needed".to_string()),
+            validated_base_commit: None,
         };
 
         let error = update_acceptance_criterion_status(&pool, "TASK-1", 1, &waiver, &worker)
@@ -4202,6 +4271,7 @@ mod tests {
         let missing_reason = UpdateRequirementStatus {
             status: "waived".to_string(),
             waiver_reason: Some(" ".to_string()),
+            validated_base_commit: None,
         };
         let error = update_acceptance_criterion_status(
             &pool,
@@ -4867,6 +4937,7 @@ mod tests {
             &UpdateRequirementStatus {
                 status: "satisfied".to_string(),
                 waiver_reason: None,
+                validated_base_commit: None,
             },
             &worker_actor(),
         )
@@ -4879,6 +4950,7 @@ mod tests {
             &UpdateRequirementStatus {
                 status: "passed".to_string(),
                 waiver_reason: None,
+                validated_base_commit: None,
             },
             &worker_actor(),
         )

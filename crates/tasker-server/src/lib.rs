@@ -57,6 +57,7 @@ pub struct UpdateRequirementStatusRequest {
     pub actor: tasker_db::Actor,
     pub status: String,
     pub waiver_reason: Option<String>,
+    pub validated_base_commit: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -247,6 +248,7 @@ async fn update_acceptance_criterion_status(
     let input = tasker_db::UpdateRequirementStatus {
         status: request.status,
         waiver_reason: request.waiver_reason,
+        validated_base_commit: request.validated_base_commit,
     };
     tasker_db::update_acceptance_criterion_status(
         &state.pool,
@@ -270,6 +272,7 @@ async fn update_validation_item_status(
     let input = tasker_db::UpdateRequirementStatus {
         status: request.status,
         waiver_reason: request.waiver_reason,
+        validated_base_commit: request.validated_base_commit,
     };
     tasker_db::update_validation_item_status(
         &state.pool,

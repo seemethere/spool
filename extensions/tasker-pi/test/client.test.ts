@@ -72,6 +72,25 @@ describe("TaskerClient", () => {
     expect(JSON.parse(requests[1].init.body as string)).toEqual({ actor, body: "new notes" });
   });
 
+  it("sends validated base commit when setting validation status", async () => {
+    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+
+    await client.setValidationItemStatus({
+      identifier: "TASK-1",
+      position: 1,
+      status: "passed",
+      validated_base_commit: "abc123",
+    }, actor);
+
+    expect(requests[0].url).toBe("http://tasker.test/tasks/TASK-1/validation-items/1/status");
+    expect(JSON.parse(requests[0].init.body as string)).toEqual({
+      actor,
+      status: "passed",
+      waiver_reason: null,
+      validated_base_commit: "abc123",
+    });
+  });
+
   it("creates child tasks through the parent task endpoint", async () => {
     const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
 
