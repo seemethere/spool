@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 use tasker_config::{ensure_data_dir, PathOverrides, TaskerConfig, TaskerPaths};
 
 mod bootstrap;
@@ -54,7 +55,11 @@ enum Command {
         command: TaskCommand,
     },
     /// Show Tasker queue and Task State counts.
-    Status,
+    Status {
+        /// Emit machine-readable lifecycle telemetry JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show Workflow Metric telemetry summaries.
     Telemetry {
         #[command(subcommand)]
@@ -353,7 +358,12 @@ enum TelemetryCommand {
 #[derive(Debug, Subcommand)]
 enum RunCommand {
     /// Show one Agent Run, its Task, and Launcher Session Data.
-    Show { run_id: String },
+    Show {
+        run_id: String,
+        /// Emit machine-readable Agent Run telemetry JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Operator recovery: fail an active Agent Run and create a Retry Hold.
     Fail {
         /// Agent Run ID.
@@ -488,7 +498,7 @@ async fn main() -> Result<()> {
         Some(Command::Init) => init(&paths, db_path_overridden).await,
         Some(Command::Queue { command }) => queue(&paths, db_path_overridden, command).await,
         Some(Command::Task { command }) => task(&paths, db_path_overridden, command).await,
-        Some(Command::Status) => status(&paths, db_path_overridden).await,
+        Some(Command::Status { json }) => status(&paths, db_path_overridden, json).await,
         Some(Command::Telemetry { command }) => {
             telemetry(&paths, db_path_overridden, command).await
         }
@@ -692,7 +702,12 @@ fn command_is_unsafe_mutation(command: &Option<Command>) -> bool {
                 MergeCommand::Integrate { .. } | MergeCommand::Done { .. }
             )
         }
-        Some(Command::Status | Command::Telemetry { .. } | Command::Monitor { .. } | Command::Version)
+        Some(
+            Command::Status { .. }
+            | Command::Telemetry { .. }
+            | Command::Monitor { .. }
+            | Command::Version,
+        )
         | None => false,
     }
 }
@@ -762,7 +777,7 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
             }
         },
         Some(Command::Init | Command::Run { .. } | Command::Serve { .. })
-        | Some(Command::Status | Command::Version)
+        | Some(Command::Status { .. } | Command::Version)
         | None => None,
     }
 }
@@ -1122,11 +1137,111 @@ async fn telemetry(
     Ok(())
 }
 
-async fn status(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
+#[derive(Debug, Serialize)]
+struct StatusTelemetry<'a> {
+    queues: Vec<QueueTelemetry<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueueTelemetry<'a> {
+    queue_key: &'a str,
+    queue_name: &'a str,
+    queue_concurrency_limit: Option<i64>,
+    active_agent_runs: i64,
+    available_claim_slots: Option<i64>,
+    ready_tasks: i64,
+    integrating_tasks: i64,
+    active_integrating_agent_runs: i64,
+    active_retry_holds: i64,
+    capacity_saturated: bool,
+    state_counts: Vec<StateCount<'a>>,
+    active_runs: Vec<&'a tasker_db::ActiveAgentRunStatus>,
+    ready_task_summaries: Vec<&'a tasker_db::TaskStatusSummary>,
+    integrating_task_summaries: Vec<&'a tasker_db::TaskStatusSummary>,
+    advisory_conflict_hints: Vec<&'a tasker_db::TaskConflictGroup>,
+    retry_holds: Vec<&'a tasker_db::ActiveRetryHoldStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct StateCount<'a> {
+    state: &'a str,
+    task_count: i64,
+}
+
+fn build_status_telemetry<'a>(
+    rows: &'a [tasker_db::QueueStatus],
+    active_runs: &'a [tasker_db::ActiveAgentRunStatus],
+    active_holds: &'a [tasker_db::ActiveRetryHoldStatus],
+    status_tasks: &'a [tasker_db::TaskStatusSummary],
+    conflict_groups: &'a [tasker_db::TaskConflictGroup],
+) -> StatusTelemetry<'a> {
+    let mut queues = Vec::new();
+    let mut index = 0;
+    while index < rows.len() {
+        let row = &rows[index];
+        let mut state_counts = Vec::new();
+        while index < rows.len()
+            && rows[index].queue_key == row.queue_key
+            && rows[index].queue_name == row.queue_name
+        {
+            state_counts.push(StateCount {
+                state: &rows[index].state,
+                task_count: rows[index].task_count,
+            });
+            index += 1;
+        }
+        let queue_active_runs: Vec<_> = active_runs
+            .iter()
+            .filter(|run| run.queue_key == row.queue_key)
+            .collect();
+        queues.push(QueueTelemetry {
+            queue_key: &row.queue_key,
+            queue_name: &row.queue_name,
+            queue_concurrency_limit: row.queue_concurrency_limit,
+            active_agent_runs: row.active_agent_runs,
+            available_claim_slots: row
+                .queue_concurrency_limit
+                .map(|limit| (limit - row.active_agent_runs).max(0)),
+            ready_tasks: row.ready_tasks,
+            integrating_tasks: row.integrating_tasks,
+            active_integrating_agent_runs: row.active_integrating_agent_runs,
+            active_retry_holds: row.active_retry_holds,
+            capacity_saturated: row
+                .queue_concurrency_limit
+                .map(|limit| row.active_agent_runs >= limit)
+                .unwrap_or(false),
+            active_runs: queue_active_runs,
+            ready_task_summaries: status_tasks
+                .iter()
+                .filter(|task| task.queue_key == row.queue_key && task.state == "ready")
+                .collect(),
+            integrating_task_summaries: status_tasks
+                .iter()
+                .filter(|task| task.queue_key == row.queue_key && task.state == "integrating")
+                .collect(),
+            advisory_conflict_hints: conflict_groups
+                .iter()
+                .filter(|group| group.queue_key == row.queue_key)
+                .collect(),
+            retry_holds: active_holds
+                .iter()
+                .filter(|hold| hold.queue_key == row.queue_key)
+                .collect(),
+            state_counts,
+        });
+    }
+    StatusTelemetry { queues }
+}
+
+async fn status(paths: &TaskerPaths, db_path_overridden: bool, json: bool) -> Result<()> {
     let pool = open_pool(paths, db_path_overridden).await?;
     let rows = tasker_db::status_by_queue_and_state(&pool).await?;
     if rows.is_empty() {
-        println!("No Task Queues found");
+        if json {
+            println!("{{\n  \"queues\": []\n}}");
+        } else {
+            println!("No Task Queues found");
+        }
         return Ok(());
     }
 
@@ -1135,6 +1250,21 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
     let status_tasks =
         tasker_db::tasks_for_status_by_states(&pool, &["ready", "integrating"]).await?;
     let conflict_groups = tasker_db::task_conflict_groups_for_status(&pool).await?;
+
+    if json {
+        serde_json::to_writer_pretty(
+            std::io::stdout(),
+            &build_status_telemetry(
+                &rows,
+                &active_runs,
+                &active_holds,
+                &status_tasks,
+                &conflict_groups,
+            ),
+        )?;
+        println!();
+        return Ok(());
+    }
 
     let mut current_queue: Option<String> = None;
     for row in rows {
@@ -1423,11 +1553,15 @@ fn resolved_database_path(paths: &TaskerPaths, db_path_overridden: bool) -> Resu
 async fn run(paths: &TaskerPaths, db_path_overridden: bool, command: RunCommand) -> Result<()> {
     let pool = open_pool(paths, db_path_overridden).await?;
     match command {
-        RunCommand::Show { run_id } => {
+        RunCommand::Show { run_id, json } => {
             let detail = tasker_db::get_agent_run_detail(&pool, &run_id)
                 .await?
                 .with_context(|| format!("Agent Run {run_id} not found"))?;
-            output::print_run_detail(&detail)?;
+            if json {
+                output::write_run_detail_json(std::io::stdout(), &detail)?;
+            } else {
+                output::print_run_detail(&detail)?;
+            }
         }
         RunCommand::Fail {
             run_id,
@@ -2474,6 +2608,88 @@ mod tests {
     }
 
     #[test]
+    fn status_json_exposes_lifecycle_telemetry_shape() {
+        let rows = vec![
+            tasker_db::QueueStatus {
+                queue_key: "TASK".to_string(),
+                queue_name: "Tasker".to_string(),
+                queue_concurrency_limit: Some(1),
+                state: "ready".to_string(),
+                task_count: 2,
+                ready_tasks: 2,
+                integrating_tasks: 1,
+                active_agent_runs: 1,
+                active_integrating_agent_runs: 1,
+                active_retry_holds: 1,
+            },
+            tasker_db::QueueStatus {
+                queue_key: "TASK".to_string(),
+                queue_name: "Tasker".to_string(),
+                queue_concurrency_limit: Some(1),
+                state: "integrating".to_string(),
+                task_count: 1,
+                ready_tasks: 2,
+                integrating_tasks: 1,
+                active_agent_runs: 1,
+                active_integrating_agent_runs: 1,
+                active_retry_holds: 1,
+            },
+        ];
+        let active_runs = vec![tasker_db::ActiveAgentRunStatus {
+            queue_key: "TASK".to_string(),
+            task_identifier: "TASK-1".to_string(),
+            task_title: "Run task".to_string(),
+            task_state: "integrating".to_string(),
+            agent_run_id: "run-1".to_string(),
+            launcher_kind: "pi".to_string(),
+            worker_id: "worker-1".to_string(),
+            lease_expires_at: "later".to_string(),
+        }];
+        let active_holds = vec![tasker_db::ActiveRetryHoldStatus {
+            queue_key: "TASK".to_string(),
+            task_identifier: "TASK-2".to_string(),
+            hold_until: "later".to_string(),
+            reason: "retry".to_string(),
+        }];
+        let status_tasks = vec![tasker_db::TaskStatusSummary {
+            queue_key: "TASK".to_string(),
+            identifier: "TASK-3".to_string(),
+            title: "Ready task".to_string(),
+            state: "ready".to_string(),
+            priority: "normal".to_string(),
+        }];
+        let conflicts = vec![tasker_db::TaskConflictGroup {
+            queue_key: "TASK".to_string(),
+            target: "crates/tasker-cli".to_string(),
+            task_count: 2,
+            tasks: "TASK-3,TASK-4".to_string(),
+        }];
+
+        let value = serde_json::to_value(build_status_telemetry(
+            &rows,
+            &active_runs,
+            &active_holds,
+            &status_tasks,
+            &conflicts,
+        ))
+        .expect("status json");
+
+        assert_eq!(value["queues"][0]["queue_key"], "TASK");
+        assert_eq!(value["queues"][0]["available_claim_slots"], 0);
+        assert_eq!(value["queues"][0]["capacity_saturated"], true);
+        assert_eq!(value["queues"][0]["state_counts"][0]["state"], "ready");
+        assert_eq!(
+            value["queues"][0]["active_runs"][0]["agent_run_id"],
+            "run-1"
+        );
+        assert_eq!(
+            value["queues"][0]["ready_task_summaries"][0]["identifier"],
+            "TASK-3"
+        );
+        assert_eq!(value["queues"][0]["retry_holds"][0]["reason"], "retry");
+    }
+
+    #[test]
     fn project_config_guard_refuses_mutating_command_when_inactive() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
@@ -3136,7 +3352,7 @@ Implement Bootstrap Task Creation.
             .expect("get retry task")
             .expect("retry task");
         assert_eq!(retry_detail.task.state, "ready");
-        status(&paths, false).await.expect("status");
+        status(&paths, false, false).await.expect("status");
     }
 
     #[tokio::test]
