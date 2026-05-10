@@ -10,6 +10,7 @@ use tasker_config::{ensure_data_dir, PathOverrides, TaskerConfig, TaskerPaths};
 
 mod bootstrap;
 mod output;
+mod supervisor;
 mod worker;
 
 #[derive(Debug, Parser)]
@@ -87,6 +88,27 @@ enum Command {
         /// Worker Role Prompt file to send to pi RPC stdin.
         #[arg(long)]
         worker_prompt: Option<PathBuf>,
+    },
+    /// Supervise a dogfood batch of tasker work --once workers.
+    Supervise {
+        /// Task Queue Key to supervise.
+        #[arg(long)]
+        queue: String,
+        /// Maximum number of concurrent tasker work --once processes.
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        /// Exit after this many seconds even if the batch has not drained.
+        #[arg(long, default_value_t = 3600)]
+        timeout_seconds: u64,
+        /// Poll interval for Agent Run and Retry Hold state.
+        #[arg(long, default_value_t = 5)]
+        poll_seconds: u64,
+        /// Agent Launcher passed to default tasker work --once workers.
+        #[arg(long, default_value = "pi")]
+        launcher: String,
+        /// Worker command prefix for tests/debugging; --actor is appended automatically.
+        #[arg(long, value_delimiter = ' ')]
+        worker_command: Option<Vec<String>>,
     },
     /// Inspect Agent Runs.
     Run {
@@ -316,6 +338,15 @@ struct WorkOptions {
     worker_prompt: Option<PathBuf>,
 }
 
+struct SuperviseOptions {
+    queue: String,
+    concurrency: usize,
+    timeout_seconds: u64,
+    poll_seconds: u64,
+    launcher: String,
+    worker_command: Option<Vec<String>>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -361,6 +392,28 @@ async fn main() -> Result<()> {
                     pi_bin,
                     pi_extension,
                     worker_prompt,
+                },
+            )
+            .await
+        }
+        Some(Command::Supervise {
+            queue,
+            concurrency,
+            timeout_seconds,
+            poll_seconds,
+            launcher,
+            worker_command,
+        }) => {
+            supervise(
+                &paths,
+                db_path_overridden,
+                SuperviseOptions {
+                    queue,
+                    concurrency,
+                    timeout_seconds,
+                    poll_seconds,
+                    launcher,
+                    worker_command,
                 },
             )
             .await
@@ -757,6 +810,57 @@ async fn work(paths: &TaskerPaths, db_path_overridden: bool, options: WorkOption
             println!("finished Agent Run {run_id} with outcome {outcome}");
         }
     }
+    Ok(())
+}
+
+async fn supervise(
+    paths: &TaskerPaths,
+    db_path_overridden: bool,
+    options: SuperviseOptions,
+) -> Result<()> {
+    let pool = open_pool(paths, db_path_overridden).await?;
+    let command = if let Some(command) = options.worker_command {
+        command
+    } else {
+        let exe = std::env::current_exe().context("failed to resolve current tasker executable")?;
+        vec![
+            exe.display().to_string(),
+            "--config".to_string(),
+            paths.config_path.display().to_string(),
+            "--data-dir".to_string(),
+            paths.data_dir.display().to_string(),
+            "--db-path".to_string(),
+            paths.db_path.display().to_string(),
+            "work".to_string(),
+            "--once".to_string(),
+            "--queue".to_string(),
+            options.queue.clone(),
+            "--launcher".to_string(),
+            options.launcher,
+        ]
+    };
+
+    let outcome = supervisor::supervise_batch(
+        &pool,
+        supervisor::SupervisorOptions {
+            queue: options.queue,
+            concurrency: options.concurrency,
+            timeout_seconds: options.timeout_seconds,
+            poll_seconds: options.poll_seconds,
+            worker_command: command,
+        },
+    )
+    .await?;
+
+    println!(
+        "supervisor summary: started={} completed={} failed={} no_eligible={} stuck_runs={} timed_out={}",
+        outcome.started_workers,
+        outcome.completed_workers,
+        outcome.failed_workers,
+        outcome.no_eligible_exits,
+        outcome.stuck_runs.len(),
+        outcome.timed_out
+    );
     Ok(())
 }
 

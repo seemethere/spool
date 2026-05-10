@@ -1,0 +1,340 @@
+use std::{
+    io::Read,
+    process::{Child, Command, ExitStatus, Stdio},
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result};
+use sqlx::SqlitePool;
+use tokio::time::sleep;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisorOptions {
+    pub queue: String,
+    pub concurrency: usize,
+    pub timeout_seconds: u64,
+    pub poll_seconds: u64,
+    pub worker_command: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisorOutcome {
+    pub started_workers: usize,
+    pub completed_workers: usize,
+    pub failed_workers: usize,
+    pub no_eligible_exits: usize,
+    pub stuck_runs: Vec<StuckRun>,
+    pub timed_out: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StuckRun {
+    pub task_identifier: String,
+    pub agent_run_id: String,
+    pub worker_id: String,
+}
+
+struct WorkerProcess {
+    actor: String,
+    child: Child,
+    stdout: Option<std::process::ChildStdout>,
+    stderr: Option<std::process::ChildStderr>,
+}
+
+struct FinishedWorker {
+    actor: String,
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+pub async fn supervise_batch(
+    pool: &SqlitePool,
+    options: SupervisorOptions,
+) -> Result<SupervisorOutcome> {
+    anyhow::ensure!(
+        options.concurrency > 0,
+        "--concurrency must be greater than zero"
+    );
+    anyhow::ensure!(
+        options.timeout_seconds > 0,
+        "--timeout-seconds must be greater than zero"
+    );
+    anyhow::ensure!(
+        options.poll_seconds > 0,
+        "--poll-seconds must be greater than zero"
+    );
+    anyhow::ensure!(
+        !options.worker_command.is_empty(),
+        "worker command must not be empty"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(options.timeout_seconds);
+    let mut next_worker = 0usize;
+    let mut saw_no_eligible = false;
+    let mut active: Vec<WorkerProcess> = Vec::new();
+    let mut outcome = SupervisorOutcome {
+        started_workers: 0,
+        completed_workers: 0,
+        failed_workers: 0,
+        no_eligible_exits: 0,
+        stuck_runs: Vec::new(),
+        timed_out: false,
+    };
+
+    while Instant::now() < deadline {
+        while !saw_no_eligible && active.len() < options.concurrency {
+            next_worker += 1;
+            let actor = format!("supervisor-worker-{next_worker}");
+            let worker = spawn_worker(&options.worker_command, &actor)
+                .with_context(|| format!("failed to start worker {actor}"))?;
+            println!("started worker {actor}");
+            active.push(worker);
+            outcome.started_workers += 1;
+        }
+
+        print_progress(pool, &options.queue).await?;
+
+        let mut index = 0;
+        while index < active.len() {
+            if active[index].child.try_wait()?.is_some() {
+                let finished = finish_worker(active.remove(index))?;
+                outcome.completed_workers += 1;
+                if !finished.status.success() {
+                    outcome.failed_workers += 1;
+                }
+                if finished.stdout.contains("no eligible Tasks found") {
+                    outcome.no_eligible_exits += 1;
+                    saw_no_eligible = true;
+                    println!("worker {} exited with no eligible Task", finished.actor);
+                } else {
+                    println!(
+                        "worker {} exited status={}{}",
+                        finished.actor,
+                        finished.status,
+                        concise_tail(&finished.stdout)
+                    );
+                }
+                if !finished.stderr.trim().is_empty() {
+                    eprintln!(
+                        "worker {} stderr:{}",
+                        finished.actor,
+                        concise_tail(&finished.stderr)
+                    );
+                }
+
+                let stuck = active_runs_for_worker(pool, &options.queue, &finished.actor).await?;
+                for run in stuck {
+                    println!(
+                        "stuck Agent Run {} for Task {} remains active after worker {} exited; suggested recovery: tasker run fail {} --reason <reason>",
+                        run.agent_run_id, run.task_identifier, run.worker_id, run.agent_run_id
+                    );
+                    outcome.stuck_runs.push(StuckRun {
+                        task_identifier: run.task_identifier,
+                        agent_run_id: run.agent_run_id,
+                        worker_id: run.worker_id,
+                    });
+                }
+            } else {
+                index += 1;
+            }
+        }
+
+        if active.is_empty() && saw_no_eligible {
+            println!("batch drained for Task Queue {}", options.queue);
+            return Ok(outcome);
+        }
+
+        sleep(Duration::from_secs(options.poll_seconds)).await;
+    }
+
+    outcome.timed_out = true;
+    println!(
+        "supervisor timeout reached for Task Queue {}",
+        options.queue
+    );
+    for mut worker in active {
+        let _ = worker.child.kill();
+        let _ = worker.child.wait();
+    }
+    Ok(outcome)
+}
+
+fn spawn_worker(command: &[String], actor: &str) -> Result<WorkerProcess> {
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..])
+        .arg("--actor")
+        .arg(actor)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    Ok(WorkerProcess {
+        actor: actor.to_string(),
+        child,
+        stdout,
+        stderr,
+    })
+}
+
+fn finish_worker(mut worker: WorkerProcess) -> Result<FinishedWorker> {
+    let status = worker.child.wait()?;
+    let mut stdout = String::new();
+    if let Some(mut pipe) = worker.stdout.take() {
+        pipe.read_to_string(&mut stdout)?;
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = worker.stderr.take() {
+        pipe.read_to_string(&mut stderr)?;
+    }
+    Ok(FinishedWorker {
+        actor: worker.actor,
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+async fn print_progress(pool: &SqlitePool, queue: &str) -> Result<()> {
+    let active_runs = tasker_db::active_agent_runs_for_status(pool).await?;
+    let holds = tasker_db::active_retry_holds_for_status(pool).await?;
+    for run in active_runs.iter().filter(|run| run.queue_key == queue) {
+        println!(
+            "active Agent Run {} Task {} worker={} lease_expires_at={}",
+            run.agent_run_id, run.task_identifier, run.worker_id, run.lease_expires_at
+        );
+    }
+    for hold in holds.iter().filter(|hold| hold.queue_key == queue) {
+        println!(
+            "active Retry Hold Task {} hold_until={} reason={}",
+            hold.task_identifier, hold.hold_until, hold.reason
+        );
+    }
+    Ok(())
+}
+
+async fn active_runs_for_worker(
+    pool: &SqlitePool,
+    queue: &str,
+    worker_id: &str,
+) -> Result<Vec<tasker_db::ActiveAgentRunStatus>> {
+    Ok(tasker_db::active_agent_runs_for_status(pool)
+        .await?
+        .into_iter()
+        .filter(|run| run.queue_key == queue && run.worker_id == worker_id)
+        .collect())
+}
+
+fn concise_tail(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut lines: Vec<&str> = trimmed.lines().rev().take(3).collect();
+    lines.reverse();
+    format!("\n{}", lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn supervisor_reports_no_eligible_worker_exit() {
+        let temp = TempDir::new().expect("tempdir");
+        let script = temp.path().join("worker.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\necho 'no eligible Tasks found for Task Queue TASK'\nexit 0\n",
+        )
+        .expect("write script");
+        make_executable(&script);
+        let pool = empty_pool(temp.path()).await;
+
+        let outcome = supervise_batch(
+            &pool,
+            SupervisorOptions {
+                queue: "TASK".to_string(),
+                concurrency: 2,
+                timeout_seconds: 2,
+                poll_seconds: 1,
+                worker_command: vec![script.display().to_string()],
+            },
+        )
+        .await
+        .expect("supervise");
+
+        assert!(outcome.no_eligible_exits >= 1);
+        assert!(outcome.started_workers <= 2);
+        assert!(!outcome.timed_out);
+    }
+
+    #[tokio::test]
+    async fn supervisor_reports_stuck_run_after_worker_exit() {
+        let temp = TempDir::new().expect("tempdir");
+        let script = temp.path().join("worker.sh");
+        fs::write(&script, "#!/bin/sh\nexit 1\n").expect("write script");
+        make_executable(&script);
+        let pool = empty_pool(temp.path()).await;
+        seed_active_run(&pool, "supervisor-worker-1").await;
+
+        let outcome = supervise_batch(
+            &pool,
+            SupervisorOptions {
+                queue: "TASK".to_string(),
+                concurrency: 1,
+                timeout_seconds: 2,
+                poll_seconds: 1,
+                worker_command: vec![script.display().to_string()],
+            },
+        )
+        .await
+        .expect("supervise");
+
+        assert_eq!(outcome.failed_workers, 1);
+        assert_eq!(outcome.stuck_runs.len(), 1);
+        assert_eq!(outcome.stuck_runs[0].agent_run_id, "run-1");
+    }
+
+    async fn empty_pool(path: &std::path::Path) -> SqlitePool {
+        let db_path = path.join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        pool
+    }
+
+    async fn seed_active_run(pool: &SqlitePool, worker_id: &str) {
+        sqlx::query(
+            "INSERT INTO task_queues (id, key, name, delivery_backend, managed_source_repository, main_branch, worktree_root, branch_template, done_worktree_retention) VALUES ('queue-1', 'TASK', 'Tasker', 'local_worktree', '/repo', 'main', '/worktrees', 'tasker/{identifier}', false)",
+        )
+        .execute(pool)
+        .await
+        .expect("queue");
+        sqlx::query(
+            "INSERT INTO tasks (id, task_queue_id, identifier, sequence, title, brief, priority, state, review_required) VALUES ('task-1', 'queue-1', 'TASK-1', 1, 'Test', 'Brief', 'normal', 'in_progress', false)",
+        )
+        .execute(pool)
+        .await
+        .expect("task");
+        sqlx::query(
+            "INSERT INTO agent_runs (id, task_id, task_queue_id, worker_actor_kind, worker_actor_id, worker_actor_display_name, worker_id, launcher_kind, lease_expires_at) VALUES ('run-1', 'task-1', 'queue-1', 'worker_agent', ?, ?, ?, 'fake', datetime('now', '+60 seconds'))",
+        )
+        .bind(worker_id)
+        .bind(worker_id)
+        .bind(worker_id)
+        .execute(pool)
+        .await
+        .expect("run");
+    }
+
+    #[cfg(unix)]
+    fn make_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod");
+    }
+}
