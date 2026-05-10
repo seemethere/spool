@@ -348,6 +348,13 @@ struct SuperviseOptions {
     worker_command: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PathForwardingOptions {
+    config: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+    db_path: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -409,6 +416,11 @@ async fn main() -> Result<()> {
             supervise(
                 &paths,
                 db_path_overridden,
+                PathForwardingOptions {
+                    config: cli.config.clone(),
+                    data_dir: cli.data_dir.clone(),
+                    db_path: cli.db_path.clone(),
+                },
                 SuperviseOptions {
                     queue,
                     concurrency,
@@ -902,29 +914,24 @@ async fn work(paths: &TaskerPaths, db_path_overridden: bool, options: WorkOption
 async fn supervise(
     paths: &TaskerPaths,
     db_path_overridden: bool,
+    path_forwarding: PathForwardingOptions,
     options: SuperviseOptions,
 ) -> Result<()> {
     let pool = open_pool(paths, db_path_overridden).await?;
+    let database_path = resolved_database_path(paths, db_path_overridden)?;
     let command = if let Some(command) = options.worker_command {
         command
     } else {
         let exe = std::env::current_exe().context("failed to resolve current tasker executable")?;
-        vec![
-            exe.display().to_string(),
-            "--config".to_string(),
-            paths.config_path.display().to_string(),
-            "--data-dir".to_string(),
-            paths.data_dir.display().to_string(),
-            "--db-path".to_string(),
-            paths.db_path.display().to_string(),
-            "work".to_string(),
-            "--once".to_string(),
-            "--queue".to_string(),
-            options.queue.clone(),
-            "--launcher".to_string(),
-            options.launcher,
-        ]
+        default_worker_command(&exe, &path_forwarding, &options)
     };
+
+    println!(
+        "supervisor worker context: config={} data_dir={} database={}",
+        paths.config_path.display(),
+        paths.data_dir.display(),
+        database_path.display()
+    );
 
     let outcome = supervisor::supervise_batch(
         &pool,
@@ -951,6 +958,43 @@ async fn supervise(
         outcome.timed_out
     );
     Ok(())
+}
+
+fn default_worker_command(
+    exe: &Path,
+    path_forwarding: &PathForwardingOptions,
+    options: &SuperviseOptions,
+) -> Vec<String> {
+    let mut command = vec![exe.display().to_string()];
+    if let Some(config) = &path_forwarding.config {
+        command.push("--config".to_string());
+        command.push(config.display().to_string());
+    }
+    if let Some(data_dir) = &path_forwarding.data_dir {
+        command.push("--data-dir".to_string());
+        command.push(data_dir.display().to_string());
+    }
+    if let Some(db_path) = &path_forwarding.db_path {
+        command.push("--db-path".to_string());
+        command.push(db_path.display().to_string());
+    }
+    command.extend([
+        "work".to_string(),
+        "--once".to_string(),
+        "--queue".to_string(),
+        options.queue.clone(),
+        "--launcher".to_string(),
+        options.launcher.clone(),
+    ]);
+    command
+}
+
+fn resolved_database_path(paths: &TaskerPaths, db_path_overridden: bool) -> Result<PathBuf> {
+    let mut config = TaskerConfig::load_or_default(paths)?;
+    if db_path_overridden {
+        config.database.path = paths.db_path.clone();
+    }
+    Ok(config.database.path)
 }
 
 async fn run(paths: &TaskerPaths, db_path_overridden: bool, command: RunCommand) -> Result<()> {
@@ -1368,6 +1412,89 @@ mod tests {
 
         guard_project_config_from(&cli, &paths, false, &nested)
             .expect("explicit project config should allow mutation");
+    }
+
+    #[test]
+    fn supervise_default_worker_command_forwards_only_explicit_config_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("repo/.tasker/config.toml");
+        let configured_db = temp.path().join("repo/.tasker/data/project.db");
+        write_config(&config_path, &configured_db);
+        let paths = TaskerPaths::resolve(
+            temp.path().join("home"),
+            PathOverrides {
+                config_path: Some(config_path.clone()),
+                ..PathOverrides::default()
+            },
+        );
+
+        let command = default_worker_command(
+            Path::new("/tmp/tasker"),
+            &PathForwardingOptions {
+                config: Some(config_path.clone()),
+                data_dir: None,
+                db_path: None,
+            },
+            &SuperviseOptions {
+                queue: "TASK".to_string(),
+                concurrency: 1,
+                timeout_seconds: 60,
+                poll_seconds: 5,
+                launcher: "pi".to_string(),
+                worker_command: None,
+            },
+        );
+
+        assert_eq!(
+            command,
+            vec![
+                "/tmp/tasker".to_string(),
+                "--config".to_string(),
+                config_path.display().to_string(),
+                "work".to_string(),
+                "--once".to_string(),
+                "--queue".to_string(),
+                "TASK".to_string(),
+                "--launcher".to_string(),
+                "pi".to_string(),
+            ]
+        );
+        assert!(!command.contains(&"--data-dir".to_string()));
+        assert!(!command.contains(&"--db-path".to_string()));
+        assert_eq!(
+            resolved_database_path(&paths, false).expect("database path"),
+            configured_db
+        );
+    }
+
+    #[test]
+    fn supervise_default_worker_command_forwards_explicit_db_path() {
+        let command = default_worker_command(
+            Path::new("/tmp/tasker"),
+            &PathForwardingOptions {
+                config: Some(PathBuf::from(".tasker/config.toml")),
+                data_dir: Some(PathBuf::from(".tasker/data")),
+                db_path: Some(PathBuf::from(".tasker/data/tasker.db")),
+            },
+            &SuperviseOptions {
+                queue: "TASK".to_string(),
+                concurrency: 1,
+                timeout_seconds: 60,
+                poll_seconds: 5,
+                launcher: "fake".to_string(),
+                worker_command: None,
+            },
+        );
+
+        assert!(command
+            .windows(2)
+            .any(|args| args == ["--config", ".tasker/config.toml"]));
+        assert!(command
+            .windows(2)
+            .any(|args| args == ["--data-dir", ".tasker/data"]));
+        assert!(command
+            .windows(2)
+            .any(|args| args == ["--db-path", ".tasker/data/tasker.db"]));
     }
 
     #[test]
