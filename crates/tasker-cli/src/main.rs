@@ -110,7 +110,7 @@ enum Command {
         #[arg(long)]
         worker_prompt: Option<PathBuf>,
     },
-    /// Supervise a dogfood batch of tasker work --once workers.
+    /// Supervise tasker work --once workers.
     Supervise {
         /// Task Queue Key to supervise.
         #[arg(long)]
@@ -124,6 +124,9 @@ enum Command {
         /// Poll interval for Agent Run and Retry Hold state.
         #[arg(long, default_value_t = 5)]
         poll_seconds: u64,
+        /// Keep polling for newly eligible Tasks until timeout or interruption.
+        #[arg(long)]
+        watch: bool,
         /// Agent Launcher passed to default tasker work --once workers.
         #[arg(long, default_value = "pi")]
         launcher: String,
@@ -429,6 +432,7 @@ struct SuperviseOptions {
     launcher: String,
     worker_command: Option<Vec<String>>,
     allow_overlap: bool,
+    watch: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -510,6 +514,7 @@ async fn main() -> Result<()> {
             concurrency,
             timeout_seconds,
             poll_seconds,
+            watch,
             launcher,
             worker_command,
             allow_overlap,
@@ -530,6 +535,7 @@ async fn main() -> Result<()> {
                     launcher,
                     worker_command,
                     allow_overlap,
+                    watch,
                 },
             )
             .await
@@ -1271,6 +1277,7 @@ async fn supervise(
             worker_command: command,
             lock_dir: paths.data_dir.join("supervisors"),
             allow_overlap: options.allow_overlap,
+            watch: options.watch,
             #[cfg(test)]
             run_prefix: None,
         },
@@ -2480,6 +2487,7 @@ mod tests {
                 launcher: "pi".to_string(),
                 worker_command: None,
                 allow_overlap: false,
+                watch: false,
             },
         );
 
@@ -2522,6 +2530,7 @@ mod tests {
                 launcher: "fake".to_string(),
                 worker_command: None,
                 allow_overlap: false,
+                watch: false,
             },
         );
 
@@ -2605,6 +2614,7 @@ mod tests {
             launcher: "fake".to_string(),
             worker_command: None,
             allow_overlap: false,
+            watch: false,
         });
 
         let context = active_tasker_context(&command, &paths, true).expect("active context");
