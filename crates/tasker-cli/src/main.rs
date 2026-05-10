@@ -671,7 +671,14 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
             TaskCommand::Workpad { command } => workpad_command_queue_key(command),
             TaskCommand::Show { .. } => None,
         },
-        Some(Command::Work { queue, .. } | Command::Supervise { queue, .. }) => Some(queue.clone()),
+        Some(
+            Command::Work { queue, .. }
+            | Command::Supervise { queue, .. }
+            | Command::Monitor {
+                queue: Some(queue), ..
+            },
+        ) => Some(queue.clone()),
+        Some(Command::Monitor { queue: None, .. } | Command::Cleanup { .. }) => None,
         Some(Command::Merge { command }) => match command {
             MergeCommand::Inspect { .. } => None,
             MergeCommand::Done { identifier, .. } => queue_key_from_task_identifier(identifier),
