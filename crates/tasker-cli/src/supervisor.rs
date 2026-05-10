@@ -22,6 +22,7 @@ pub struct SupervisorOptions {
     pub worker_command: Vec<String>,
     pub lock_dir: PathBuf,
     pub allow_overlap: bool,
+    pub watch: bool,
     #[cfg(test)]
     pub run_prefix: Option<String>,
 }
@@ -98,6 +99,14 @@ pub async fn supervise_batch(
     let run_prefix = supervisor_run_prefix(&options);
     let status_dir = supervisor_status_dir(&run_prefix)?;
     println!("supervisor run prefix: {run_prefix}");
+    println!(
+        "supervisor mode: {}",
+        if options.watch {
+            "watch"
+        } else {
+            "bounded batch"
+        }
+    );
     let mut reports = SupervisorReports::default();
     let mut next_worker = 0usize;
     let mut saw_no_eligible = false;
@@ -117,15 +126,17 @@ pub async fn supervise_batch(
     while Instant::now() < deadline {
         reports.refresh(&mut outcome)?;
         let unblock = unblocking_state(pool, &options.queue, &reports).await?;
-        if active.is_empty() && outcome.started_workers > 0 && unblock.should_stop() {
+        if !options.watch
+            && active.is_empty()
+            && outcome.started_workers > 0
+            && unblock.should_stop()
+        {
             println!("{} for Task Queue {}", unblock.reason(), options.queue);
             return Ok(outcome);
         }
 
-        while !saw_no_eligible
-            && !unblock.has_only_reported_work
-            && active.len() < options.concurrency
-        {
+        let target_starts = worker_start_target(&options, &outcome, &active, &unblock);
+        while active.len() < options.concurrency && outcome.started_workers < target_starts {
             next_worker += 1;
             let actor = supervisor_worker_id(&run_prefix, next_worker);
             let status_path = status_dir.join(format!("{actor}.jsonl"));
@@ -137,6 +148,19 @@ pub async fn supervise_batch(
             outcome.started_workers += 1;
         }
 
+        if options.watch && active.is_empty() && unblock.unclaimed_eligible.is_empty() {
+            println!(
+                "idle polling Task Queue {} for eligible Tasks",
+                options.queue
+            );
+        } else {
+            println!(
+                "supervisor active workers: {} eligible_unclaimed={} active_runs={}",
+                active.len(),
+                unblock.unclaimed_eligible.len(),
+                unblock.active_runs
+            );
+        }
         print_progress(pool, &options.queue).await?;
 
         let mut index = 0;
@@ -187,7 +211,7 @@ pub async fn supervise_batch(
 
         reports.refresh(&mut outcome)?;
         let unblock = unblocking_state(pool, &options.queue, &reports).await?;
-        if active.is_empty() && (saw_no_eligible || unblock.should_stop()) {
+        if !options.watch && active.is_empty() && (saw_no_eligible || unblock.should_stop()) {
             let reason = if saw_no_eligible {
                 "drained queue"
             } else {
@@ -211,6 +235,33 @@ pub async fn supervise_batch(
         let _ = worker.child.wait();
     }
     Ok(outcome)
+}
+
+fn worker_start_target(
+    options: &SupervisorOptions,
+    outcome: &SupervisorOutcome,
+    active: &[WorkerProcess],
+    unblock: &UnblockingState,
+) -> usize {
+    if unblock.has_only_reported_work {
+        return outcome.started_workers;
+    }
+    if options.watch {
+        let available = unblock.unclaimed_eligible.len();
+        if available == 0 {
+            if outcome.started_workers == 0 && active.is_empty() {
+                return outcome.started_workers + 1;
+            }
+            return outcome.started_workers;
+        }
+        let desired_active = available.min(options.concurrency);
+        return outcome.started_workers + desired_active.saturating_sub(active.len());
+    }
+    if outcome.no_eligible_exits == 0 {
+        outcome.started_workers + (options.concurrency - active.len())
+    } else {
+        outcome.started_workers
+    }
 }
 
 fn spawn_worker(command: &[String], actor: &str, status_path: PathBuf) -> Result<WorkerProcess> {
@@ -631,6 +682,7 @@ mod tests {
                 worker_command: vec![script.display().to_string()],
                 lock_dir: temp.path().join("supervisors"),
                 allow_overlap: false,
+                watch: false,
                 run_prefix: Some("supervisor-test-no-eligible".to_string()),
             },
         )
@@ -640,6 +692,85 @@ mod tests {
         assert!(outcome.no_eligible_exits >= 1);
         assert!(outcome.started_workers <= 2);
         assert!(!outcome.timed_out);
+    }
+
+    #[tokio::test]
+    async fn supervisor_watch_picks_up_task_after_initial_no_eligible_exit() {
+        let temp = TempDir::new().expect("tempdir");
+        let count = temp.path().join("count");
+        let script = temp.path().join("worker.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ ! -f {count} ]; then echo 1 > {count}; echo 'no eligible Tasks found for Task Queue TASK'; exit 0; fi\nsleep 1\nexit 0\n",
+                count = count.display()
+            ),
+        )
+        .expect("write script");
+        make_executable(&script);
+        let pool = empty_pool(temp.path()).await;
+        seed_task(&pool, "backlog").await;
+        let supervise_pool = pool.clone();
+        let lock_dir = temp.path().join("supervisors");
+        let handle = tokio::spawn(async move {
+            supervise_batch(
+                &supervise_pool,
+                SupervisorOptions {
+                    queue: "TASK".to_string(),
+                    concurrency: 1,
+                    timeout_seconds: 3,
+                    poll_seconds: 1,
+                    worker_command: vec![script.display().to_string()],
+                    lock_dir,
+                    allow_overlap: false,
+                    watch: true,
+                    run_prefix: Some("supervisor-test-watch-late-ready".to_string()),
+                },
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        sqlx::query("UPDATE tasks SET state = 'ready' WHERE identifier = 'TASK-1'")
+            .execute(&pool)
+            .await
+            .expect("ready task");
+        let outcome = handle.await.expect("join").expect("supervise");
+
+        assert!(outcome.no_eligible_exits >= 1);
+        assert!(outcome.started_workers >= 2);
+        assert!(outcome.timed_out);
+    }
+
+    #[tokio::test]
+    async fn supervisor_watch_respects_concurrency_and_timeout() {
+        let temp = TempDir::new().expect("tempdir");
+        let script = temp.path().join("worker.sh");
+        fs::write(&script, "#!/bin/sh\nsleep 5\nexit 0\n").expect("write script");
+        make_executable(&script);
+        let pool = empty_pool(temp.path()).await;
+        seed_task(&pool, "ready").await;
+        seed_second_task(&pool, "ready").await;
+
+        let outcome = supervise_batch(
+            &pool,
+            SupervisorOptions {
+                queue: "TASK".to_string(),
+                concurrency: 2,
+                timeout_seconds: 2,
+                poll_seconds: 1,
+                worker_command: vec![script.display().to_string()],
+                lock_dir: temp.path().join("supervisors"),
+                allow_overlap: false,
+                watch: true,
+                run_prefix: Some("supervisor-test-watch-timeout".to_string()),
+            },
+        )
+        .await
+        .expect("supervise");
+
+        assert_eq!(outcome.started_workers, 2);
+        assert!(outcome.timed_out);
     }
 
     #[tokio::test]
@@ -681,6 +812,7 @@ mod tests {
                 worker_command: vec![script.display().to_string()],
                 lock_dir: temp.path().join("supervisors"),
                 allow_overlap: false,
+                watch: false,
                 run_prefix: Some("supervisor-test-handoff".to_string()),
             },
         )
@@ -711,6 +843,7 @@ mod tests {
                 worker_command: vec![script.display().to_string()],
                 lock_dir: temp.path().join("supervisors"),
                 allow_overlap: false,
+                watch: false,
                 run_prefix: Some("supervisor-test-stuck".to_string()),
             },
         )
@@ -787,6 +920,7 @@ mod tests {
             worker_command: vec!["worker".to_string()],
             lock_dir: PathBuf::from("/tmp/tasker-supervisor-locks"),
             allow_overlap: false,
+            watch: false,
             run_prefix: None,
         });
         let second = supervisor_run_prefix(&SupervisorOptions {
@@ -797,6 +931,7 @@ mod tests {
             worker_command: vec!["worker".to_string()],
             lock_dir: PathBuf::from("/tmp/tasker-supervisor-locks"),
             allow_overlap: false,
+            watch: false,
             run_prefix: None,
         });
 
@@ -834,6 +969,16 @@ mod tests {
 
     async fn seed_eligible_integrating_task(pool: &SqlitePool) {
         seed_task(pool, "integrating").await;
+    }
+
+    async fn seed_second_task(pool: &SqlitePool, state: &str) {
+        sqlx::query(
+            "INSERT INTO tasks (id, task_queue_id, identifier, sequence, title, brief, priority, state, review_required) VALUES ('task-2', 'queue-1', 'TASK-2', 2, 'Test 2', 'Brief', 'normal', ?, false)",
+        )
+        .bind(state)
+        .execute(pool)
+        .await
+        .expect("task 2");
     }
 
     async fn seed_task(pool: &SqlitePool, state: &str) {
