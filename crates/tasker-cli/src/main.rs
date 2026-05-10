@@ -54,6 +54,9 @@ enum Command {
     /// Show Tasker queue and Task State counts.
     Status,
     /// Open a read-only terminal Task status monitor.
+    #[command(
+        after_long_help = "Terminal notes:\n  tasker monitor uses raw mode and the alternate screen for interactive rendering.\n  Use --plain, or --once for a single plain snapshot, when terminal capabilities are limited.\n  Remote terminals and tmux should render normally when TERM is not dumb; if output is piped or TERM=dumb, tasker monitor prints one plain snapshot instead.\n\nSmoke fallback:\n  tasker monitor --queue TASKER --once --plain"
+    )]
     Monitor {
         /// Optional Task Queue Key filter.
         #[arg(long)]
@@ -1856,6 +1859,20 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn monitor_help_documents_plain_tmux_and_remote_terminal_expectations() {
+        let mut command = Cli::command();
+        let monitor = command
+            .find_subcommand_mut("monitor")
+            .expect("monitor subcommand");
+        let help = monitor.render_long_help().to_string();
+
+        assert!(help.contains("raw mode"));
+        assert!(help.contains("Remote terminals and tmux should render normally"));
+        assert!(help.contains("TERM=dumb"));
+        assert!(help.contains("tasker monitor --queue TASKER --once --plain"));
     }
 
     #[test]

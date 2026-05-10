@@ -151,10 +151,14 @@ impl<W: Write> Write for CrLfWriter<W> {
 }
 
 fn stdout_supports_terminal_ui() -> bool {
-    io::stdout().is_terminal()
-        && std::env::var("TERM")
-            .map(|term| term != "dumb")
-            .unwrap_or(true)
+    terminal_supports_ui(
+        io::stdout().is_terminal(),
+        std::env::var("TERM").ok().as_deref(),
+    )
+}
+
+fn terminal_supports_ui(is_terminal: bool, term: Option<&str>) -> bool {
+    is_terminal && !matches!(term, Some("dumb"))
 }
 
 pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Result<MonitorSnapshot> {
@@ -450,5 +454,43 @@ mod tests {
         write!(CrLfWriter::new(&mut out), "one\ntwo\n").expect("write");
 
         assert_eq!(String::from_utf8(out).expect("utf8"), "one\r\ntwo\r\n");
+    }
+
+    #[test]
+    fn raw_terminal_snapshot_output_normalizes_all_newlines_to_crlf() {
+        let snapshot = MonitorSnapshot {
+            config_path: PathBuf::from("/repo/.tasker/config.toml"),
+            db_path: PathBuf::from("/repo/.tasker/data/tasker.db"),
+            queue_filter: Some("TASK".to_string()),
+            captured_at: "2026-05-09 00:00:00".to_string(),
+            queues: vec![QueueSnapshot {
+                key: "TASK".to_string(),
+                name: "Tasker".to_string(),
+                state_counts: vec![("ready".to_string(), 1)],
+                active_agent_runs: 0,
+                active_retry_holds: 0,
+                active_runs: Vec::new(),
+                retry_holds: Vec::new(),
+            }],
+            recent_runs: Vec::new(),
+        };
+        let mut out = Vec::new();
+
+        write_snapshot(CrLfWriter::new(&mut out), &snapshot).expect("write");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(text.contains("Tasker terminal status monitor\r\n"));
+        assert!(text.contains("\r\nTask Queue: TASK\tTasker\r\n"));
+        assert!(!text.contains("\n  ready: 1\n"));
+    }
+
+    #[test]
+    fn terminal_ui_capability_rejects_non_terminal_or_dumb_terminal() {
+        assert!(terminal_supports_ui(true, None));
+        assert!(terminal_supports_ui(true, Some("xterm-256color")));
+        assert!(terminal_supports_ui(true, Some("tmux-256color")));
+        assert!(terminal_supports_ui(true, Some("screen-256color")));
+        assert!(!terminal_supports_ui(false, Some("xterm-256color")));
+        assert!(!terminal_supports_ui(true, Some("dumb")));
     }
 }
