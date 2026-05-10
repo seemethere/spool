@@ -368,6 +368,12 @@ enum CleanupCommand {
 
 #[derive(Debug, Subcommand)]
 enum MergeCommand {
+    /// List Integrating Tasks for temporary Manual Dogfood Merge inspection.
+    Queue {
+        /// Optional Task Queue Key filter.
+        #[arg(long)]
+        queue: Option<String>,
+    },
     /// Print a temporary Manual Dogfood Merge inspection plan for a Task.
     Inspect { identifier: String },
     /// Mark a manually merged Integrating Task Done after explicit confirmation.
@@ -680,6 +686,7 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
         ) => Some(queue.clone()),
         Some(Command::Monitor { queue: None, .. } | Command::Cleanup { .. }) => None,
         Some(Command::Merge { command }) => match command {
+            MergeCommand::Queue { queue } => queue.clone(),
             MergeCommand::Inspect { .. } => None,
             MergeCommand::Done { identifier, .. } => queue_key_from_task_identifier(identifier),
         },
@@ -1390,6 +1397,10 @@ fn print_cleanup_report(report: &cleanup::CleanupReport) {
 async fn merge(paths: &TaskerPaths, db_path_overridden: bool, command: MergeCommand) -> Result<()> {
     let pool = open_pool(paths, db_path_overridden).await?;
     match command {
+        MergeCommand::Queue { queue } => {
+            let rows = tasker_db::merge_queue_tasks(&pool, queue.as_deref()).await?;
+            print_manual_merge_queue(&rows);
+        }
         MergeCommand::Inspect { identifier } => {
             let detail = tasker_db::get_task_detail(&pool, &identifier)
                 .await?
@@ -1437,6 +1448,130 @@ async fn merge(paths: &TaskerPaths, db_path_overridden: bool, command: MergeComm
         }
     }
     Ok(())
+}
+
+fn print_manual_merge_queue(rows: &[tasker_db::MergeQueueTask]) {
+    println!("Manual Dogfood Merge queue");
+    println!("temporary helper: read-only view for Integrating Tasks; Git operations remain operator-side; Tasker Service performs no Git mutations");
+    println!("Tasks: {}", rows.len());
+    if rows.is_empty() {
+        println!("(none)");
+        return;
+    }
+    println!();
+    for row in rows {
+        let git = inspect_merge_queue_git(
+            row.local_worktree.as_deref(),
+            row.task_branch.as_deref(),
+            &row.main_branch,
+        );
+        let gates_ready = row.pending_acceptance_criteria == 0
+            && row.pending_validation_items == 0
+            && row.failed_validation_items == 0;
+        let has_task_commit = git.task_commits.unwrap_or(false);
+        let clean = git.clean.unwrap_or(false);
+        let ready = gates_ready && clean && has_task_commit;
+        println!(
+            "{} [{}] {}",
+            row.task_identifier,
+            if ready { "ready" } else { "attention" },
+            row.title
+        );
+        println!("  Task Queue: {}", row.queue_key);
+        println!(
+            "  Task Branch: {}",
+            row.task_branch.as_deref().unwrap_or("missing Task Link")
+        );
+        println!(
+            "  Local Worktree: {}",
+            row.local_worktree.as_deref().unwrap_or("missing Task Link")
+        );
+        println!("  Main Branch: {}", row.main_branch);
+        println!(
+            "  Latest Agent Run: {} ({})",
+            row.latest_agent_run_id.as_deref().unwrap_or("none"),
+            row.latest_agent_run_outcome.as_deref().unwrap_or("none")
+        );
+        println!(
+            "  Structured gates: {} pending Acceptance Criteria, {} pending Validation Items, {} failed Validation Items",
+            row.pending_acceptance_criteria, row.pending_validation_items, row.failed_validation_items
+        );
+        println!("  Local Worktree clean: {}", git.label(git.clean));
+        println!("  Task Commits present: {}", git.label(git.task_commits));
+        println!(
+            "  Merge inspection readiness: {}",
+            if ready {
+                "clean and gate-satisfied"
+            } else {
+                "operator attention needed"
+            }
+        );
+        if let Some(warning) = git.warning {
+            println!("  Attention: {warning}");
+        }
+        println!("  Detail: tasker merge inspect {}", row.task_identifier);
+        println!();
+    }
+}
+
+#[derive(Debug, Default)]
+struct MergeQueueGitInspection {
+    clean: Option<bool>,
+    task_commits: Option<bool>,
+    warning: Option<String>,
+}
+
+impl MergeQueueGitInspection {
+    fn label(&self, value: Option<bool>) -> &'static str {
+        match value {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unknown",
+        }
+    }
+}
+
+fn inspect_merge_queue_git(
+    local_worktree: Option<&str>,
+    task_branch: Option<&str>,
+    main_branch: &str,
+) -> MergeQueueGitInspection {
+    let Some(local_worktree) = local_worktree else {
+        return MergeQueueGitInspection {
+            warning: Some("missing Local Worktree Task Link".to_string()),
+            ..MergeQueueGitInspection::default()
+        };
+    };
+    let worktree = Path::new(local_worktree);
+    if !worktree.exists() {
+        return MergeQueueGitInspection {
+            warning: Some("Local Worktree path does not exist".to_string()),
+            ..MergeQueueGitInspection::default()
+        };
+    }
+
+    let clean = git_output(worktree, &["status", "--porcelain"])
+        .ok()
+        .map(|status| status.trim().is_empty());
+    let checked_out_branch = git_output(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .ok()
+        .map(|branch| branch.trim().to_string());
+    let warning = match (checked_out_branch.as_deref(), task_branch) {
+        (Some(actual), Some(expected)) if actual != expected => Some(format!(
+            "checked-out branch {actual} differs from Task Branch {expected}"
+        )),
+        _ => None,
+    };
+    let commits = format!("{main_branch}..HEAD");
+    let task_commits = git_output(worktree, &["log", "--oneline", &commits])
+        .ok()
+        .map(|log| !log.trim().is_empty());
+
+    MergeQueueGitInspection {
+        clean,
+        task_commits,
+        warning,
+    }
 }
 
 fn print_manual_merge_inspection(
@@ -2262,6 +2397,26 @@ Implement Bootstrap Task Creation.
             .expect("get task")
             .expect("task");
         assert_eq!(detail.task.state, "integrating");
+        let merge_queue = tasker_db::merge_queue_tasks(&pool, Some("TASK"))
+            .await
+            .expect("merge queue snapshot");
+        assert_eq!(merge_queue.len(), 1);
+        assert_eq!(merge_queue[0].task_identifier, "TASK-1");
+        assert_eq!(
+            merge_queue[0].latest_agent_run_outcome.as_deref(),
+            Some("completed")
+        );
+        assert_eq!(merge_queue[0].pending_acceptance_criteria, 0);
+        assert_eq!(merge_queue[0].pending_validation_items, 0);
+        merge(
+            &paths,
+            false,
+            MergeCommand::Queue {
+                queue: Some("TASK".to_string()),
+            },
+        )
+        .await
+        .expect("list manual merge queue");
         merge(
             &paths,
             false,

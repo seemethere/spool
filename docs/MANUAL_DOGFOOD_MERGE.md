@@ -44,13 +44,21 @@ If post-merge validation fails, treat it as unresolved Manual Dogfood Merge work
 
 ## Inspect the Task and Agent Run
 
-The temporary CLI helper prints a Manual Dogfood Merge inspection plan and runs only read-only Git inspection commands from the **Local Worktree**:
+The temporary CLI queue helper lists current **Integrating** **Tasks** and runs only read-only Git inspection commands from each **Local Worktree**:
+
+```bash
+cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data merge queue --queue TASKER
+```
+
+It summarizes **Task Branch**, **Local Worktree**, latest **Agent Run** outcome, structured gate counts, clean worktree status, whether **Task Commits** are present, and whether the Task looks ready for operator merge inspection or needs attention.
+
+The per-Task temporary CLI helper prints a Manual Dogfood Merge inspection plan and also runs only read-only Git inspection commands from the **Local Worktree**:
 
 ```bash
 cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data merge inspect <task-identifier>
 ```
 
-It summarizes the **Local Worktree**, **Task Branch**, whether the worktree is clean, how the **Task Branch** differs from the **Main Branch**, suggested validation commands, latest **Agent Run**, **Run Transcript**, **Launcher Session Data**, and **Workpad Note** presence. It does not mutate Git state, and any later refresh or merge remains an operator-side action outside the **Tasker Service**. For deeper inspection, use the underlying Tasker reads:
+It summarizes the **Local Worktree**, **Task Branch**, whether the worktree is clean, how the **Task Branch** differs from the **Main Branch**, suggested validation commands, latest **Agent Run**, **Run Transcript**, **Launcher Session Data**, and **Workpad Note** presence. These helpers do not mutate Git state, and any later refresh or merge remains an operator-side action outside the **Tasker Service**. For deeper inspection, use the underlying Tasker reads:
 
 ```bash
 cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data task show <task-identifier>

@@ -565,6 +565,21 @@ pub struct ActiveRetryHoldStatus {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct MergeQueueTask {
+    pub queue_key: String,
+    pub task_identifier: String,
+    pub title: String,
+    pub task_branch: Option<String>,
+    pub local_worktree: Option<String>,
+    pub main_branch: String,
+    pub latest_agent_run_id: Option<String>,
+    pub latest_agent_run_outcome: Option<String>,
+    pub pending_acceptance_criteria: i64,
+    pub pending_validation_items: i64,
+    pub failed_validation_items: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateRequirementStatus {
     pub status: String,
@@ -1610,6 +1625,70 @@ pub async fn active_retry_holds_for_status(
     .fetch_all(pool)
     .await
     .context("failed to load active Retry Holds for status")
+}
+
+pub async fn merge_queue_tasks(
+    pool: &SqlitePool,
+    queue_key: Option<&str>,
+) -> Result<Vec<MergeQueueTask>> {
+    sqlx::query_as::<_, MergeQueueTask>(
+        r#"
+        SELECT
+            task_queues.key AS queue_key,
+            tasks.identifier AS task_identifier,
+            tasks.title AS title,
+            (
+                SELECT task_links.target FROM task_links
+                WHERE task_links.task_id = tasks.id AND task_links.kind = 'task_branch'
+                ORDER BY task_links.is_primary DESC, task_links.created_at DESC, task_links.id DESC
+                LIMIT 1
+            ) AS task_branch,
+            (
+                SELECT task_links.target FROM task_links
+                WHERE task_links.task_id = tasks.id AND task_links.kind = 'local_worktree'
+                ORDER BY task_links.is_primary DESC, task_links.created_at DESC, task_links.id DESC
+                LIMIT 1
+            ) AS local_worktree,
+            task_queues.main_branch AS main_branch,
+            (
+                SELECT agent_runs.id FROM agent_runs
+                WHERE agent_runs.task_id = tasks.id
+                ORDER BY agent_runs.created_at DESC, agent_runs.id DESC
+                LIMIT 1
+            ) AS latest_agent_run_id,
+            (
+                SELECT COALESCE(agent_runs.outcome, 'active') FROM agent_runs
+                WHERE agent_runs.task_id = tasks.id
+                ORDER BY agent_runs.created_at DESC, agent_runs.id DESC
+                LIMIT 1
+            ) AS latest_agent_run_outcome,
+            (
+                SELECT COUNT(*) FROM acceptance_criteria
+                WHERE acceptance_criteria.task_id = tasks.id
+                  AND acceptance_criteria.status NOT IN ('satisfied', 'waived')
+            ) AS pending_acceptance_criteria,
+            (
+                SELECT COUNT(*) FROM validation_items
+                WHERE validation_items.task_id = tasks.id
+                  AND validation_items.status NOT IN ('passed', 'waived')
+            ) AS pending_validation_items,
+            (
+                SELECT COUNT(*) FROM validation_items
+                WHERE validation_items.task_id = tasks.id
+                  AND validation_items.status = 'failed'
+            ) AS failed_validation_items
+        FROM tasks
+        JOIN task_queues ON task_queues.id = tasks.task_queue_id
+        WHERE tasks.state = 'integrating'
+          AND (? IS NULL OR task_queues.key = ?)
+        ORDER BY task_queues.key, tasks.identifier
+        "#,
+    )
+    .bind(queue_key)
+    .bind(queue_key)
+    .fetch_all(pool)
+    .await
+    .context("failed to load Manual Dogfood Merge queue")
 }
 
 pub async fn claim_next(
