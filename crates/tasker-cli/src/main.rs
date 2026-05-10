@@ -90,6 +90,11 @@ enum Command {
         #[command(subcommand)]
         command: RunCommand,
     },
+    /// Temporary Manual Dogfood Merge helpers.
+    Merge {
+        #[command(subcommand)]
+        command: MergeCommand,
+    },
     /// Start the Tasker Service.
     Serve {
         /// Override the service bind address.
@@ -235,6 +240,23 @@ enum RunCommand {
     Show { run_id: String },
 }
 
+#[derive(Debug, Subcommand)]
+enum MergeCommand {
+    /// Print a temporary Manual Dogfood Merge inspection plan for a Task.
+    Inspect { identifier: String },
+    /// Mark a manually merged Integrating Task Done after explicit confirmation.
+    Done {
+        /// Task Identifier.
+        identifier: String,
+        /// Confirm that the operator already performed the Local Merge outside Tasker.
+        #[arg(long)]
+        manual: bool,
+        /// Operator actor display name for audit attribution.
+        #[arg(long, default_value = "local-operator")]
+        actor: String,
+    },
+}
+
 struct WorkOptions {
     queue: String,
     once: bool,
@@ -297,6 +319,7 @@ async fn main() -> Result<()> {
             .await
         }
         Some(Command::Run { command }) => run(&paths, db_path_overridden, command).await,
+        Some(Command::Merge { command }) => merge(&paths, db_path_overridden, command).await,
         Some(Command::Serve { bind }) => serve(&paths, bind, db_path_overridden).await,
         Some(Command::Version) => {
             println!("{}", env!("CARGO_PKG_VERSION"));
@@ -648,6 +671,162 @@ async fn run(paths: &TaskerPaths, db_path_overridden: bool, command: RunCommand)
     Ok(())
 }
 
+async fn merge(paths: &TaskerPaths, db_path_overridden: bool, command: MergeCommand) -> Result<()> {
+    let pool = open_pool(paths, db_path_overridden).await?;
+    match command {
+        MergeCommand::Inspect { identifier } => {
+            let detail = tasker_db::get_task_detail(&pool, &identifier)
+                .await?
+                .with_context(|| format!("Task {identifier} not found"))?;
+            let queue = tasker_db::get_task_queue(&pool, &detail.task.task_queue_key)
+                .await?
+                .with_context(|| format!("Task Queue {} not found", detail.task.task_queue_key))?;
+            let latest_run =
+                tasker_db::get_latest_agent_run_detail_for_task(&pool, &identifier).await?;
+            print_manual_merge_inspection(&detail, &queue, latest_run.as_ref());
+        }
+        MergeCommand::Done {
+            identifier,
+            manual,
+            actor,
+        } => {
+            if !manual {
+                anyhow::bail!(
+                    "refusing to mark Task Done without --manual confirmation that the Local Merge was performed outside Tasker"
+                );
+            }
+            let current = tasker_db::get_task_detail(&pool, &identifier)
+                .await?
+                .with_context(|| format!("Task {identifier} not found"))?;
+            if current.task.state != "integrating" {
+                anyhow::bail!(
+                    "Manual Dogfood Merge completion requires Task State integrating; current state is {}",
+                    current.task.state
+                );
+            }
+            let detail = tasker_db::transition_task_state(
+                &pool,
+                &identifier,
+                &tasker_db::TransitionTaskState {
+                    to_state: "done".to_string(),
+                    agent_run_id: None,
+                },
+                &tasker_db::Actor::operator(actor),
+            )
+            .await?;
+            println!(
+                "marked manually merged Task {} Done",
+                detail.task.identifier
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_manual_merge_inspection(
+    detail: &tasker_db::TaskDetail,
+    queue: &tasker_db::TaskQueue,
+    latest_run: Option<&tasker_db::AgentRunDetail>,
+) {
+    let local_worktree = detail
+        .task_links
+        .iter()
+        .find(|link| link.kind == "local_worktree")
+        .map(|link| link.target.as_str());
+    let task_branch = detail
+        .task_links
+        .iter()
+        .find(|link| link.kind == "task_branch")
+        .map(|link| link.target.as_str());
+
+    println!("Manual Dogfood Merge inspection plan");
+    println!("temporary helper: Git operations remain operator-side; Tasker Service performs no Git mutations");
+    println!();
+    println!("Task: {}", detail.task.identifier);
+    println!("title: {}", detail.task.title);
+    println!("Task State: {}", detail.task.state);
+    println!("Task Queue: {}", detail.task.task_queue_key);
+    println!(
+        "Managed Source Repository: {}",
+        queue.managed_source_repository
+    );
+    println!("Main Branch: {}", queue.main_branch);
+    println!(
+        "Local Worktree: {}",
+        local_worktree.unwrap_or("missing Task Link")
+    );
+    println!(
+        "Task Branch: {}",
+        task_branch.unwrap_or("missing Task Link")
+    );
+    println!(
+        "Workpad Note: {}",
+        if detail.workpad_note.is_some() {
+            "present"
+        } else {
+            "missing"
+        }
+    );
+    println!();
+    println!("Latest Agent Run:");
+    if let Some(run) = latest_run {
+        println!("  id: {}", run.run.id);
+        println!("  launcher: {}", run.run.launcher_kind);
+        println!(
+            "  outcome: {}",
+            run.run.outcome.as_deref().unwrap_or("active")
+        );
+        if let Some(reason) = &run.run.failure_reason {
+            println!("  failure reason: {reason}");
+        }
+        if let Some(session) = &run.launcher_session_data {
+            println!(
+                "  Run Transcript: {}",
+                session.transcript_path.as_deref().unwrap_or("not recorded")
+            );
+            println!(
+                "  Launcher Session Data: present{}",
+                session
+                    .final_status
+                    .as_deref()
+                    .map(|status| format!(" (final status: {status})"))
+                    .unwrap_or_default()
+            );
+        } else {
+            println!("  Run Transcript: not recorded");
+            println!("  Launcher Session Data: missing");
+        }
+    } else {
+        println!("  (none)");
+        println!("  Run Transcript: not recorded");
+        println!("  Launcher Session Data: missing");
+    }
+    println!();
+    println!("Structured gates:");
+    for criterion in &detail.acceptance_criteria {
+        println!(
+            "  Acceptance Criterion {}: [{}] {}",
+            criterion.position, criterion.status, criterion.description
+        );
+    }
+    for item in &detail.validation_items {
+        println!(
+            "  Validation Item {}: [{}] {}",
+            item.position, item.status, item.description
+        );
+    }
+    println!();
+    println!("Operator-side checklist:");
+    println!("  1. Inspect Tasker state, latest Agent Run, Run Transcript, and Workpad Note.");
+    println!("  2. From the Local Worktree, verify a clean working tree and focused Task Commits.");
+    println!("  3. Run current validation from the Local Worktree after any refresh.");
+    println!("  4. Perform the Local Merge into the Main Branch outside Tasker.");
+    println!(
+        "  5. After the manual merge, run: tasker merge done {} --manual",
+        detail.task.identifier
+    );
+}
+
 async fn serve(
     paths: &TaskerPaths,
     bind: Option<SocketAddr>,
@@ -793,7 +972,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_commands_create_show_workpad_and_status() {
+    async fn task_commands_create_show_workpad_status_and_merge() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = TaskerPaths::resolve(temp.path(), PathOverrides::default());
         init(&paths, false).await.expect("init");
@@ -963,6 +1142,43 @@ Implement Bootstrap Task Creation.
             .expect("get task")
             .expect("task");
         assert_eq!(detail.task.state, "integrating");
+        merge(
+            &paths,
+            false,
+            MergeCommand::Inspect {
+                identifier: "TASK-1".to_string(),
+            },
+        )
+        .await
+        .expect("inspect manual merge");
+        let missing_manual = merge(
+            &paths,
+            false,
+            MergeCommand::Done {
+                identifier: "TASK-1".to_string(),
+                manual: false,
+                actor: "tester".to_string(),
+            },
+        )
+        .await
+        .expect_err("manual confirmation required");
+        assert!(missing_manual.to_string().contains("--manual"));
+        merge(
+            &paths,
+            false,
+            MergeCommand::Done {
+                identifier: "TASK-1".to_string(),
+                manual: true,
+                actor: "tester".to_string(),
+            },
+        )
+        .await
+        .expect("mark manually merged done");
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("get task")
+            .expect("task");
+        assert_eq!(detail.task.state, "done");
         status(&paths, false).await.expect("status");
     }
 

@@ -22,6 +22,14 @@ Do not batch-merge several **Task Branches** without separately inspecting their
 
 ## Inspect the Task and Agent Run
 
+The temporary CLI helper prints a Manual Dogfood Merge inspection plan without running Git commands:
+
+```bash
+cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data merge inspect <task-identifier>
+```
+
+It summarizes the **Local Worktree**, **Task Branch**, latest **Agent Run**, **Run Transcript**, **Launcher Session Data**, and **Workpad Note** presence. For deeper inspection, use the underlying Tasker reads:
+
 ```bash
 cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data task show <task-identifier>
 cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data run show <agent-run-id>
@@ -63,6 +71,10 @@ From the **Managed Source Repository**, inspect the **Task Branch** against the 
 
 Tasker does not perform Git mutations in the **Tasker Service**. During Manual Dogfood Merge, Git commands are operator actions performed in the local repository, not hidden Tasker behavior.
 
-After merge and validation, record a final **Workpad Note** or audit-relevant context through the CLI/API, then request **Task State** transitions only through supported Tasker gates.
+After merge and validation, record a final **Workpad Note** or audit-relevant context through the CLI/API, then request **Task State** transitions only through supported Tasker gates. The temporary confirmation helper only marks an already-merged **Integrating** Task as **Done** when the operator explicitly confirms `--manual`:
 
-This procedure is intentionally temporary and does not replace the target **Integrating** implementation, **Agent-Gated Integration**, or automated **Squash Merge**.
+```bash
+cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data merge done <task-identifier> --manual
+```
+
+This command performs no Git operations; it records the Task State transition through existing Tasker gates. This procedure is intentionally temporary and does not replace the target **Integrating** implementation, **Agent-Gated Integration**, or automated **Squash Merge**.
