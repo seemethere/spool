@@ -71,7 +71,9 @@ These do not replace the target model.
 
 ## Project dogfooding command safety
 
-Project dogfooding commands must use the project Tasker database, not the default user Tasker database. Prefer the repo-local `bin/tasker-local` wrapper once it exists; otherwise run Tasker CLI commands from the Managed Source Repository root and pass the project config explicitly:
+Project dogfooding commands must use the project Tasker database, not the default user Tasker database. Prefer the repo-local `bin/tasker-local` wrapper for project dogfood CLI reads and operator/debug commands. It runs the workspace-built `target/debug/tasker` binary with the repository's `.tasker/config.toml`; build it first with `cargo build -p tasker-cli` when the wrapper reports the binary is missing.
+
+If the wrapper is unavailable, run Tasker CLI commands from the Managed Source Repository root and pass the project config explicitly:
 
 ```bash
 cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data <tasker-args>
@@ -82,7 +84,7 @@ Do not run bare `tasker task create`, `tasker status`, `tasker work`, or `tasker
 Before any Tasker mutation for project dogfooding, run this preflight and confirm it prints `key: TASKER`:
 
 ```bash
-cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data queue show TASKER
+bin/tasker-local queue show TASKER
 ```
 
 Only continue with project dogfooding mutations when the preflight shows the `TASKER` Task Queue from the project database.
