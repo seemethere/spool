@@ -4,6 +4,8 @@ use std::{
     path::Path,
 };
 
+use serde::Serialize;
+
 pub fn write_task_detail(mut writer: impl Write, detail: &tasker_db::TaskDetail) -> Result<()> {
     writeln!(writer, "Task: {}", detail.task.identifier)?;
     writeln!(writer, "title: {}", detail.task.title)?;
@@ -116,8 +118,8 @@ pub fn print_task_detail(detail: &tasker_db::TaskDetail) -> Result<()> {
     write_task_detail(std::io::stdout(), detail)
 }
 
-#[derive(Debug, Default)]
-struct TranscriptSummary {
+#[derive(Debug, Default, Serialize)]
+pub struct TranscriptSummary {
     agent_end: Option<bool>,
     timed_out: Option<bool>,
     unattended_question_detected: Option<bool>,
@@ -295,6 +297,79 @@ fn write_transcript_summary(
     for warning in summary.warnings {
         writeln!(writer, "  warning: {warning}")?;
     }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct LauncherSessionTelemetry<'a> {
+    launcher_kind: &'a str,
+    session_id: Option<&'a str>,
+    model: Option<&'a str>,
+    provider: Option<&'a str>,
+    started_at: Option<&'a str>,
+    finished_at: Option<&'a str>,
+    final_status: Option<&'a str>,
+    transcript_path: Option<&'a str>,
+    transcript_summary: Option<TranscriptSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct RunTelemetry<'a> {
+    agent_run_id: &'a str,
+    task_identifier: &'a str,
+    task_title: &'a str,
+    task_state: &'a str,
+    worker_agent: &'a str,
+    launcher: &'a str,
+    claim_lease_expires_at: &'a str,
+    outcome: Option<&'a str>,
+    failure_reason: Option<&'a str>,
+    created_at: &'a str,
+    finished_at: Option<&'a str>,
+    launcher_session_data: Option<LauncherSessionTelemetry<'a>>,
+}
+
+fn run_telemetry(detail: &tasker_db::AgentRunDetail) -> RunTelemetry<'_> {
+    let launcher_session_data = detail.launcher_session_data.as_ref().map(|session| {
+        let transcript_summary = session
+            .transcript_path
+            .as_deref()
+            .map(|path| summarize_transcript(Path::new(path), session.raw_json.as_deref()));
+        LauncherSessionTelemetry {
+            launcher_kind: &session.launcher_kind,
+            session_id: session.session_id.as_deref(),
+            model: session.model.as_deref(),
+            provider: session.provider.as_deref(),
+            started_at: session.started_at.as_deref(),
+            finished_at: session.finished_at.as_deref(),
+            final_status: session.final_status.as_deref(),
+            transcript_path: session.transcript_path.as_deref(),
+            transcript_summary,
+        }
+    });
+    RunTelemetry {
+        agent_run_id: &detail.run.id,
+        task_identifier: &detail.task.task.identifier,
+        task_title: &detail.task.task.title,
+        task_state: &detail.task.task.state,
+        worker_agent: &detail.run.worker_actor_display_name,
+        launcher: &detail.run.launcher_kind,
+        claim_lease_expires_at: &detail.run.lease_expires_at,
+        outcome: detail.run.outcome.as_deref(),
+        failure_reason: detail.run.failure_reason.as_deref(),
+        created_at: &detail.run.created_at,
+        finished_at: detail.run.finished_at.as_deref(),
+        launcher_session_data,
+    }
+}
+
+pub fn write_run_detail_json(
+    mut writer: impl Write,
+    detail: &tasker_db::AgentRunDetail,
+) -> Result<()> {
+    serde_json::to_writer_pretty(&mut writer, &run_telemetry(detail))
+        .map_err(std::io::Error::other)?;
+    writeln!(writer)?;
     Ok(())
 }
 
@@ -542,6 +617,52 @@ mod tests {
         assert!(text.contains("stderr captured:"));
         assert!(!text.contains("secret-token"));
         assert!(!text.contains("very secret stderr"));
+    }
+
+    #[test]
+    fn run_detail_json_summarizes_transcript_without_raw_blobs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let transcript_path = temp.path().join("pi.jsonl");
+        std::fs::write(
+            &transcript_path,
+            serde_json::json!({
+                "status": 7,
+                "stdout": "{\"type\":\"agent_end\"}\nsecret-token",
+                "stderr": "very secret stderr",
+                "timed_out": true,
+                "unattended_question_detected": false
+            })
+            .to_string(),
+        )
+        .expect("write transcript");
+        let detail = sample_run_detail(
+            Some(transcript_path.display().to_string()),
+            Some(
+                serde_json::json!({"exit_code": 7, "timed_out": true, "secret": "raw-secret"})
+                    .to_string(),
+            ),
+        );
+        let mut out = Vec::new();
+
+        write_run_detail_json(&mut out, &detail).expect("write json");
+        let text = String::from_utf8(out).expect("utf8");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+
+        assert_eq!(value["agent_run_id"], "run-1");
+        assert_eq!(value["task_identifier"], "TASK-1");
+        assert_eq!(
+            value["launcher_session_data"]["transcript_summary"]["agent_end"],
+            true
+        );
+        assert!(
+            value["launcher_session_data"]["transcript_summary"]["stdout_bytes"]
+                .as_u64()
+                .expect("stdout bytes")
+                > 0
+        );
+        assert!(!text.contains("secret-token"));
+        assert!(!text.contains("very secret stderr"));
+        assert!(!text.contains("raw-secret"));
     }
 
     #[test]
