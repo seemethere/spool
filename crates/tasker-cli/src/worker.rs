@@ -73,7 +73,28 @@ pub async fn run_worker_once(
         });
     };
 
-    let worktree_path = prepare_local_worktree(pool, &claimed.task, &actor).await?;
+    let worktree_path = match prepare_local_worktree(pool, &claimed.task, &actor).await {
+        Ok(path) => path,
+        Err(error) => {
+            let failure_reason = format!("Local Worktree setup failed after claim: {error:#}");
+            let finished = tasker_db::finish_run(
+                pool,
+                &claimed.run.id,
+                &tasker_db::FinishRunInput {
+                    outcome: "failed".to_string(),
+                    failure_reason: Some(failure_reason),
+                    retry_hold_seconds: request.retry_hold_seconds,
+                },
+                &actor,
+            )
+            .await?;
+            return Ok(WorkOnceOutcome::Finished {
+                task_identifier: claimed.task.task.identifier,
+                run_id: finished.id,
+                outcome: finished.outcome.unwrap_or_else(|| "unknown".to_string()),
+            });
+        }
+    };
     tasker_db::heartbeat_run(pool, &claimed.run.id, request.lease_seconds, &actor).await?;
     let transcript_dir = request.data_dir.join("runs").join(&claimed.run.id);
     fs::create_dir_all(&transcript_dir).with_context(|| {
@@ -554,10 +575,10 @@ async fn prepare_local_worktree(
         &worktree_path,
     )?;
 
-    tasker_db::upsert_task_link(
+    upsert_task_link_with_lock_retry(
         pool,
         &task.task.identifier,
-        &tasker_db::UpsertTaskLink {
+        tasker_db::UpsertTaskLink {
             kind: "local_worktree".to_string(),
             target: worktree_path.display().to_string(),
             label: Some("Local Worktree".to_string()),
@@ -566,10 +587,10 @@ async fn prepare_local_worktree(
         actor,
     )
     .await?;
-    tasker_db::upsert_task_link(
+    upsert_task_link_with_lock_retry(
         pool,
         &task.task.identifier,
-        &tasker_db::UpsertTaskLink {
+        tasker_db::UpsertTaskLink {
             kind: "task_branch".to_string(),
             target: branch,
             label: Some("Task Branch".to_string()),
@@ -579,6 +600,38 @@ async fn prepare_local_worktree(
     )
     .await?;
     Ok(worktree_path)
+}
+
+async fn upsert_task_link_with_lock_retry(
+    pool: &SqlitePool,
+    identifier: &str,
+    input: tasker_db::UpsertTaskLink,
+    actor: &tasker_db::Actor,
+) -> Result<tasker_db::TaskDetail> {
+    const MAX_ATTEMPTS: usize = 5;
+    let mut delay = Duration::from_millis(50);
+    for attempt in 1..=MAX_ATTEMPTS {
+        match tasker_db::upsert_task_link(pool, identifier, &input, actor).await {
+            Ok(detail) => return Ok(detail),
+            Err(error) if attempt < MAX_ATTEMPTS && is_transient_sqlite_lock(&error) => {
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("Task Link upsert retry loop always returns")
+}
+
+fn is_transient_sqlite_lock(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("database is locked")
+            || message.contains("database table is locked")
+            || message.contains("sqlite busy")
+            || message.contains("code: 5")
+            || message.contains("code: 6")
+    })
 }
 
 fn setup_local_worktree(
@@ -826,6 +879,56 @@ mod tests {
             .any(|link| link.kind == "task_branch" && link.target == "tasker/TASK-1"));
         let runs_dir = temp.path().join("data/runs");
         assert!(runs_dir.is_dir());
+    }
+
+    #[tokio::test]
+    async fn worker_finishes_run_failed_when_local_worktree_setup_fails_after_claim() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let worktrees = temp.path().join("worktrees");
+        init_git_repo(&repo);
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        seed_ready_task(&pool, &repo, &worktrees).await;
+        fs::write(repo.join("dirty.txt"), "dirty").expect("dirty repo");
+
+        let outcome = run_worker_once(
+            &pool,
+            WorkOnceRequest {
+                queue: "TASK".to_string(),
+                launcher: "fake".to_string(),
+                actor: "worker".to_string(),
+                fake_outcome: "completed".to_string(),
+                lease_seconds: 90,
+                retry_hold_seconds: Some(7),
+                max_run_seconds: None,
+                data_dir: temp.path().join("data"),
+                api_url: "http://127.0.0.1:4317".to_string(),
+                api_token: "token".to_string(),
+                pi_bin: "pi".to_string(),
+                pi_extension: None,
+                worker_prompt: None,
+            },
+        )
+        .await
+        .expect("run worker");
+
+        let WorkOnceOutcome::Finished {
+            run_id, outcome, ..
+        } = outcome
+        else {
+            panic!("finished")
+        };
+        assert_eq!(outcome, "failed");
+        let run = tasker_db::get_agent_run(&pool, &run_id)
+            .await
+            .expect("load run")
+            .expect("run");
+        assert!(run.finished_at.is_some());
+        let failure_reason = run.failure_reason.expect("failure reason");
+        assert!(failure_reason.contains("Local Worktree setup failed after claim"));
+        assert!(failure_reason.contains("unexpected uncommitted changes"));
     }
 
     #[cfg(unix)]
@@ -1245,6 +1348,15 @@ mod tests {
         .expect_err("option-like branch fails");
 
         assert!(error.to_string().contains("non-option Git branch"));
+    }
+
+    #[test]
+    fn sqlite_lock_retry_detection_recognizes_lock_errors() {
+        let error = anyhow::anyhow!("failed to upsert Task Link: database is locked");
+        assert!(is_transient_sqlite_lock(&error));
+
+        let error = anyhow::anyhow!("failed to upsert Task Link: malformed input");
+        assert!(!is_transient_sqlite_lock(&error));
     }
 
     #[test]
