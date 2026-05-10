@@ -818,7 +818,29 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
                 println!();
             }
             println!("Task Queue: {queue_header}");
+            match row.queue_concurrency_limit {
+                Some(limit) => {
+                    let available = (limit - row.active_agent_runs).max(0);
+                    println!("  Queue Concurrency Limit: {limit}");
+                    println!("  available claim slots: {available}");
+                    if available == 0 && row.ready_tasks > 0 {
+                        println!(
+                            "  claim status: limit reached; Ready Tasks cannot be claimed until active Agent Runs finish"
+                        );
+                    }
+                }
+                None => {
+                    println!("  Queue Concurrency Limit: none");
+                    println!("  available claim slots: unlimited");
+                }
+            }
+            println!("  Ready Tasks: {}", row.ready_tasks);
+            println!("  Integrating Tasks: {}", row.integrating_tasks);
             println!("  active Agent Runs: {}", row.active_agent_runs);
+            println!(
+                "  active Agent Runs on Integrating Tasks: {}",
+                row.active_integrating_agent_runs
+            );
             for run in active_runs
                 .iter()
                 .filter(|run| run.queue_key.as_str() == row.queue_key.as_str())

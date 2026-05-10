@@ -536,9 +536,13 @@ pub struct TaskDetail {
 pub struct QueueStatus {
     pub queue_key: String,
     pub queue_name: String,
+    pub queue_concurrency_limit: Option<i64>,
     pub state: String,
     pub task_count: i64,
+    pub ready_tasks: i64,
+    pub integrating_tasks: i64,
     pub active_agent_runs: i64,
+    pub active_integrating_agent_runs: i64,
     pub active_retry_holds: i64,
 }
 
@@ -1517,14 +1521,33 @@ pub async fn status_by_queue_and_state(pool: &SqlitePool) -> Result<Vec<QueueSta
         SELECT
             task_queues.key AS queue_key,
             task_queues.name AS queue_name,
+            task_queues.queue_concurrency_limit AS queue_concurrency_limit,
             COALESCE(tasks.state, 'none') AS state,
             COUNT(tasks.id) AS task_count,
+            (
+                SELECT COUNT(*) FROM tasks ready_tasks
+                WHERE ready_tasks.task_queue_id = task_queues.id
+                  AND ready_tasks.state = 'ready'
+            ) AS ready_tasks,
+            (
+                SELECT COUNT(*) FROM tasks integrating_tasks
+                WHERE integrating_tasks.task_queue_id = task_queues.id
+                  AND integrating_tasks.state = 'integrating'
+            ) AS integrating_tasks,
             (
                 SELECT COUNT(*) FROM agent_runs
                 WHERE agent_runs.task_queue_id = task_queues.id
                   AND agent_runs.outcome IS NULL
                   AND agent_runs.lease_expires_at > CURRENT_TIMESTAMP
             ) AS active_agent_runs,
+            (
+                SELECT COUNT(*) FROM agent_runs
+                JOIN tasks active_tasks ON active_tasks.id = agent_runs.task_id
+                WHERE agent_runs.task_queue_id = task_queues.id
+                  AND active_tasks.state = 'integrating'
+                  AND agent_runs.outcome IS NULL
+                  AND agent_runs.lease_expires_at > CURRENT_TIMESTAMP
+            ) AS active_integrating_agent_runs,
             (
                 SELECT COUNT(*) FROM task_retry_holds
                 JOIN tasks held_tasks ON held_tasks.id = task_retry_holds.task_id
@@ -1533,7 +1556,7 @@ pub async fn status_by_queue_and_state(pool: &SqlitePool) -> Result<Vec<QueueSta
             ) AS active_retry_holds
         FROM task_queues
         LEFT JOIN tasks ON tasks.task_queue_id = task_queues.id
-        GROUP BY task_queues.id, task_queues.key, task_queues.name, tasks.state
+        GROUP BY task_queues.id, task_queues.key, task_queues.name, task_queues.queue_concurrency_limit, tasks.state
         ORDER BY task_queues.key, tasks.state
         "#,
     )
@@ -4369,6 +4392,9 @@ mod tests {
         let status = status_by_queue_and_state(&pool).await.expect("status");
         assert!(status
             .iter()
+            .all(|row| row.queue_concurrency_limit.is_none()));
+        assert!(status
+            .iter()
             .any(|row| row.queue_key == "TASK" && row.state == "ready" && row.task_count == 1));
         assert!(status
             .iter()
@@ -4378,13 +4404,11 @@ mod tests {
     #[tokio::test]
     async fn status_lists_active_runs_and_retry_holds() {
         let (_temp, pool) = migrated_pool().await;
-        create_task_queue(
-            &pool,
-            &sample_queue("TASK", "Tasker"),
-            &Actor::operator("tester"),
-        )
-        .await
-        .expect("create queue");
+        let mut queue = sample_queue("TASK", "Tasker");
+        queue.queue_concurrency_limit = Some(1);
+        create_task_queue(&pool, &queue, &Actor::operator("tester"))
+            .await
+            .expect("create queue");
         create_task(
             &pool,
             &sample_task("TASK", "First"),
@@ -4420,6 +4444,52 @@ mod tests {
             .await
             .expect("claim second")
             .expect("second claimed");
+        update_acceptance_criterion_status(
+            &pool,
+            &active_run.task.task.identifier,
+            1,
+            &UpdateRequirementStatus {
+                status: "satisfied".to_string(),
+                waiver_reason: None,
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("satisfy criterion");
+        update_validation_item_status(
+            &pool,
+            &active_run.task.task.identifier,
+            1,
+            &UpdateRequirementStatus {
+                status: "passed".to_string(),
+                waiver_reason: None,
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("pass validation");
+        transition_task_state(
+            &pool,
+            &active_run.task.task.identifier,
+            &TransitionTaskState {
+                to_state: "integrating".to_string(),
+                agent_run_id: Some(active_run.run.id.clone()),
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("move to integrating");
+
+        let status = status_by_queue_and_state(&pool).await.expect("status");
+        let row = status
+            .iter()
+            .find(|row| row.queue_key == "TASK" && row.state == "integrating")
+            .expect("integrating status row");
+        assert_eq!(row.queue_concurrency_limit, Some(1));
+        assert_eq!(row.ready_tasks, 0);
+        assert_eq!(row.integrating_tasks, 1);
+        assert_eq!(row.active_agent_runs, 1);
+        assert_eq!(row.active_integrating_agent_runs, 1);
 
         let runs = active_agent_runs_for_status(&pool).await.expect("runs");
         assert_eq!(runs.len(), 1);
