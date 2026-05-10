@@ -127,6 +127,11 @@ pub struct TaskQueue {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateQueueConcurrencyLimit {
+    pub queue_concurrency_limit: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
 pub struct AuditEvent {
     pub id: String,
@@ -263,6 +268,67 @@ pub async fn list_task_queues(pool: &SqlitePool) -> Result<Vec<TaskQueue>> {
     .context("failed to list Task Queues")
 }
 
+pub async fn update_task_queue_concurrency_limit(
+    pool: &SqlitePool,
+    key: &str,
+    input: &UpdateQueueConcurrencyLimit,
+    actor: &Actor,
+) -> Result<TaskQueue> {
+    validate_actor(actor)?;
+    validate_queue_concurrency_limit(input.queue_concurrency_limit)?;
+
+    let mut tx = pool.begin().await.context("failed to begin transaction")?;
+    let existing = sqlx::query_as::<_, TaskQueue>(
+        r#"
+        SELECT
+            id, key, name, delivery_backend, managed_source_repository, main_branch,
+            worktree_root, branch_template, done_worktree_retention, queue_concurrency_limit,
+            created_at, updated_at
+        FROM task_queues
+        WHERE key = ?
+        "#,
+    )
+    .bind(key)
+    .fetch_optional(&mut *tx)
+    .await
+    .with_context(|| format!("failed to load Task Queue {key}"))?
+    .with_context(|| format!("Task Queue {key} not found"))?;
+
+    sqlx::query(
+        r#"
+        UPDATE task_queues
+        SET queue_concurrency_limit = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        "#,
+    )
+    .bind(input.queue_concurrency_limit)
+    .bind(&existing.id)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("failed to update Queue Concurrency Limit for Task Queue {key}"))?;
+
+    append_audit_event_in_tx(
+        &mut tx,
+        actor,
+        "task_queue.concurrency_limit_updated",
+        "task_queue",
+        &existing.id,
+        serde_json::json!({
+            "key": key,
+            "previous_queue_concurrency_limit": existing.queue_concurrency_limit,
+            "queue_concurrency_limit": input.queue_concurrency_limit,
+        }),
+    )
+    .await?;
+
+    tx.commit().await.context("failed to commit transaction")?;
+
+    get_task_queue(pool, key)
+        .await?
+        .with_context(|| format!("updated Task Queue {key} was not found"))
+}
+
 pub async fn list_audit_events(pool: &SqlitePool) -> Result<Vec<AuditEvent>> {
     sqlx::query_as::<_, AuditEvent>(
         r#"
@@ -283,6 +349,32 @@ pub async fn list_audit_events(pool: &SqlitePool) -> Result<Vec<AuditEvent>> {
     .fetch_all(pool)
     .await
     .context("failed to list Audit Events")
+}
+
+pub async fn list_task_queue_audit_events(pool: &SqlitePool, key: &str) -> Result<Vec<AuditEvent>> {
+    sqlx::query_as::<_, AuditEvent>(
+        r#"
+        SELECT
+            audit_events.id,
+            audit_events.actor_kind,
+            audit_events.actor_id,
+            audit_events.actor_display_name,
+            audit_events.event_type,
+            audit_events.subject_type,
+            audit_events.subject_id,
+            audit_events.payload_json,
+            audit_events.created_at
+        FROM audit_events
+        JOIN task_queues ON task_queues.id = audit_events.subject_id
+        WHERE audit_events.subject_type = 'task_queue'
+          AND task_queues.key = ?
+        ORDER BY audit_events.created_at, audit_events.id
+        "#,
+    )
+    .bind(key)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("failed to list Audit Events for Task Queue {key}"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2105,7 +2197,12 @@ fn validate_task_queue(input: &CreateTaskQueue) -> Result<()> {
     ensure_not_blank("Main Branch", &input.main_branch)?;
     ensure_not_blank("Worktree Root", &input.worktree_root)?;
     ensure_not_blank("Branch Template", &input.branch_template)?;
-    if let Some(limit) = input.queue_concurrency_limit {
+    validate_queue_concurrency_limit(input.queue_concurrency_limit)?;
+    Ok(())
+}
+
+fn validate_queue_concurrency_limit(limit: Option<i64>) -> Result<()> {
+    if let Some(limit) = limit {
         if limit <= 0 {
             anyhow::bail!("Queue Concurrency Limit must be positive");
         }
@@ -2351,6 +2448,90 @@ mod tests {
         assert_eq!(events[0].subject_id, queue.id);
         assert_eq!(events[0].actor_kind, "operator");
         assert!(events[0].payload_json.contains("\"key\":\"TASK\""));
+    }
+
+    #[tokio::test]
+    async fn updates_task_queue_concurrency_limit_and_audit_history() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+
+        let updated = update_task_queue_concurrency_limit(
+            &pool,
+            "TASK",
+            &UpdateQueueConcurrencyLimit {
+                queue_concurrency_limit: Some(2),
+            },
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("set limit");
+        assert_eq!(updated.queue_concurrency_limit, Some(2));
+
+        let cleared = update_task_queue_concurrency_limit(
+            &pool,
+            "TASK",
+            &UpdateQueueConcurrencyLimit {
+                queue_concurrency_limit: None,
+            },
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("clear limit");
+        assert_eq!(cleared.queue_concurrency_limit, None);
+
+        let events = list_task_queue_audit_events(&pool, "TASK")
+            .await
+            .expect("queue audit events");
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "task_queue.concurrency_limit_updated")
+                .count(),
+            2
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.payload_json.contains("\"queue_concurrency_limit\":2")));
+        assert!(events.iter().any(|event| event
+            .payload_json
+            .contains("\"previous_queue_concurrency_limit\":2")
+            && event
+                .payload_json
+                .contains("\"queue_concurrency_limit\":null")));
+    }
+
+    #[tokio::test]
+    async fn queue_concurrency_limit_update_must_be_positive() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+
+        let error = update_task_queue_concurrency_limit(
+            &pool,
+            "TASK",
+            &UpdateQueueConcurrencyLimit {
+                queue_concurrency_limit: Some(0),
+            },
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect_err("zero limit fails");
+
+        assert!(error
+            .to_string()
+            .contains("Queue Concurrency Limit must be positive"));
     }
 
     #[tokio::test]

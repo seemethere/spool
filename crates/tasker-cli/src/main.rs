@@ -134,6 +134,22 @@ enum QueueCommand {
     },
     /// Show a Task Queue by key.
     Show { key: String },
+    /// Update Operator-managed Task Queue settings.
+    Update {
+        /// Task Queue Key to update.
+        key: String,
+        /// Set a positive Queue Concurrency Limit.
+        #[arg(long, conflicts_with = "clear_queue_concurrency_limit")]
+        queue_concurrency_limit: Option<i64>,
+        /// Clear the Queue Concurrency Limit.
+        #[arg(long)]
+        clear_queue_concurrency_limit: bool,
+        /// Operator actor display name for audit attribution.
+        #[arg(long, default_value = "local-operator")]
+        actor: String,
+    },
+    /// Show Audit Events for a Task Queue.
+    Audit { key: String },
     /// List Task Queues.
     List,
 }
@@ -384,6 +400,46 @@ async fn queue(paths: &TaskerPaths, db_path_overridden: bool, command: QueueComm
                 .await?
                 .with_context(|| format!("Task Queue {key} not found"))?;
             output::print_queue(&queue)?;
+        }
+        QueueCommand::Update {
+            key,
+            queue_concurrency_limit,
+            clear_queue_concurrency_limit,
+            actor,
+        } => {
+            if queue_concurrency_limit.is_none() && !clear_queue_concurrency_limit {
+                anyhow::bail!(
+                    "queue update requires --queue-concurrency-limit or --clear-queue-concurrency-limit"
+                );
+            }
+            let limit = if clear_queue_concurrency_limit {
+                None
+            } else {
+                queue_concurrency_limit
+            };
+            let queue = tasker_db::update_task_queue_concurrency_limit(
+                &pool,
+                &key,
+                &tasker_db::UpdateQueueConcurrencyLimit {
+                    queue_concurrency_limit: limit,
+                },
+                &tasker_db::Actor::operator(actor),
+            )
+            .await?;
+            output::print_queue(&queue)?;
+        }
+        QueueCommand::Audit { key } => {
+            let events = tasker_db::list_task_queue_audit_events(&pool, &key).await?;
+            for event in events {
+                println!(
+                    "{}\t{}\t{} ({})\t{}",
+                    event.created_at,
+                    event.event_type,
+                    event.actor_display_name,
+                    event.actor_kind,
+                    event.payload_json
+                );
+            }
         }
         QueueCommand::List => {
             let queues = tasker_db::list_task_queues(&pool).await?;
@@ -787,6 +843,39 @@ mod tests {
         )
         .await
         .expect("show queue");
+        queue(
+            &paths,
+            false,
+            QueueCommand::Update {
+                key: "TASK".to_string(),
+                queue_concurrency_limit: Some(2),
+                clear_queue_concurrency_limit: false,
+                actor: "tester".to_string(),
+            },
+        )
+        .await
+        .expect("set Queue Concurrency Limit");
+        queue(
+            &paths,
+            false,
+            QueueCommand::Update {
+                key: "TASK".to_string(),
+                queue_concurrency_limit: None,
+                clear_queue_concurrency_limit: true,
+                actor: "tester".to_string(),
+            },
+        )
+        .await
+        .expect("clear Queue Concurrency Limit");
+        queue(
+            &paths,
+            false,
+            QueueCommand::Audit {
+                key: "TASK".to_string(),
+            },
+        )
+        .await
+        .expect("queue audit");
         queue(&paths, false, QueueCommand::List)
             .await
             .expect("list queues");
