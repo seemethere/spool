@@ -96,13 +96,21 @@ bun run build
 
 Commit focused **Task Branch** changes if the Worker Agent left uncommitted files. A clean **Local Worktree** with committed **Task Commits** is required before any handoff to **Integrating** or manual merge.
 
-## Merge manually
+## Merge manually or run the runner-side integration helper
 
-From the **Managed Source Repository**, inspect the **Task Branch** against the **Main Branch** and perform the local merge strategy chosen by the operator. Prefer the planned v1 shape: a squash-style **Local Merge** that produces one **Final Commit** containing Tasker metadata such as **Task Identifier**, title, and optionally run ID.
+For an already-**Integrating** Task, the runner-side Local Worktree Delivery helper can perform the planned v1 **Squash Merge**, record an **Integration Outcome**, move the Task to **Done** or **Rework** as appropriate, and clean up the **Local Worktree**/**Task Branch** after success:
 
-Tasker does not perform Git mutations in the **Tasker Service**. During Manual Dogfood Merge, Git commands are operator actions performed in the local repository, not hidden Tasker behavior.
+```bash
+cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data merge integrate <task-identifier>
+```
 
-After merge and post-merge validation on the combined **Main Branch**, record a final **Workpad Note** or audit-relevant context through the CLI/API, then request **Task State** transitions only through supported Tasker gates. The temporary confirmation helper only marks an already-merged **Integrating** Task as **Done** when the operator explicitly confirms `--manual`:
+This helper runs in the CLI/worker process, not in the **Tasker Service**. Operational failures leave the Task in **Integrating** for retry; work-change failures such as dirty worktrees, stale branches, or merge conflicts move the Task to **Rework**.
+
+For the remaining fully manual path, from the **Managed Source Repository**, inspect the **Task Branch** against the **Main Branch** and perform the local merge strategy chosen by the operator. Prefer the planned v1 shape: a squash-style **Local Merge** that produces one **Final Commit** containing Tasker metadata such as **Task Identifier**, title, and optionally run ID.
+
+Tasker does not perform Git mutations in the **Tasker Service**. During Manual Dogfood Merge, manual Git commands are operator actions performed in the local repository, not hidden Tasker Service behavior.
+
+After manual merge and post-merge validation on the combined **Main Branch**, record a final **Workpad Note** or audit-relevant context through the CLI/API, then request **Task State** transitions only through supported Tasker gates. The temporary confirmation helper only marks an already-merged **Integrating** Task as **Done** when the operator explicitly confirms `--manual`:
 
 ```bash
 cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data merge done <task-identifier> --manual
