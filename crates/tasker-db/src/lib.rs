@@ -673,6 +673,28 @@ pub struct OperatorFailRunInput {
     pub retry_hold_seconds: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct IntegrationOutcome {
+    pub id: String,
+    pub task_id: String,
+    pub agent_run_id: Option<String>,
+    pub outcome_kind: String,
+    pub final_commit: Option<String>,
+    pub pre_merge_head: Option<String>,
+    pub message: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecordIntegrationOutcomeInput {
+    pub task_identifier: String,
+    pub agent_run_id: Option<String>,
+    pub outcome_kind: String,
+    pub final_commit: Option<String>,
+    pub pre_merge_head: Option<String>,
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RetryTaskInput {
     pub reason: String,
@@ -2204,6 +2226,89 @@ pub async fn retry_task(
     get_task_detail(pool, identifier)
         .await?
         .with_context(|| format!("retried Task {identifier} was not found"))
+}
+
+pub async fn record_integration_outcome(
+    pool: &SqlitePool,
+    input: &RecordIntegrationOutcomeInput,
+    actor: &Actor,
+) -> Result<IntegrationOutcome> {
+    validate_actor(actor)?;
+    if !matches!(
+        input.outcome_kind.as_str(),
+        "success" | "no_changes" | "work_change_failure" | "operational_failure"
+    ) {
+        anyhow::bail!("invalid Integration Outcome kind");
+    }
+
+    let mut tx = pool.begin().await.context("failed to begin transaction")?;
+    let task_id: String = sqlx::query_scalar("SELECT id FROM tasks WHERE identifier = ?")
+        .bind(&input.task_identifier)
+        .fetch_optional(&mut *tx)
+        .await
+        .with_context(|| format!("failed to load Task {}", input.task_identifier))?
+        .with_context(|| format!("Task {} not found", input.task_identifier))?;
+
+    if let Some(agent_run_id) = &input.agent_run_id {
+        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM agent_runs WHERE id = ?")
+            .bind(agent_run_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .with_context(|| format!("failed to load Agent Run {agent_run_id}"))?;
+        if exists.is_none() {
+            anyhow::bail!("Agent Run {agent_run_id} not found");
+        }
+    }
+
+    let outcome_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        r#"
+        INSERT INTO integration_outcomes (
+            id, task_id, agent_run_id, outcome_kind, final_commit, pre_merge_head, message
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&outcome_id)
+    .bind(&task_id)
+    .bind(&input.agent_run_id)
+    .bind(&input.outcome_kind)
+    .bind(&input.final_commit)
+    .bind(&input.pre_merge_head)
+    .bind(&input.message)
+    .execute(&mut *tx)
+    .await
+    .context("failed to record Integration Outcome")?;
+
+    append_audit_event_in_tx(
+        &mut tx,
+        actor,
+        "integration_outcome.recorded",
+        "task",
+        &task_id,
+        serde_json::json!({
+            "identifier": input.task_identifier,
+            "agent_run_id": input.agent_run_id,
+            "outcome_kind": input.outcome_kind,
+            "final_commit": input.final_commit,
+            "pre_merge_head": input.pre_merge_head,
+            "message": input.message,
+        }),
+    )
+    .await?;
+
+    tx.commit().await.context("failed to commit transaction")?;
+
+    sqlx::query_as::<_, IntegrationOutcome>(
+        r#"
+        SELECT id, task_id, agent_run_id, outcome_kind, final_commit, pre_merge_head, message, created_at
+        FROM integration_outcomes
+        WHERE id = ?
+        "#,
+    )
+    .bind(outcome_id)
+    .fetch_one(pool)
+    .await
+    .context("failed to load recorded Integration Outcome")
 }
 
 pub async fn get_agent_run(pool: &SqlitePool, run_id: &str) -> Result<Option<AgentRun>> {
@@ -4621,6 +4726,42 @@ mod tests {
         assert_eq!(holds[0].task_identifier, failed_run.task.task.identifier);
         assert_eq!(holds[0].reason, "model unavailable");
         assert!(!holds[0].hold_until.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delivery_records_integration_outcome_and_audit_event() {
+        let (_temp, pool) = migrated_pool().await;
+        let actor = Actor::operator("tester");
+        create_task_queue(&pool, &sample_queue("TASK", "Tasker"), &actor)
+            .await
+            .expect("queue");
+        create_task(&pool, &sample_task("TASK", "Delivery"), &actor)
+            .await
+            .expect("task");
+
+        let outcome = record_integration_outcome(
+            &pool,
+            &RecordIntegrationOutcomeInput {
+                task_identifier: "TASK-1".to_string(),
+                agent_run_id: None,
+                outcome_kind: "success".to_string(),
+                final_commit: Some("abc123".to_string()),
+                pre_merge_head: Some("def456".to_string()),
+                message: None,
+            },
+            &actor,
+        )
+        .await
+        .expect("record outcome");
+
+        assert_eq!(outcome.outcome_kind, "success");
+        assert_eq!(outcome.final_commit.as_deref(), Some("abc123"));
+        let events = list_task_audit_events(&pool, "TASK-1")
+            .await
+            .expect("events");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "integration_outcome.recorded"));
     }
 
     async fn migrated_pool() -> (tempfile::TempDir, SqlitePool) {

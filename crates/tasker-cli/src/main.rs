@@ -379,6 +379,14 @@ enum MergeCommand {
     },
     /// Print a temporary Manual Dogfood Merge inspection plan for a Task.
     Inspect { identifier: String },
+    /// Integrate an already-Integrating Task through runner-side Local Worktree Delivery.
+    Integrate {
+        /// Task Identifier.
+        identifier: String,
+        /// Operator actor display name for audit attribution.
+        #[arg(long, default_value = "local-operator")]
+        actor: String,
+    },
     /// Mark a manually merged Integrating Task Done after explicit confirmation.
     Done {
         /// Task Identifier.
@@ -633,7 +641,12 @@ fn command_is_unsafe_mutation(command: &Option<Command>) -> bool {
         ),
         Some(Command::Run { command }) => matches!(command, RunCommand::Fail { .. }),
         Some(Command::Cleanup { command }) => cleanup_command_is_unsafe_mutation(command),
-        Some(Command::Merge { command }) => matches!(command, MergeCommand::Done { .. }),
+        Some(Command::Merge { command }) => {
+            matches!(
+                command,
+                MergeCommand::Integrate { .. } | MergeCommand::Done { .. }
+            )
+        }
         Some(Command::Status | Command::Monitor { .. } | Command::Version) | None => false,
     }
 }
@@ -694,7 +707,9 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
         Some(Command::Merge { command }) => match command {
             MergeCommand::Queue { queue } => queue.clone(),
             MergeCommand::Inspect { .. } => None,
-            MergeCommand::Done { identifier, .. } => queue_key_from_task_identifier(identifier),
+            MergeCommand::Integrate { identifier, .. } | MergeCommand::Done { identifier, .. } => {
+                queue_key_from_task_identifier(identifier)
+            }
         },
         Some(Command::Init | Command::Run { .. } | Command::Serve { .. })
         | Some(Command::Status | Command::Version)
@@ -1422,6 +1437,11 @@ async fn merge(paths: &TaskerPaths, db_path_overridden: bool, command: MergeComm
                 tasker_db::get_latest_agent_run_detail_for_task(&pool, &identifier).await?;
             print_manual_merge_inspection(&detail, &queue, latest_run.as_ref());
         }
+        MergeCommand::Integrate { identifier, actor } => {
+            let actor = tasker_db::Actor::operator(actor);
+            let outcome = integrate_local_worktree(&pool, &identifier, &actor).await?;
+            println!("{}", outcome.summary);
+        }
         MergeCommand::Done {
             identifier,
             manual,
@@ -1458,6 +1478,404 @@ async fn merge(paths: &TaskerPaths, db_path_overridden: bool, command: MergeComm
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalIntegrationResult {
+    summary: String,
+}
+
+async fn integrate_local_worktree(
+    pool: &sqlx::SqlitePool,
+    identifier: &str,
+    actor: &tasker_db::Actor,
+) -> Result<LocalIntegrationResult> {
+    let detail = tasker_db::get_task_detail(pool, identifier)
+        .await?
+        .with_context(|| format!("Task {identifier} not found"))?;
+    if detail.task.state != "integrating" {
+        anyhow::bail!(
+            "Local Worktree integration requires Task State integrating; current state is {}",
+            detail.task.state
+        );
+    }
+    let queue = tasker_db::get_task_queue(pool, &detail.task.task_queue_key)
+        .await?
+        .with_context(|| format!("Task Queue {} not found", detail.task.task_queue_key))?;
+    let task_branch = required_task_link(&detail, "task_branch")?;
+    let local_worktree = required_task_link(&detail, "local_worktree")?;
+    let latest_run = tasker_db::get_latest_agent_run_detail_for_task(pool, identifier).await?;
+    let agent_run_id = latest_run.map(|run| run.run.id);
+
+    let repo = Path::new(&queue.managed_source_repository);
+    let worktree = Path::new(&local_worktree);
+    let mut adapter = LocalWorktreeIntegrationAdapter {
+        pool,
+        task: &detail,
+        queue: &queue,
+        actor,
+        agent_run_id: agent_run_id.as_deref(),
+        repo,
+        worktree,
+        task_branch: &task_branch,
+    };
+    adapter.integrate().await
+}
+
+fn required_task_link(detail: &tasker_db::TaskDetail, kind: &str) -> Result<String> {
+    detail
+        .task_links
+        .iter()
+        .find(|link| link.kind == kind)
+        .map(|link| link.target.clone())
+        .with_context(|| {
+            format!(
+                "Task {} is missing {kind} Task Link",
+                detail.task.identifier
+            )
+        })
+}
+
+struct LocalWorktreeIntegrationAdapter<'a> {
+    pool: &'a sqlx::SqlitePool,
+    task: &'a tasker_db::TaskDetail,
+    queue: &'a tasker_db::TaskQueue,
+    actor: &'a tasker_db::Actor,
+    agent_run_id: Option<&'a str>,
+    repo: &'a Path,
+    worktree: &'a Path,
+    task_branch: &'a str,
+}
+
+impl<'a> LocalWorktreeIntegrationAdapter<'a> {
+    async fn integrate(&mut self) -> Result<LocalIntegrationResult> {
+        if let Err(error) = self.validate_operational_safety() {
+            self.record_outcome("operational_failure", None, None, Some(error.to_string()))
+                .await?;
+            return Ok(LocalIntegrationResult {
+                summary: format!(
+                    "operational Delivery Failure for Task {}; left in Integrating: {error:#}",
+                    self.task.task.identifier
+                ),
+            });
+        }
+        if let Err(error) = self.validate_work_change_safety() {
+            self.record_outcome("work_change_failure", None, None, Some(error.to_string()))
+                .await?;
+            self.transition("rework").await?;
+            return Ok(LocalIntegrationResult {
+                summary: format!(
+                    "work-change Delivery Failure for Task {}; moved to Rework: {error:#}",
+                    self.task.task.identifier
+                ),
+            });
+        }
+
+        let pre_merge_head = git_output(self.repo, &["rev-parse", &self.queue.main_branch])?
+            .trim()
+            .to_string();
+        if git_status(
+            self.repo,
+            &[
+                "diff",
+                "--quiet",
+                &format!("{}..{}", self.queue.main_branch, self.task_branch),
+                "--",
+            ],
+        )?
+        .success()
+        {
+            self.record_outcome("no_changes", None, Some(pre_merge_head.clone()), None)
+                .await?;
+            self.transition("done").await?;
+            let cleanup = self.cleanup_after_success();
+            let mut summary = format!(
+                "No-Change Integration recorded for Task {}; moved to Done",
+                self.task.task.identifier
+            );
+            if let Err(error) = cleanup {
+                summary.push_str(&format!("; cleanup needs operator repair: {error:#}"));
+            }
+            return Ok(LocalIntegrationResult { summary });
+        }
+
+        if let Err(error) = run_git(
+            self.repo,
+            &["merge", "--squash", "--no-commit", self.task_branch],
+        ) {
+            let _ = self.rollback_to(&pre_merge_head);
+            self.record_outcome(
+                "work_change_failure",
+                None,
+                Some(pre_merge_head.clone()),
+                Some(format!("Squash Merge failed: {error:#}")),
+            )
+            .await?;
+            self.transition("rework").await?;
+            return Ok(LocalIntegrationResult {
+                summary: format!(
+                    "work-change Delivery Failure for Task {}; moved to Rework: Squash Merge failed: {error:#}",
+                    self.task.task.identifier
+                ),
+            });
+        }
+
+        let message = final_commit_message(self.task, self.agent_run_id);
+        if let Err(error) = run_git(self.repo, &["commit", "-m", &message]) {
+            let _ = self.rollback_to(&pre_merge_head);
+            self.record_outcome(
+                "work_change_failure",
+                None,
+                Some(pre_merge_head.clone()),
+                Some(format!("Final Commit failed: {error:#}")),
+            )
+            .await?;
+            self.transition("rework").await?;
+            return Ok(LocalIntegrationResult {
+                summary: format!(
+                    "work-change Delivery Failure for Task {}; moved to Rework: Final Commit failed: {error:#}",
+                    self.task.task.identifier
+                ),
+            });
+        }
+
+        let final_commit = git_output(self.repo, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_string();
+        self.record_outcome(
+            "success",
+            Some(final_commit.clone()),
+            Some(pre_merge_head),
+            None,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "Final Commit {final_commit} was created but Tasker could not record the successful Integration Outcome; operator repair required"
+            )
+        })?;
+        self.transition("done").await.with_context(|| {
+            format!(
+                "Final Commit {final_commit} was created but Tasker could not move the Task to Done; operator repair required"
+            )
+        })?;
+        let cleanup = self.cleanup_after_success();
+        let mut summary = format!(
+            "Integrated Task {} as Final Commit {}; moved to Done",
+            self.task.task.identifier, final_commit
+        );
+        if let Err(error) = cleanup {
+            summary.push_str(&format!("; cleanup needs operator repair: {error:#}"));
+        }
+        Ok(LocalIntegrationResult { summary })
+    }
+
+    fn validate_operational_safety(&self) -> Result<()> {
+        run_git(self.repo, &["rev-parse", "--show-toplevel"])?;
+        run_git(self.worktree, &["rev-parse", "--is-inside-work-tree"])?;
+        ensure_no_git_lock(self.repo)?;
+        ensure_no_git_lock(self.worktree)?;
+        let branch = git_output(self.repo, &["branch", "--show-current"])?;
+        if branch.trim() != self.queue.main_branch {
+            anyhow::bail!(
+                "Managed Source Repository is on branch {}, expected Main Branch {}",
+                branch.trim(),
+                self.queue.main_branch
+            );
+        }
+        ensure_clean_git(self.repo, "Managed Source Repository")?;
+        let source_common_dir = git_common_dir_for_cli(self.repo)?;
+        let worktree_common_dir = git_common_dir_for_cli(self.worktree)?;
+        if source_common_dir != worktree_common_dir {
+            anyhow::bail!(
+                "Local Worktree is not attached to the configured Managed Source Repository"
+            );
+        }
+        if !git_status(
+            self.repo,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", self.task_branch),
+            ],
+        )?
+        .success()
+        {
+            anyhow::bail!("Task Branch {} does not exist", self.task_branch);
+        }
+        Ok(())
+    }
+
+    fn validate_work_change_safety(&self) -> Result<()> {
+        ensure_clean_git(self.worktree, "Local Worktree")?;
+        let worktree_branch = git_output(self.worktree, &["branch", "--show-current"])?;
+        if worktree_branch.trim() != self.task_branch {
+            anyhow::bail!(
+                "Local Worktree is on branch {}, expected Task Branch {}",
+                worktree_branch.trim(),
+                self.task_branch
+            );
+        }
+        if !git_status(
+            self.repo,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &self.queue.main_branch,
+                self.task_branch,
+            ],
+        )?
+        .success()
+        {
+            anyhow::bail!(
+                "Task Branch {} does not include current Main Branch {}",
+                self.task_branch,
+                self.queue.main_branch
+            );
+        }
+        Ok(())
+    }
+
+    async fn record_outcome(
+        &self,
+        kind: &str,
+        final_commit: Option<String>,
+        pre_merge_head: Option<String>,
+        message: Option<String>,
+    ) -> Result<()> {
+        tasker_db::record_integration_outcome(
+            self.pool,
+            &tasker_db::RecordIntegrationOutcomeInput {
+                task_identifier: self.task.task.identifier.clone(),
+                agent_run_id: self.agent_run_id.map(ToString::to_string),
+                outcome_kind: kind.to_string(),
+                final_commit,
+                pre_merge_head,
+                message,
+            },
+            self.actor,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn transition(&self, to_state: &str) -> Result<()> {
+        tasker_db::transition_task_state(
+            self.pool,
+            &self.task.task.identifier,
+            &tasker_db::TransitionTaskState {
+                to_state: to_state.to_string(),
+                agent_run_id: None,
+            },
+            self.actor,
+        )
+        .await?;
+        Ok(())
+    }
+
+    fn rollback_to(&self, pre_merge_head: &str) -> Result<()> {
+        let branch = git_output(self.repo, &["branch", "--show-current"])?;
+        if branch.trim() != self.queue.main_branch {
+            anyhow::bail!(
+                "refusing rollback because Managed Source Repository is no longer on Main Branch"
+            );
+        }
+        run_git(self.repo, &["reset", "--hard", pre_merge_head])
+    }
+
+    fn cleanup_after_success(&self) -> Result<()> {
+        if self.queue.done_worktree_retention {
+            return Ok(());
+        }
+        if self.worktree.exists() {
+            let worktree = self.worktree.display().to_string();
+            run_git(self.repo, &["worktree", "remove", "--force", &worktree])?;
+        }
+        if git_status(
+            self.repo,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", self.task_branch),
+            ],
+        )?
+        .success()
+        {
+            run_git(self.repo, &["branch", "-D", self.task_branch])?;
+        }
+        Ok(())
+    }
+}
+
+fn final_commit_message(detail: &tasker_db::TaskDetail, agent_run_id: Option<&str>) -> String {
+    let mut message = format!(
+        "{}: {}\n\nTask: {}",
+        detail.task.identifier, detail.task.title, detail.task.identifier
+    );
+    if let Some(run_id) = agent_run_id {
+        message.push_str(&format!("\nAgent Run: {run_id}"));
+    }
+    message
+}
+
+fn ensure_clean_git(repo: &Path, label: &str) -> Result<()> {
+    let status = git_output(repo, &["status", "--porcelain"])?;
+    if !status.trim().is_empty() {
+        anyhow::bail!("{label} has uncommitted changes");
+    }
+    Ok(())
+}
+
+fn ensure_no_git_lock(repo: &Path) -> Result<()> {
+    let common_dir = git_common_dir_for_cli(repo)?;
+    if common_dir.join("index.lock").exists() {
+        anyhow::bail!(
+            "Git lock exists at {}",
+            common_dir.join("index.lock").display()
+        );
+    }
+    let git_dir = git_output(repo, &["rev-parse", "--git-dir"])?;
+    let git_dir = PathBuf::from(git_dir.trim());
+    let git_dir = if git_dir.is_absolute() {
+        git_dir
+    } else {
+        repo.join(git_dir)
+    };
+    if git_dir.join("index.lock").exists() {
+        anyhow::bail!(
+            "Git lock exists at {}",
+            git_dir.join("index.lock").display()
+        );
+    }
+    Ok(())
+}
+
+fn git_common_dir_for_cli(repo: &Path) -> Result<PathBuf> {
+    let common_dir = git_output(repo, &["rev-parse", "--git-common-dir"])?;
+    let path = PathBuf::from(common_dir.trim());
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        repo.join(path)
+    };
+    absolute
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", absolute.display()))
+}
+
+fn run_git(repo: &Path, args: &[&str]) -> Result<()> {
+    git_output(repo, args).map(|_| ())
+}
+
+fn git_status(repo: &Path, args: &[&str]) -> Result<std::process::ExitStatus> {
+    ProcessCommand::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to run git {:?} in {}", args, repo.display()))
 }
 
 fn print_manual_merge_queue(rows: &[tasker_db::MergeQueueTask]) {
@@ -2526,6 +2944,340 @@ Implement Bootstrap Task Creation.
             .expect("retry task");
         assert_eq!(retry_detail.task.state, "ready");
         status(&paths, false).await.expect("status");
+    }
+
+    #[tokio::test]
+    async fn merge_integrate_squash_merges_and_cleans_successful_task() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+
+        let result =
+            integrate_local_worktree(&pool, "TASK-1", &tasker_db::Actor::operator("tester"))
+                .await
+                .expect("integrate");
+
+        assert!(result.summary.contains("Final Commit"));
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "done");
+        assert!(git_output(&repo, &["show", "--stat", "--oneline", "HEAD"])
+            .expect("show final commit")
+            .contains("feature.txt"));
+        assert!(!worktree.exists());
+        assert!(!std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/tasker/TASK-1"
+            ])
+            .status()
+            .expect("branch status")
+            .success());
+        let outcomes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'success'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("outcome count");
+        assert_eq!(outcomes, 1);
+    }
+
+    #[tokio::test]
+    async fn merge_integrate_records_no_change_without_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, _worktree) = seed_integrating_local_task(&pool, temp.path(), false, false).await;
+        let before = git_output(&repo, &["rev-parse", "HEAD"]).expect("head");
+
+        let result =
+            integrate_local_worktree(&pool, "TASK-1", &tasker_db::Actor::operator("tester"))
+                .await
+                .expect("integrate");
+
+        assert!(result.summary.contains("No-Change Integration"));
+        let after = git_output(&repo, &["rev-parse", "HEAD"]).expect("head");
+        assert_eq!(before, after);
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "done");
+        let outcomes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'no_changes'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("outcome count");
+        assert_eq!(outcomes, 1);
+    }
+
+    #[tokio::test]
+    async fn merge_integrate_dirty_managed_source_repository_stays_integrating() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, _worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        fs::write(repo.join("operator-scratch.txt"), "dirty\n").expect("dirty repo");
+
+        let result =
+            integrate_local_worktree(&pool, "TASK-1", &tasker_db::Actor::operator("tester"))
+                .await
+                .expect("integrate");
+
+        assert!(result.summary.contains("operational Delivery Failure"));
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "integrating");
+        let outcomes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'operational_failure'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("outcome count");
+        assert_eq!(outcomes, 1);
+    }
+
+    #[tokio::test]
+    async fn merge_integrate_dirty_local_worktree_moves_to_rework() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (_repo, worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        fs::write(worktree.join("dirty.txt"), "dirty\n").expect("dirty worktree");
+
+        let result =
+            integrate_local_worktree(&pool, "TASK-1", &tasker_db::Actor::operator("tester"))
+                .await
+                .expect("integrate");
+
+        assert!(result.summary.contains("work-change Delivery Failure"));
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "rework");
+        let outcomes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'work_change_failure'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("outcome count");
+        assert_eq!(outcomes, 1);
+    }
+
+    #[tokio::test]
+    async fn merge_integrate_stale_task_branch_moves_to_rework() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, _worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        fs::write(repo.join("main-only.txt"), "main moved\n").expect("main change");
+        git(&repo, &["add", "main-only.txt"]);
+        git(&repo, &["commit", "-m", "move main"]);
+
+        let result =
+            integrate_local_worktree(&pool, "TASK-1", &tasker_db::Actor::operator("tester"))
+                .await
+                .expect("integrate");
+
+        assert!(result.summary.contains("work-change Delivery Failure"));
+        assert!(result
+            .summary
+            .contains("does not include current Main Branch"));
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "rework");
+    }
+
+    #[tokio::test]
+    async fn merge_integrate_commit_failure_rolls_back_main_branch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, _worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        let pre_head = git_output(&repo, &["rev-parse", "HEAD"]).expect("head");
+        let hooks = repo.join(".git/hooks");
+        fs::write(hooks.join("pre-commit"), "#!/bin/sh\nexit 1\n").expect("hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(hooks.join("pre-commit"))
+                .expect("hook metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(hooks.join("pre-commit"), permissions).expect("chmod hook");
+        }
+
+        let result =
+            integrate_local_worktree(&pool, "TASK-1", &tasker_db::Actor::operator("tester"))
+                .await
+                .expect("integrate");
+
+        assert!(result.summary.contains("Final Commit failed"));
+        let after_head = git_output(&repo, &["rev-parse", "HEAD"]).expect("head");
+        assert_eq!(pre_head, after_head);
+        assert!(git_output(&repo, &["status", "--porcelain"])
+            .expect("status")
+            .trim()
+            .is_empty());
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "rework");
+    }
+
+    async fn seed_integrating_local_task(
+        pool: &sqlx::SqlitePool,
+        root: &Path,
+        with_feature_commit: bool,
+        done_worktree_retention: bool,
+    ) -> (PathBuf, PathBuf) {
+        let repo = root.join("repo");
+        let worktrees = root.join("worktrees");
+        let worktree = worktrees.join("TASK-1");
+        init_git_repo(&repo);
+        tasker_db::create_task_queue(
+            pool,
+            &tasker_db::CreateTaskQueue {
+                key: "TASK".to_string(),
+                name: "Tasker".to_string(),
+                managed_source_repository: repo.display().to_string(),
+                main_branch: "main".to_string(),
+                worktree_root: worktrees.display().to_string(),
+                branch_template: "tasker/{task_identifier}".to_string(),
+                done_worktree_retention,
+                queue_concurrency_limit: None,
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("queue");
+        tasker_db::create_task(
+            pool,
+            &tasker_db::CreateTask {
+                queue_key: "TASK".to_string(),
+                title: "Integrate me".to_string(),
+                brief: "Brief".to_string(),
+                priority: "normal".to_string(),
+                state: "ready".to_string(),
+                review_required: false,
+                acceptance_criteria: vec!["accepted".to_string()],
+                validation_items: vec!["validated".to_string()],
+                tags: vec![],
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("task");
+        git(&repo, &["branch", "tasker/TASK-1", "main"]);
+        fs::create_dir_all(&worktrees).expect("worktrees");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                worktree.to_str().expect("utf8"),
+                "tasker/TASK-1",
+            ],
+        );
+        if with_feature_commit {
+            fs::write(worktree.join("feature.txt"), "feature\n").expect("feature");
+            git(&worktree, &["add", "feature.txt"]);
+            git(&worktree, &["commit", "-m", "add feature"]);
+        }
+        let actor = tasker_db::Actor::operator("tester");
+        tasker_db::upsert_task_link(
+            pool,
+            "TASK-1",
+            &tasker_db::UpsertTaskLink {
+                kind: "local_worktree".to_string(),
+                target: worktree.display().to_string(),
+                label: Some("Local Worktree".to_string()),
+                is_primary: true,
+            },
+            &actor,
+        )
+        .await
+        .expect("worktree link");
+        tasker_db::upsert_task_link(
+            pool,
+            "TASK-1",
+            &tasker_db::UpsertTaskLink {
+                kind: "task_branch".to_string(),
+                target: "tasker/TASK-1".to_string(),
+                label: Some("Task Branch".to_string()),
+                is_primary: false,
+            },
+            &actor,
+        )
+        .await
+        .expect("branch link");
+        tasker_db::update_acceptance_criterion_status(
+            pool,
+            "TASK-1",
+            1,
+            &tasker_db::UpdateRequirementStatus {
+                status: "satisfied".to_string(),
+                waiver_reason: None,
+            },
+            &actor,
+        )
+        .await
+        .expect("criterion");
+        tasker_db::update_validation_item_status(
+            pool,
+            "TASK-1",
+            1,
+            &tasker_db::UpdateRequirementStatus {
+                status: "passed".to_string(),
+                waiver_reason: None,
+            },
+            &actor,
+        )
+        .await
+        .expect("validation");
+        tasker_db::transition_task_state(
+            pool,
+            "TASK-1",
+            &tasker_db::TransitionTaskState {
+                to_state: "in_progress".to_string(),
+                agent_run_id: None,
+            },
+            &actor,
+        )
+        .await
+        .expect("in progress");
+        tasker_db::transition_task_state(
+            pool,
+            "TASK-1",
+            &tasker_db::TransitionTaskState {
+                to_state: "integrating".to_string(),
+                agent_run_id: None,
+            },
+            &actor,
+        )
+        .await
+        .expect("integrating");
+        (repo, worktree)
     }
 
     fn init_git_repo(repo: &Path) {
