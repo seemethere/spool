@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use tasker_config::{ensure_data_dir, PathOverrides, TaskerConfig, TaskerPaths};
 
 mod bootstrap;
+mod cleanup;
 mod output;
 mod supervisor;
 mod worker;
@@ -115,6 +116,11 @@ enum Command {
     Run {
         #[command(subcommand)]
         command: RunCommand,
+    },
+    /// Explicit operator cleanup for local dogfood storage artifacts.
+    Cleanup {
+        #[command(subcommand)]
+        command: CleanupCommand,
     },
     /// Temporary Manual Dogfood Merge helpers.
     Merge {
@@ -308,6 +314,43 @@ enum RunCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum CleanupCommand {
+    /// Summarize or remove rebuildable Cargo target/ directories under Local Worktrees.
+    CargoTargets {
+        /// Task Queue Key whose configured Worktree Root should be scanned.
+        #[arg(long, conflicts_with = "worktree_root")]
+        queue: Option<String>,
+        /// Worktree Root to scan directly.
+        #[arg(long)]
+        worktree_root: Option<PathBuf>,
+        /// Explicitly keep files and only report reclaimable space.
+        #[arg(long, conflicts_with = "delete")]
+        dry_run: bool,
+        /// Delete matching rebuildable target/ trees.
+        #[arg(long)]
+        delete: bool,
+    },
+    /// Summarize or prune saved Run Transcript and Launcher Session Data artifact files.
+    Runs {
+        /// Override the Run Transcript root; defaults to <data-dir>/runs.
+        #[arg(long)]
+        runs_dir: Option<PathBuf>,
+        /// Select artifacts older than this many days for pruning.
+        #[arg(long)]
+        older_than_days: Option<u64>,
+        /// Keep the newest N run artifact directories/files and select older ones for pruning.
+        #[arg(long)]
+        keep_latest: Option<usize>,
+        /// Explicitly keep files and only report selected artifact space.
+        #[arg(long, conflicts_with = "delete")]
+        dry_run: bool,
+        /// Delete selected Run Transcript and Launcher Session Data artifacts.
+        #[arg(long)]
+        delete: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum MergeCommand {
     /// Print a temporary Manual Dogfood Merge inspection plan for a Task.
     Inspect { identifier: String },
@@ -433,6 +476,7 @@ async fn main() -> Result<()> {
             .await
         }
         Some(Command::Run { command }) => run(&paths, db_path_overridden, command).await,
+        Some(Command::Cleanup { command }) => cleanup(&paths, db_path_overridden, command).await,
         Some(Command::Merge { command }) => merge(&paths, db_path_overridden, command).await,
         Some(Command::Serve { bind }) => serve(&paths, bind, db_path_overridden).await,
         Some(Command::Version) => {
@@ -518,6 +562,14 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
     }
 }
 
+fn cleanup_command_is_unsafe_mutation(command: &CleanupCommand) -> bool {
+    match command {
+        CleanupCommand::CargoTargets { delete, .. } | CleanupCommand::Runs { delete, .. } => {
+            *delete
+        }
+    }
+}
+
 fn command_is_unsafe_mutation(command: &Option<Command>) -> bool {
     match command {
         Some(
@@ -535,6 +587,7 @@ fn command_is_unsafe_mutation(command: &Option<Command>) -> bool {
             TaskCommand::Show { .. } | TaskCommand::Audit { .. }
         ),
         Some(Command::Run { command }) => matches!(command, RunCommand::Fail { .. }),
+        Some(Command::Cleanup { command }) => cleanup_command_is_unsafe_mutation(command),
         Some(Command::Merge { command }) => matches!(command, MergeCommand::Done { .. }),
         Some(Command::Status | Command::Version) | None => false,
     }
@@ -1033,6 +1086,90 @@ async fn run(paths: &TaskerPaths, db_path_overridden: bool, command: RunCommand)
         }
     }
     Ok(())
+}
+
+async fn cleanup(
+    paths: &TaskerPaths,
+    db_path_overridden: bool,
+    command: CleanupCommand,
+) -> Result<()> {
+    match command {
+        CleanupCommand::CargoTargets {
+            queue,
+            worktree_root,
+            dry_run: _,
+            delete,
+        } => {
+            let worktree_root = if let Some(root) = worktree_root {
+                root
+            } else if let Some(queue_key) = queue {
+                let pool = open_pool(paths, db_path_overridden).await?;
+                let queue = tasker_db::get_task_queue(&pool, &queue_key)
+                    .await?
+                    .with_context(|| format!("Task Queue {queue_key} not found"))?;
+                PathBuf::from(queue.worktree_root)
+            } else {
+                anyhow::bail!("cleanup cargo-targets requires --queue or --worktree-root");
+            };
+            let report = cleanup::cleanup_cargo_targets(&worktree_root, delete)?;
+            println!("Local Worktree Cargo target cleanup");
+            println!("Worktree Root: {}", worktree_root.display());
+            println!("mode: {}", if delete { "delete" } else { "dry-run" });
+            println!(
+                "safe-to-delete artifact kind: rebuildable per-Local Worktree target/ directories"
+            );
+            println!("preserved Task data: Local Worktree source files, Task Branches, Task records, Agent Runs, and Audit Events");
+            print_cleanup_report(&report);
+        }
+        CleanupCommand::Runs {
+            runs_dir,
+            older_than_days,
+            keep_latest,
+            dry_run: _,
+            delete,
+        } => {
+            let runs_dir = runs_dir.unwrap_or_else(|| paths.data_dir.join("runs"));
+            let report = cleanup::cleanup_run_artifacts(
+                &runs_dir,
+                cleanup::RunPruneOptions {
+                    older_than_days,
+                    keep_latest,
+                },
+                delete,
+            )?;
+            println!("Run Transcript and Launcher Session Data artifact cleanup");
+            println!("Run artifact root: {}", runs_dir.display());
+            println!("mode: {}", if delete { "delete" } else { "dry-run" });
+            if let Some(days) = older_than_days {
+                println!("selection: older than {days} day(s)");
+            }
+            if let Some(keep) = keep_latest {
+                println!("selection: keep newest {keep} artifact(s)");
+            }
+            if older_than_days.is_none() && keep_latest.is_none() {
+                println!("selection: summarize all artifacts");
+            }
+            println!("safe-to-delete artifact kind: saved Run Transcript files and launcher raw/session artifacts under runs/");
+            println!("preserved authoritative data: Task records, Agent Run rows, Launcher Session Data database rows, and Audit Events");
+            print_cleanup_report(&report);
+        }
+    }
+    Ok(())
+}
+
+fn print_cleanup_report(report: &cleanup::CleanupReport) {
+    println!(
+        "{} entries, {} reclaimable",
+        report.entries.len(),
+        cleanup::human_bytes(report.total_bytes())
+    );
+    for entry in &report.entries {
+        println!(
+            "  {}	{}",
+            cleanup::human_bytes(entry.bytes),
+            entry.path.display()
+        );
+    }
 }
 
 async fn merge(paths: &TaskerPaths, db_path_overridden: bool, command: MergeCommand) -> Result<()> {

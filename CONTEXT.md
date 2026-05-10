@@ -524,8 +524,9 @@ _Avoid_: Separate progress comment
 - `tasker task retry` is an **Operator** recovery command that clears a **Retry Hold** and moves a resolved failed, canceled, or stuck **Task** back to **Ready** without changing normal completion gates.
 - `tasker run show` shows **Agent Run**, **Run Transcript**, and **Launcher Session Data** metadata.
 - `tasker run fail` is an **Operator** recovery command that fails an active **Agent Run** with an explicit reason and records a **Retry Hold**.
+- `tasker cleanup cargo-targets` and `tasker cleanup runs` are explicit **Operator** cleanup commands for local dogfood storage artifacts; they default to dry-run reporting and require `--delete` before removing rebuildable Cargo target directories or saved Run Transcript/Launcher Session Data files.
 - Dogfooding API covers health/version, queue create/show/list, bootstrap task create, task show, claim-next, heartbeat, finish-run, Workpad Note update, criterion/validation status update, child task creation, state transition request, local worktree/delivery metadata, status summary, run show, and operator recovery for failed or stuck work.
-- Search, bulk edits, review sessions, pruning, metrics export, and token admin APIs are deferred until after **Dogfooding Readiness**.
+- Search, bulk edits, review sessions, metrics export, and token admin APIs are deferred until after **Dogfooding Readiness**.
 - Dogfooding persistence includes queues, tasks, acceptance criteria, validation items, workpad notes/revisions, task links, task relationships, agent runs/heartbeats, delivery records, launcher session data, audit events, and API tokens.
 - **Dogfooding Readiness** comes before full v1 polish.
 - **Pre-Dogfooding Development Loop** is used before **Dogfooding Cutover**.
@@ -566,6 +567,7 @@ _Avoid_: Separate progress comment
 - Tasker may store a **Run Transcript** for each **Agent Run**.
 - Tasker stores **Launcher Session Data** with common fields and launcher-specific raw data.
 - Tasker does not automatically upload or share **Launcher Session Data**.
+- Tasker does not automatically delete dogfood storage artifacts during normal **Worker Loop** execution; artifact cleanup is an explicit **Operator** action and does not delete authoritative Task, Agent Run, Launcher Session Data database rows, or Audit Events.
 - **Workflow Metrics** are derived from Tasker events and run data rather than a separate metrics database.
 - Tasker records **Agent Runs** and optional launcher metadata, not agent-protocol-specific control state.
 - A **Task** may have many **Agent Runs** over its lifetime.

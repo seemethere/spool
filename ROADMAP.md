@@ -48,6 +48,7 @@ Once this milestone works, create real dogfood tasks for later milestones.
 
 - Run transcripts and launcher session data
 - `tasker run show`
+- CLI-first cleanup for dogfood storage artifacts
 - Improved `tasker status`
 - Manual dogfood merge documentation before automatic Integrating
 - Opt-in real pi smoke documentation
@@ -58,6 +59,6 @@ Once this milestone works, create real dogfood tasks for later milestones.
 - Agent-Gated Integrating with squash merge
 - Review sessions
 - Metrics export
-- Transcript pruning
+- Richer transcript export/pruning policies
 - Richer Tasker Pi Extension tool set
 - Optional concurrency beyond one local worker
