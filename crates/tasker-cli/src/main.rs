@@ -1209,6 +1209,8 @@ async fn supervise(
             timeout_seconds: options.timeout_seconds,
             poll_seconds: options.poll_seconds,
             worker_command: command,
+            #[cfg(test)]
+            run_prefix: None,
         },
     )
     .await?;

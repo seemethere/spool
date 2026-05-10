@@ -4,6 +4,7 @@ use std::{
     io::Read,
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,6 +20,8 @@ pub struct SupervisorOptions {
     pub timeout_seconds: u64,
     pub poll_seconds: u64,
     pub worker_command: Vec<String>,
+    #[cfg(test)]
+    pub run_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +80,9 @@ pub async fn supervise_batch(
     );
 
     let deadline = Instant::now() + Duration::from_secs(options.timeout_seconds);
-    let status_dir = supervisor_status_dir()?;
+    let run_prefix = supervisor_run_prefix(&options);
+    let status_dir = supervisor_status_dir(&run_prefix)?;
+    println!("supervisor run prefix: {run_prefix}");
     let mut reports = SupervisorReports::default();
     let mut next_worker = 0usize;
     let mut saw_no_eligible = false;
@@ -107,12 +112,12 @@ pub async fn supervise_batch(
             && active.len() < options.concurrency
         {
             next_worker += 1;
-            let actor = format!("supervisor-worker-{next_worker}");
+            let actor = supervisor_worker_id(&run_prefix, next_worker);
             let status_path = status_dir.join(format!("{actor}.jsonl"));
             reports.files.insert(status_path.clone());
             let worker = spawn_worker(&options.worker_command, &actor, status_path)
                 .with_context(|| format!("failed to start worker {actor}"))?;
-            println!("started worker {actor}");
+            println!("{}", started_worker_message(&actor));
             active.push(worker);
             outcome.started_workers += 1;
         }
@@ -297,13 +302,32 @@ impl SupervisorReports {
     }
 }
 
-fn supervisor_status_dir() -> Result<PathBuf> {
+static SUPERVISOR_RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn supervisor_run_prefix(_options: &SupervisorOptions) -> String {
+    #[cfg(test)]
+    if let Some(prefix) = &_options.run_prefix {
+        return prefix.clone();
+    }
+
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let dir =
-        std::env::temp_dir().join(format!("tasker-supervisor-{millis}-{}", std::process::id()));
+    let counter = SUPERVISOR_RUN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("supervisor-{millis}-{}-{counter}", std::process::id())
+}
+
+fn supervisor_worker_id(run_prefix: &str, worker_number: usize) -> String {
+    format!("{run_prefix}-worker-{worker_number}")
+}
+
+fn started_worker_message(worker_id: &str) -> String {
+    format!("started worker {worker_id}")
+}
+
+fn supervisor_status_dir(run_prefix: &str) -> Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("tasker-{run_prefix}"));
     fs::create_dir_all(&dir).with_context(|| {
         format!(
             "failed to create supervisor status directory {}",
@@ -457,6 +481,7 @@ mod tests {
                 timeout_seconds: 2,
                 poll_seconds: 1,
                 worker_command: vec![script.display().to_string()],
+                run_prefix: Some("supervisor-test-no-eligible".to_string()),
             },
         )
         .await
@@ -488,6 +513,7 @@ mod tests {
                 timeout_seconds: 2,
                 poll_seconds: 1,
                 worker_command: vec![script.display().to_string()],
+                run_prefix: Some("supervisor-test-handoff".to_string()),
             },
         )
         .await
@@ -505,7 +531,7 @@ mod tests {
         fs::write(&script, "#!/bin/sh\nexit 1\n").expect("write script");
         make_executable(&script);
         let pool = empty_pool(temp.path()).await;
-        seed_active_run(&pool, "supervisor-worker-1").await;
+        seed_active_run(&pool, "supervisor-test-stuck-worker-1").await;
 
         let outcome = supervise_batch(
             &pool,
@@ -515,6 +541,7 @@ mod tests {
                 timeout_seconds: 2,
                 poll_seconds: 1,
                 worker_command: vec![script.display().to_string()],
+                run_prefix: Some("supervisor-test-stuck".to_string()),
             },
         )
         .await
@@ -523,6 +550,37 @@ mod tests {
         assert_eq!(outcome.failed_workers, 1);
         assert_eq!(outcome.stuck_runs.len(), 1);
         assert_eq!(outcome.stuck_runs[0].agent_run_id, "run-1");
+    }
+
+    #[test]
+    fn supervisor_run_prefixes_are_unique_and_worker_ids_use_prefix() {
+        let first = supervisor_run_prefix(&SupervisorOptions {
+            queue: "TASK".to_string(),
+            concurrency: 1,
+            timeout_seconds: 1,
+            poll_seconds: 1,
+            worker_command: vec!["worker".to_string()],
+            run_prefix: None,
+        });
+        let second = supervisor_run_prefix(&SupervisorOptions {
+            queue: "TASK".to_string(),
+            concurrency: 1,
+            timeout_seconds: 1,
+            poll_seconds: 1,
+            worker_command: vec!["worker".to_string()],
+            run_prefix: None,
+        });
+
+        assert_ne!(first, second);
+        assert_ne!(supervisor_worker_id(&first, 1), "supervisor-worker-1");
+        assert_eq!(
+            supervisor_worker_id("supervisor-test", 2),
+            "supervisor-test-worker-2"
+        );
+        assert_eq!(
+            started_worker_message(&supervisor_worker_id("supervisor-test", 2)),
+            "started worker supervisor-test-worker-2"
+        );
     }
 
     async fn empty_pool(path: &std::path::Path) -> SqlitePool {
