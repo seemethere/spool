@@ -518,7 +518,7 @@ _Avoid_: Separate progress comment
 - Symphony reads from and writes to the **Task Backend** through the **Tasker API**.
 - `tasker init` creates XDG-style local config and data directories.
 - Tasker config defaults to `~/.config/tasker/config.toml`.
-- Tasker data defaults to `~/.local/share/tasker/`, with SQLite at `tasker.db` and run transcripts under `runs/<run_id>/`.
+- Tasker data defaults to `~/.local/share/tasker/`, with SQLite at `tasker.db` and run transcripts under `runs/<run_id>/`; when using a repository-local `.tasker/config.toml` without an explicit data override, the active data directory is `.tasker/data/` beside that config.
 - When a repository-local `.tasker/config.toml` is present but not the resolved active Tasker config, unsafe mutating CLI commands refuse to run unless the operator explicitly selects a config or data/database override.
 - In that inactive project-config case, read-only CLI commands warn with the active config and database paths so operators can diagnose wrong-database mistakes.
 - `tasker serve` starts the **Tasker Service**.
@@ -576,7 +576,7 @@ _Avoid_: Separate progress comment
 - Question UI is allowed in **Interactive Agent Sessions**.
 - Unexpected question UI in an **Unattended Worker Session** fails the **Agent Run** with a clear reason.
 - A **Pi Launcher** max-run timeout fails the **Agent Run** with a clear reason while preserving the **Run Transcript** and **Launcher Session Data**.
-- Tasker may store a **Run Transcript** for each **Agent Run**.
+- Tasker may store a **Run Transcript** for each **Agent Run** under the active Tasker data directory, usually `runs/<run_id>/`.
 - Tasker stores **Launcher Session Data** with common fields and launcher-specific raw data.
 - Tasker does not automatically upload or share **Launcher Session Data**.
 - Tasker does not automatically delete dogfood storage artifacts during normal **Worker Loop** execution; artifact cleanup is an explicit **Operator** action and does not delete authoritative Task, Agent Run, Launcher Session Data database rows, or Audit Events.

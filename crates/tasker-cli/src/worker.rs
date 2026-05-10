@@ -73,8 +73,10 @@ pub async fn run_worker_once(
         });
     };
 
+    let data_dir =
+        absolute_path(&request.data_dir).context("failed to resolve Tasker data directory")?;
     let prepared_worktree =
-        match prepare_local_worktree(pool, &claimed.task, &actor, &request.data_dir).await {
+        match prepare_local_worktree(pool, &claimed.task, &actor, &data_dir).await {
             Ok(prepared) => prepared,
             Err(error) => {
                 let failure_reason = format!("Local Worktree setup failed after claim: {error:#}");
@@ -97,7 +99,7 @@ pub async fn run_worker_once(
             }
         };
     tasker_db::heartbeat_run(pool, &claimed.run.id, request.lease_seconds, &actor).await?;
-    let transcript_dir = request.data_dir.join("runs").join(&claimed.run.id);
+    let transcript_dir = data_dir.join("runs").join(&claimed.run.id);
     fs::create_dir_all(&transcript_dir).with_context(|| {
         format!(
             "failed to create Run Transcript directory {}",
@@ -850,6 +852,16 @@ fn git_output(repo: &Path, args: &[&str], action: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .context("failed to resolve current directory")?
+            .join(path))
+    }
+}
+
 fn fake_workpad_note(task_identifier: &str, run_id: &str, outcome: &str) -> String {
     format!(
         "Fake Agent Launcher processed Task {task_identifier} in Agent Run {run_id}.\nOutcome: {outcome}\n"
@@ -950,6 +962,21 @@ mod tests {
             .any(|link| link.kind == "task_branch" && link.target == "tasker/TASK-1"));
         let runs_dir = temp.path().join("data/runs");
         assert!(runs_dir.is_dir());
+        let run_id = match outcome {
+            WorkOnceOutcome::Finished { run_id, .. } => run_id,
+            WorkOnceOutcome::NoEligibleTask { .. } => panic!("expected finished run"),
+        };
+        let run_detail = tasker_db::get_agent_run_detail(&pool, &run_id)
+            .await
+            .expect("load run detail")
+            .expect("run detail");
+        let transcript_path = run_detail
+            .launcher_session_data
+            .expect("Launcher Session Data")
+            .transcript_path
+            .expect("Run Transcript path");
+        assert!(Path::new(&transcript_path).is_absolute());
+        assert!(Path::new(&transcript_path).starts_with(&runs_dir));
     }
 
     #[tokio::test]

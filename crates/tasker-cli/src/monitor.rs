@@ -30,12 +30,14 @@ pub struct MonitorOptions {
     pub plain: bool,
     pub once: bool,
     pub config_path: PathBuf,
+    pub data_dir: PathBuf,
     pub db_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorSnapshot {
     pub config_path: PathBuf,
+    pub data_dir: PathBuf,
     pub db_path: PathBuf,
     pub queue_filter: Option<String>,
     pub captured_at: String,
@@ -168,6 +170,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot) 
             snapshot.captured_at
         )),
         Line::from(format!("config: {}", snapshot.config_path.display())),
+        Line::from(format!("data: {}", snapshot.data_dir.display())),
         Line::from(format!("database: {}", snapshot.db_path.display())),
     ];
     frame.render_widget(
@@ -419,6 +422,7 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
 
     Ok(MonitorSnapshot {
         config_path: options.config_path.clone(),
+        data_dir: options.data_dir.clone(),
         db_path: options.db_path.clone(),
         queue_filter: options.queue.clone(),
         captured_at,
@@ -464,6 +468,7 @@ pub fn write_snapshot(mut writer: impl Write, snapshot: &MonitorSnapshot) -> io:
     writeln!(writer, "Tasker terminal status monitor")?;
     writeln!(writer, "captured at: {}", snapshot.captured_at)?;
     writeln!(writer, "config: {}", snapshot.config_path.display())?;
+    writeln!(writer, "data: {}", snapshot.data_dir.display())?;
     writeln!(writer, "database: {}", snapshot.db_path.display())?;
     if let Some(queue) = &snapshot.queue_filter {
         writeln!(writer, "queue filter: {queue}")?;
@@ -599,6 +604,7 @@ mod tests {
             plain: true,
             once: true,
             config_path: PathBuf::from("/config.toml"),
+            data_dir: PathBuf::from("/data"),
             db_path: PathBuf::from("/tasker.db"),
         }
     }
@@ -659,6 +665,7 @@ mod tests {
     fn plain_snapshot_output_includes_context_and_keybindings() {
         let snapshot = MonitorSnapshot {
             config_path: PathBuf::from("/repo/.tasker/config.toml"),
+            data_dir: PathBuf::from("/repo/.tasker/data"),
             db_path: PathBuf::from("/repo/.tasker/data/tasker.db"),
             queue_filter: Some("TASK".to_string()),
             captured_at: "2026-05-09 00:00:00".to_string(),
@@ -672,6 +679,7 @@ mod tests {
 
         assert!(text.contains("Tasker terminal status monitor"));
         assert!(text.contains("config: /repo/.tasker/config.toml"));
+        assert!(text.contains("data: /repo/.tasker/data"));
         assert!(text.contains("database: /repo/.tasker/data/tasker.db"));
         assert!(text.contains("queue filter: TASK"));
         assert!(text.contains("keys: q/esc quit, r refresh, Ctrl-C quit"));
@@ -691,6 +699,7 @@ mod tests {
     fn ratatui_tui_render_includes_context_and_task_queue_status() {
         let snapshot = MonitorSnapshot {
             config_path: PathBuf::from("/repo/.tasker/config.toml"),
+            data_dir: PathBuf::from("/repo/.tasker/data"),
             db_path: PathBuf::from("/repo/.tasker/data/tasker.db"),
             queue_filter: Some("TASK".to_string()),
             captured_at: "2026-05-09 00:00:00".to_string(),
@@ -745,6 +754,7 @@ mod tests {
     fn raw_terminal_snapshot_output_normalizes_all_newlines_to_crlf() {
         let snapshot = MonitorSnapshot {
             config_path: PathBuf::from("/repo/.tasker/config.toml"),
+            data_dir: PathBuf::from("/repo/.tasker/data"),
             db_path: PathBuf::from("/repo/.tasker/data/tasker.db"),
             queue_filter: Some("TASK".to_string()),
             captured_at: "2026-05-09 00:00:00".to_string(),
