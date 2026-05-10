@@ -11,6 +11,15 @@ pub fn write_task_detail(mut writer: impl Write, detail: &tasker_db::TaskDetail)
     writeln!(writer, "Task State: {}", detail.task.state)?;
     writeln!(writer, "Priority: {}", detail.task.priority)?;
     writeln!(writer, "review required: {}", detail.task.review_required)?;
+    writeln!(
+        writer,
+        "Validated Base Commit: {}",
+        detail
+            .task
+            .validated_base_commit
+            .as_deref()
+            .unwrap_or("not recorded")
+    )?;
     if !detail.tags.is_empty() {
         writeln!(writer, "tags: {}", detail.tags.join(", "))?;
     }
@@ -381,6 +390,7 @@ mod tests {
                     priority: "normal".to_string(),
                     state: "in_progress".to_string(),
                     review_required: false,
+                    validated_base_commit: None,
                     created_at: "now".to_string(),
                     updated_at: "now".to_string(),
                 },

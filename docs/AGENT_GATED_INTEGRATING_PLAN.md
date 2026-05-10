@@ -53,7 +53,7 @@ Before mutating the **Managed Source Repository**, the adapter should fail fast 
 3. The **Task Branch** is a valid local branch and belongs to the same repository as the **Local Worktree**.
 4. The **Local Worktree** exists, is attached to the configured repository, is on the **Task Branch**, and has a clean working tree and clean index.
 5. The Task has no pending structured gates; in the first slice this is satisfied by requiring **Integrating**, because transition into **Integrating** already enforces gates.
-6. The **Task Branch** includes the current **Main Branch**, or the Task's **Validated Base Commit** equals the current **Main Branch** once that field is implemented.
+6. The **Task Branch** includes the current **Main Branch**, or the Task's recorded **Validated Base Commit** equals the current **Main Branch**.
 7. There is no obvious Git lock file in the repository or worktree that would make mutation unsafe.
 8. The adapter captures the pre-integration Main Branch commit before any mutating Git command.
 
@@ -80,7 +80,7 @@ The adapter slice is intentionally not the whole feature. Follow-up Tasks should
 1. **TASKER-40**: implement the runner-side Local Worktree integrate command.
 2. **TASKER-41**: wire the Worker Loop to call the adapter immediately after a Worker Agent transitions to **Integrating** and still owns the **Claim Lease**.
 3. Persist richer delivery records/outcomes and expose them in `tasker task show`, `tasker status`, and `tasker run show` as needed.
-4. **TASKER-42**: add or finalize **Validated Base Commit** recording so integration rejects stale validation deterministically.
+4. **TASKER-42**: add or finalize **Validated Base Commit** recording so integration rejects stale validation deterministically. (Implemented during dogfooding; keep expanding delivery evidence as needed.)
 5. Add a repo-level integration lock or equivalent serialization if queue concurrency allows more than one **Integrating** Task to attempt local merge at the same time; coordinate with the separate Integrating capacity policy work.
 
 ## Deterministic test strategy

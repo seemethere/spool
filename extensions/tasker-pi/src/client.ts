@@ -38,7 +38,12 @@ export class TaskerClient {
     return this.request(
       "PUT",
       `/tasks/${encodeURIComponent(input.identifier)}/validation-items/${input.position}/status`,
-      { actor, status: input.status, waiver_reason: input.waiver_reason ?? null },
+      {
+        actor,
+        status: input.status,
+        waiver_reason: input.waiver_reason ?? null,
+        validated_base_commit: input.validated_base_commit ?? null,
+      },
       signal,
     );
   }

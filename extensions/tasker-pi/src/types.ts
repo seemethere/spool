@@ -38,6 +38,7 @@ export interface RequirementStatusInput {
   position: number;
   status: string;
   waiver_reason?: string;
+  validated_base_commit?: string;
 }
 
 export interface CreateChildTaskInput {
