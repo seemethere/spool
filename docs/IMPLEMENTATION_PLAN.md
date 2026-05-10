@@ -255,7 +255,12 @@ After this milestone, create real bootstrap **Tasks** for the remaining mileston
    - fake delivery outcomes.
 6. Choose the fastest dogfooding delivery path:
    - acceptable early path: completed **Local Worktree** plus **Manual Dogfood Merge**
-   - preferred if stable: first **Integrating** path with **Squash Merge**, **Integration Outcome**, **Final Commit**, and cleanup.
+   - preferred path: first **Integrating** path with **Squash Merge**, **Integration Outcome**, **Final Commit**, and cleanup.
+7. Implement the first Agent-Gated **Integrating** slice described in `docs/AGENT_GATED_INTEGRATING_PLAN.md`:
+   - keep Git/filesystem operations in a runner-side **Delivery Adapter**
+   - require an already-**Integrating** Task for the first command-oriented slice
+   - record success, no-change, work-change failure, or operational failure outcomes
+   - move successful work to **Done**, work-change failures to **Rework**, and leave operational failures in **Integrating** for retry.
 
 ### Acceptance check
 
@@ -264,7 +269,7 @@ After this milestone, create real bootstrap **Tasks** for the remaining mileston
 
 ## Full v1 follow-up after dogfooding
 
-- Complete Agent-Gated **Integrating** with default **Squash Merge** if dogfooding used manual merge first.
+- Complete Agent-Gated **Integrating** polish beyond the first dogfood slice, including automatic Worker Loop invocation after a Worker Agent transitions to **Integrating** while still holding the **Claim Lease**.
 - Add `tasker delegate` and the Pi-backed **Delegation Session**.
 - Add `tasker review` and **Review Session** support.
 - Expand the **Tasker Pi Extension** with Task Links and richer transition/update tools.
