@@ -97,7 +97,7 @@ async fn run_terminal_loop(
             terminal::Clear(ClearType::All)
         )
         .context("failed to redraw terminal monitor")?;
-        write_snapshot(&mut *stdout, &snapshot)?;
+        write_snapshot(CrLfWriter::new(&mut *stdout), &snapshot)?;
         stdout.flush()?;
 
         let deadline = std::time::Instant::now() + refresh;
@@ -120,6 +120,33 @@ async fn run_terminal_loop(
                 }
             }
         }
+    }
+}
+
+struct CrLfWriter<W> {
+    inner: W,
+}
+
+impl<W> CrLfWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner }
+    }
+}
+
+impl<W: Write> Write for CrLfWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        for byte in buf {
+            if *byte == b'\n' {
+                self.inner.write_all(b"\r\n")?;
+            } else {
+                self.inner.write_all(&[*byte])?;
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -414,5 +441,14 @@ mod tests {
         assert!(text.contains("queue filter: TASK"));
         assert!(text.contains("keys: q/esc quit, r refresh, Ctrl-C quit"));
         assert!(text.contains("No Task Queues found"));
+    }
+
+    #[test]
+    fn crlf_writer_expands_newline_for_raw_terminal_mode() {
+        let mut out = Vec::new();
+
+        write!(CrLfWriter::new(&mut out), "one\ntwo\n").expect("write");
+
+        assert_eq!(String::from_utf8(out).expect("utf8"), "one\r\ntwo\r\n");
     }
 }
