@@ -167,7 +167,7 @@ After this milestone, create real bootstrap **Tasks** for the remaining mileston
    - no unresolved **Blocking Tasks**
    - no active **Claim Lease**
    - no active **Retry Hold**
-   - queue is below its optional **Queue Concurrency Limit**
+   - queue is below its optional **Queue Concurrency Limit** based on active **Agent Runs**, including active **Integrating** runs
    - ordering: **Priority**, creation time, **Task Identifier**.
 2. `claim-next` API:
    - expire stale active **Agent Runs** first
@@ -192,7 +192,7 @@ After this milestone, create real bootstrap **Tasks** for the remaining mileston
 
 - Concurrent claims cannot claim the same **Task**.
 - Expired leases can be reclaimed after expiry and retry hold handling.
-- Queue concurrency limits are enforced during claim.
+- Queue concurrency limits are enforced during claim and count active **Integrating** **Agent Runs** during dogfooding.
 - Finishing a run does not silently change **Task State**.
 - `tasker work --once --launcher fake` can process one bootstrap **Task** deterministically.
 

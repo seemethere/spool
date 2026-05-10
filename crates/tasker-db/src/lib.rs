@@ -536,6 +536,7 @@ pub struct TaskDetail {
 pub struct QueueStatus {
     pub queue_key: String,
     pub queue_name: String,
+    pub queue_concurrency_limit: Option<i64>,
     pub state: String,
     pub task_count: i64,
     pub active_agent_runs: i64,
@@ -546,6 +547,7 @@ pub struct QueueStatus {
 pub struct ActiveAgentRunStatus {
     pub queue_key: String,
     pub task_identifier: String,
+    pub task_state: String,
     pub agent_run_id: String,
     pub launcher_kind: String,
     pub worker_id: String,
@@ -1517,6 +1519,7 @@ pub async fn status_by_queue_and_state(pool: &SqlitePool) -> Result<Vec<QueueSta
         SELECT
             task_queues.key AS queue_key,
             task_queues.name AS queue_name,
+            task_queues.queue_concurrency_limit AS queue_concurrency_limit,
             COALESCE(tasks.state, 'none') AS state,
             COUNT(tasks.id) AS task_count,
             (
@@ -1533,7 +1536,7 @@ pub async fn status_by_queue_and_state(pool: &SqlitePool) -> Result<Vec<QueueSta
             ) AS active_retry_holds
         FROM task_queues
         LEFT JOIN tasks ON tasks.task_queue_id = task_queues.id
-        GROUP BY task_queues.id, task_queues.key, task_queues.name, tasks.state
+        GROUP BY task_queues.id, task_queues.key, task_queues.name, task_queues.queue_concurrency_limit, tasks.state
         ORDER BY task_queues.key, tasks.state
         "#,
     )
@@ -1548,6 +1551,7 @@ pub async fn active_agent_runs_for_status(pool: &SqlitePool) -> Result<Vec<Activ
         SELECT
             task_queues.key AS queue_key,
             tasks.identifier AS task_identifier,
+            tasks.state AS task_state,
             agent_runs.id AS agent_run_id,
             agent_runs.launcher_kind AS launcher_kind,
             agent_runs.worker_id AS worker_id,
@@ -3902,7 +3906,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_concurrency_limit_blocks_claims() {
+    async fn queue_concurrency_limit_blocks_claims_including_integrating_runs() {
         let (_temp, pool) = migrated_pool().await;
         let mut queue = sample_queue("TASK", "Tasker");
         queue.queue_concurrency_limit = Some(1);
@@ -3928,6 +3932,14 @@ mod tests {
             .await
             .expect("claim")
             .is_some());
+        sqlx::query("UPDATE tasks SET state = 'integrating' WHERE identifier = 'TASK-1'")
+            .execute(&pool)
+            .await
+            .expect("mark claimed Task Integrating");
+        let active_runs = active_agent_runs_for_status(&pool)
+            .await
+            .expect("active runs");
+        assert_eq!(active_runs[0].task_state, "integrating");
         assert!(claim_next(
             &pool,
             &ClaimNextInput {

@@ -517,6 +517,7 @@ _Avoid_: Separate progress comment
 - `tasker work` starts a **Worker Loop**.
 - A **Worker Loop** has default **Worker Concurrency** of 1.
 - `tasker work --concurrency N` raises **Worker Concurrency** up to the **Queue Concurrency Limit**.
+- The **Queue Concurrency Limit** counts active **Agent Runs** across agent-eligible **Task States**, including **Integrating**.
 - `tasker work --once` claims and runs at most one **Task**.
 - `tasker work --max-run-seconds N` bounds one launcher execution and fails the **Agent Run** if the **Pi Launcher** does not emit `agent_end` before the duration elapses.
 - `tasker status` shows queue counts, running work, and retry holds.
@@ -547,6 +548,7 @@ _Avoid_: Separate progress comment
 - The first **Dogfooding Cutover** target is after roadmap Milestone 2, when **Bootstrap Task Creation**, **Task Queues**, task show/status, **Workpad Notes**, and **Audit Events** are usable for real Tasker development work.
 - **Dogfooding Readiness** requires enough init/config, queue setup, delegation or temporary task creation, one-shot work, local worktree handling, work updates, and status visibility to build Tasker with Tasker.
 - **Dogfooding Readiness** uses single-worker execution only.
+- During dogfooding, active **Agent Runs** for **Integrating** **Tasks** share the same **Queue Concurrency Limit** as coding and rework runs; operators unblock saturation by waiting for completion or **Claim Lease** expiry, failing stuck runs, or raising/clearing the limit only if local resources permit.
 - **Bootstrap Task Creation** uses `tasker task create --bootstrap --queue <key> --file task.md`.
 - A bootstrap task file uses YAML front matter for title, acceptance criteria, validation items, priority, state, tags, and review requirement, with the Markdown body as the **Task Brief**.
 - **Bootstrap Task Creation** defaults to **Ready** when the task file does not specify state.
@@ -608,6 +610,7 @@ _Avoid_: Separate progress comment
 - "scheduling" could imply due dates, estimates, milestones, or calendars — resolved: v1 scheduling is limited to queues, states, priority, blockers, leases, concurrency, and retry holds.
 - "queue creation" could mean normal task delegation — resolved: **Task Queues** are **Operator**-managed infrastructure boundaries, not agent-created work data.
 - "concurrency limit" could mean only Symphony's process limit — resolved: **Queue Concurrency Limit** is enforced by Tasker during claims, while Symphony may still enforce a global worker limit.
+- "Integrating capacity" could mean a separate delivery-only lane — resolved for v1 dogfooding: **Integrating** consumes ordinary **Queue Concurrency Limit** capacity while an **Agent Run** is active.
 - "identifier" could mean internal database ID or human key — resolved: use an immutable UUID internally and **Task Identifier** for human/operator-facing references.
 - "description" could mean an unstructured blob containing hidden requirements — resolved: use a **Task Brief** for narrative context and first-class **Acceptance Criteria** plus **Validation Items** for required outcomes/proof.
 - "completion evidence" could live only in the **Workpad Note** — resolved: **Criterion Status**, **Validation Status**, and **Waivers** are structured Tasker data.
