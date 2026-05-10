@@ -699,6 +699,7 @@ pub struct ActiveRetryHoldStatus {
     pub task_identifier: String,
     pub hold_until: String,
     pub reason: String,
+    pub failure_reason_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
@@ -743,6 +744,7 @@ pub struct AgentRun {
     pub last_heartbeat_at: Option<String>,
     pub outcome: Option<String>,
     pub failure_reason: Option<String>,
+    pub failure_reason_code: Option<String>,
     pub created_at: String,
     pub finished_at: Option<String>,
 }
@@ -832,12 +834,14 @@ pub struct ClaimNextInput {
 pub struct FinishRunInput {
     pub outcome: String,
     pub failure_reason: Option<String>,
+    pub failure_reason_code: Option<String>,
     pub retry_hold_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OperatorFailRunInput {
     pub failure_reason: String,
+    pub failure_reason_code: Option<String>,
     pub retry_hold_seconds: Option<i64>,
 }
 
@@ -1590,7 +1594,7 @@ pub async fn transition_task_state(
         let canceled_runs = sqlx::query(
             r#"
             UPDATE agent_runs
-            SET outcome = 'canceled', finished_at = CURRENT_TIMESTAMP, failure_reason = 'Task canceled'
+            SET outcome = 'canceled', finished_at = CURRENT_TIMESTAMP, failure_reason = 'Task canceled', failure_reason_code = 'task_canceled'
             WHERE task_id = ? AND outcome IS NULL
             "#,
         )
@@ -1948,9 +1952,11 @@ pub async fn active_retry_holds_for_status(
             task_queues.key AS queue_key,
             tasks.identifier AS task_identifier,
             task_retry_holds.hold_until AS hold_until,
-            task_retry_holds.reason AS reason
+            task_retry_holds.reason AS reason,
+            agent_runs.failure_reason_code AS failure_reason_code
         FROM task_retry_holds
         JOIN tasks ON tasks.id = task_retry_holds.task_id
+        LEFT JOIN agent_runs ON agent_runs.id = task_retry_holds.agent_run_id
         JOIN task_queues ON task_queues.id = tasks.task_queue_id
         WHERE task_retry_holds.hold_until > CURRENT_TIMESTAMP
         ORDER BY task_queues.key, tasks.identifier
@@ -2304,7 +2310,7 @@ pub async fn heartbeat_run(
           AND worker_actor_id = ?
         RETURNING id, task_id, task_queue_id, worker_actor_kind, worker_actor_id,
                   worker_actor_display_name, worker_id, launcher_kind, lease_expires_at,
-                  last_heartbeat_at, outcome, failure_reason, created_at, finished_at
+                  last_heartbeat_at, outcome, failure_reason, failure_reason_code, created_at, finished_at
         "#,
     )
     .bind(lease_seconds)
@@ -2340,12 +2346,13 @@ pub async fn finish_run(
     if let Some(seconds) = input.retry_hold_seconds {
         validate_positive_seconds("retry_hold_seconds", seconds)?;
     }
+    let failure_reason_code = failure_reason_code_for_finish(input)?;
 
     let mut tx = pool.begin().await.context("failed to begin transaction")?;
     let run = sqlx::query_as::<_, AgentRun>(
         r#"
         UPDATE agent_runs
-        SET outcome = ?, failure_reason = ?, finished_at = CURRENT_TIMESTAMP
+        SET outcome = ?, failure_reason = ?, failure_reason_code = ?, finished_at = CURRENT_TIMESTAMP
         WHERE id = ?
           AND outcome IS NULL
           AND lease_expires_at > CURRENT_TIMESTAMP
@@ -2353,11 +2360,12 @@ pub async fn finish_run(
           AND worker_actor_id = ?
         RETURNING id, task_id, task_queue_id, worker_actor_kind, worker_actor_id,
                   worker_actor_display_name, worker_id, launcher_kind, lease_expires_at,
-                  last_heartbeat_at, outcome, failure_reason, created_at, finished_at
+                  last_heartbeat_at, outcome, failure_reason, failure_reason_code, created_at, finished_at
         "#,
     )
     .bind(&input.outcome)
     .bind(&input.failure_reason)
+    .bind(failure_reason_code)
     .bind(run_id)
     .bind(&actor.kind)
     .bind(&actor.id)
@@ -2400,6 +2408,7 @@ pub async fn finish_run(
                 "agent_run_id": run.id,
                 "hold_seconds": seconds,
                 "reason": reason,
+                "failure_reason_code": run.failure_reason_code,
             }),
         )
         .await?;
@@ -2431,6 +2440,7 @@ pub async fn finish_run(
         serde_json::json!({
             "outcome": input.outcome,
             "failure_reason": input.failure_reason,
+            "failure_reason_code": run.failure_reason_code,
             "retry_hold_seconds": input.retry_hold_seconds,
         }),
     )
@@ -2451,19 +2461,25 @@ pub async fn operator_fail_run(
     if let Some(seconds) = input.retry_hold_seconds {
         validate_positive_seconds("retry_hold_seconds", seconds)?;
     }
+    let failure_reason_code = input
+        .failure_reason_code
+        .as_deref()
+        .unwrap_or("operator_failed");
+    validate_failure_reason_code(failure_reason_code)?;
 
     let mut tx = pool.begin().await.context("failed to begin transaction")?;
     let run = sqlx::query_as::<_, AgentRun>(
         r#"
         UPDATE agent_runs
-        SET outcome = 'failed', failure_reason = ?, finished_at = CURRENT_TIMESTAMP
+        SET outcome = 'failed', failure_reason = ?, failure_reason_code = ?, finished_at = CURRENT_TIMESTAMP
         WHERE id = ? AND outcome IS NULL
         RETURNING id, task_id, task_queue_id, worker_actor_kind, worker_actor_id,
                   worker_actor_display_name, worker_id, launcher_kind, lease_expires_at,
-                  last_heartbeat_at, outcome, failure_reason, created_at, finished_at
+                  last_heartbeat_at, outcome, failure_reason, failure_reason_code, created_at, finished_at
         "#,
     )
     .bind(input.failure_reason.trim())
+    .bind(failure_reason_code)
     .bind(run_id)
     .fetch_optional(&mut *tx)
     .await
@@ -2500,6 +2516,7 @@ pub async fn operator_fail_run(
             "agent_run_id": run.id,
             "hold_seconds": seconds,
             "reason": input.failure_reason.trim(),
+            "failure_reason_code": run.failure_reason_code,
         }),
     )
     .await?;
@@ -2511,6 +2528,7 @@ pub async fn operator_fail_run(
         &run.id,
         serde_json::json!({
             "reason": input.failure_reason.trim(),
+            "failure_reason_code": run.failure_reason_code,
             "retry_hold_seconds": seconds,
         }),
     )
@@ -3199,7 +3217,12 @@ impl AgentRunMetricsSummary {
                 &["usage", "maxContextTokens"],
                 &["message", "usage", "context_tokens"],
                 &["message", "usage", "contextTokens"],
-                &["assistantMessageEvent", "partial", "usage", "context_tokens"],
+                &[
+                    "assistantMessageEvent",
+                    "partial",
+                    "usage",
+                    "context_tokens",
+                ],
                 &["assistantMessageEvent", "partial", "usage", "contextTokens"],
             ],
         ) {
@@ -3374,11 +3397,11 @@ async fn expire_stale_agent_runs(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -
     let expired = sqlx::query_as::<_, AgentRun>(
         r#"
         UPDATE agent_runs
-        SET outcome = 'expired', finished_at = CURRENT_TIMESTAMP, failure_reason = 'Claim Lease expired'
+        SET outcome = 'expired', finished_at = CURRENT_TIMESTAMP, failure_reason = 'Claim Lease expired', failure_reason_code = 'claim_lease_expired'
         WHERE outcome IS NULL AND lease_expires_at <= CURRENT_TIMESTAMP
         RETURNING id, task_id, task_queue_id, worker_actor_kind, worker_actor_id,
                   worker_actor_display_name, worker_id, launcher_kind, lease_expires_at,
-                  last_heartbeat_at, outcome, failure_reason, created_at, finished_at
+                  last_heartbeat_at, outcome, failure_reason, failure_reason_code, created_at, finished_at
         "#,
     )
     .fetch_all(&mut **tx)
@@ -3417,6 +3440,7 @@ async fn expire_stale_agent_runs(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -
                 "agent_run_id": run.id,
                 "hold_seconds": 60,
                 "reason": "Claim Lease expired",
+                "failure_reason_code": run.failure_reason_code,
             }),
         )
         .await?;
@@ -3426,7 +3450,7 @@ async fn expire_stale_agent_runs(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -
             "agent_run.expired",
             "agent_run",
             &run.id,
-            serde_json::json!({ "reason": "Claim Lease expired" }),
+            serde_json::json!({ "reason": "Claim Lease expired", "failure_reason_code": run.failure_reason_code }),
         )
         .await?;
         sqlx::query(
@@ -3490,7 +3514,7 @@ async fn append_audit_event_in_tx(
 
 fn agent_run_select_sql(where_clause: &str) -> String {
     format!(
-        "SELECT agent_runs.id, agent_runs.task_id, agent_runs.task_queue_id, agent_runs.worker_actor_kind, agent_runs.worker_actor_id, agent_runs.worker_actor_display_name, agent_runs.worker_id, agent_runs.launcher_kind, agent_runs.lease_expires_at, agent_runs.last_heartbeat_at, agent_runs.outcome, agent_runs.failure_reason, agent_runs.created_at, agent_runs.finished_at FROM agent_runs {where_clause}"
+        "SELECT agent_runs.id, agent_runs.task_id, agent_runs.task_queue_id, agent_runs.worker_actor_kind, agent_runs.worker_actor_id, agent_runs.worker_actor_display_name, agent_runs.worker_id, agent_runs.launcher_kind, agent_runs.lease_expires_at, agent_runs.last_heartbeat_at, agent_runs.outcome, agent_runs.failure_reason, agent_runs.failure_reason_code, agent_runs.created_at, agent_runs.finished_at FROM agent_runs {where_clause}"
     )
 }
 
@@ -3760,6 +3784,38 @@ fn validate_run_outcome(outcome: &str) -> Result<()> {
     match outcome {
         "completed" | "failed" | "canceled" => Ok(()),
         _ => anyhow::bail!("invalid Agent Run outcome {outcome}"),
+    }
+}
+
+fn failure_reason_code_for_finish(input: &FinishRunInput) -> Result<Option<&str>> {
+    let Some(code) = input.failure_reason_code.as_deref() else {
+        return Ok((input.outcome == "failed").then_some("agent_run_failed"));
+    };
+    validate_failure_reason_code(code)?;
+    if input.outcome == "completed" {
+        anyhow::bail!("completed Agent Runs cannot have a failure reason code");
+    }
+    Ok(Some(code))
+}
+
+fn validate_failure_reason_code(code: &str) -> Result<()> {
+    match code {
+        "agent_run_failed"
+        | "local_worktree_setup_failed"
+        | "dirty_managed_source_repository"
+        | "repo_operation_lock_held"
+        | "migration_incompatible"
+        | "stale_validation_base"
+        | "launcher_start_failed"
+        | "launcher_rpc_io_failed"
+        | "launcher_exited"
+        | "launcher_timeout"
+        | "unattended_question"
+        | "agent_gated_integration_failed"
+        | "operator_failed"
+        | "claim_lease_expired"
+        | "task_canceled" => Ok(()),
+        _ => anyhow::bail!("invalid Agent Run failure reason code {code}"),
     }
 }
 
@@ -4669,6 +4725,7 @@ mod tests {
             &FinishRunInput {
                 outcome: "failed".to_string(),
                 failure_reason: Some("failed".to_string()),
+                failure_reason_code: None,
                 retry_hold_seconds: Some(60),
             },
             &worker_actor(),
@@ -5278,6 +5335,7 @@ mod tests {
             &FinishRunInput {
                 outcome: "completed".to_string(),
                 failure_reason: None,
+                failure_reason_code: None,
                 retry_hold_seconds: None,
             },
             &worker_actor(),
@@ -5325,6 +5383,7 @@ mod tests {
             &FinishRunInput {
                 outcome: "completed".to_string(),
                 failure_reason: None,
+                failure_reason_code: None,
                 retry_hold_seconds: None,
             },
             &worker_actor(),
@@ -5355,23 +5414,68 @@ mod tests {
             .await
             .expect("claim")
             .expect("claimed task");
-        finish_run(
+        let failed = finish_run(
             &pool,
             &claimed.run.id,
             &FinishRunInput {
                 outcome: "failed".to_string(),
                 failure_reason: Some("fake failure".to_string()),
+                failure_reason_code: Some("launcher_exited".to_string()),
                 retry_hold_seconds: Some(60),
             },
             &worker_actor(),
         )
         .await
         .expect("finish failed");
+        assert_eq!(
+            failed.failure_reason_code.as_deref(),
+            Some("launcher_exited")
+        );
 
         assert!(claim_next(&pool, &sample_claim("TASK"), &worker_actor())
             .await
             .expect("claim")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn finish_run_rejects_invalid_failure_reason_code() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Run"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
+        let claimed = claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim")
+            .expect("claimed task");
+
+        let error = finish_run(
+            &pool,
+            &claimed.run.id,
+            &FinishRunInput {
+                outcome: "failed".to_string(),
+                failure_reason: Some("fake failure".to_string()),
+                failure_reason_code: Some("not-a-code".to_string()),
+                retry_hold_seconds: Some(60),
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect_err("invalid code rejected");
+        assert!(error
+            .to_string()
+            .contains("invalid Agent Run failure reason code"));
     }
 
     #[tokio::test]
@@ -5401,6 +5505,7 @@ mod tests {
             &claimed.run.id,
             &OperatorFailRunInput {
                 failure_reason: "SQLite database is locked".to_string(),
+                failure_reason_code: None,
                 retry_hold_seconds: Some(120),
             },
             &Actor::operator("operator"),
@@ -5412,6 +5517,10 @@ mod tests {
         assert_eq!(
             failed.failure_reason.as_deref(),
             Some("SQLite database is locked")
+        );
+        assert_eq!(
+            failed.failure_reason_code.as_deref(),
+            Some("operator_failed")
         );
         assert!(claim_next(&pool, &sample_claim("TASK"), &worker_actor())
             .await
@@ -5453,6 +5562,7 @@ mod tests {
             &FinishRunInput {
                 outcome: "failed".to_string(),
                 failure_reason: Some("fake failure".to_string()),
+                failure_reason_code: None,
                 retry_hold_seconds: Some(60),
             },
             &worker_actor(),
@@ -5696,6 +5806,7 @@ mod tests {
             &FinishRunInput {
                 outcome: "completed".to_string(),
                 failure_reason: None,
+                failure_reason_code: None,
                 retry_hold_seconds: None,
             },
             &worker_actor(),
@@ -5783,6 +5894,7 @@ mod tests {
             &FinishRunInput {
                 outcome: "completed".to_string(),
                 failure_reason: None,
+                failure_reason_code: None,
                 retry_hold_seconds: None,
             },
             &worker_actor(),
@@ -5863,6 +5975,7 @@ mod tests {
             &FinishRunInput {
                 outcome: "failed".to_string(),
                 failure_reason: Some("failed".to_string()),
+                failure_reason_code: None,
                 retry_hold_seconds: Some(60),
             },
             &worker_actor(),
@@ -5918,6 +6031,7 @@ mod tests {
             &FinishRunInput {
                 outcome: "completed".to_string(),
                 failure_reason: None,
+                failure_reason_code: None,
                 retry_hold_seconds: None,
             },
             &worker_actor(),
@@ -6004,6 +6118,7 @@ mod tests {
             &FinishRunInput {
                 outcome: "failed".to_string(),
                 failure_reason: Some("model unavailable".to_string()),
+                failure_reason_code: None,
                 retry_hold_seconds: Some(300),
             },
             &worker_actor(),

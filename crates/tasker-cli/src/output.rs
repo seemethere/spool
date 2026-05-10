@@ -324,6 +324,7 @@ struct RunTelemetry<'a> {
     claim_lease_expires_at: &'a str,
     outcome: Option<&'a str>,
     failure_reason: Option<&'a str>,
+    failure_reason_code: Option<&'a str>,
     created_at: &'a str,
     finished_at: Option<&'a str>,
     launcher_session_data: Option<LauncherSessionTelemetry<'a>>,
@@ -358,6 +359,7 @@ fn run_telemetry(detail: &tasker_db::AgentRunDetail) -> RunTelemetry<'_> {
         claim_lease_expires_at: &detail.run.lease_expires_at,
         outcome: detail.run.outcome.as_deref(),
         failure_reason: detail.run.failure_reason.as_deref(),
+        failure_reason_code: detail.run.failure_reason_code.as_deref(),
         created_at: &detail.run.created_at,
         finished_at: detail.run.finished_at.as_deref(),
         launcher_session_data,
@@ -396,6 +398,9 @@ pub fn write_run_detail(mut writer: impl Write, detail: &tasker_db::AgentRunDeta
         "Outcome: {}",
         detail.run.outcome.as_deref().unwrap_or("active")
     )?;
+    if let Some(code) = &detail.run.failure_reason_code {
+        writeln!(writer, "Failure Reason Code: {code}")?;
+    }
     if let Some(reason) = &detail.run.failure_reason {
         writeln!(writer, "Failure Reason: {reason}")?;
     }
@@ -544,6 +549,7 @@ mod tests {
                 last_heartbeat_at: None,
                 outcome: Some("failed".to_string()),
                 failure_reason: Some("launcher failure".to_string()),
+                failure_reason_code: Some("launcher_exited".to_string()),
                 created_at: "now".to_string(),
                 finished_at: Some("later".to_string()),
             },

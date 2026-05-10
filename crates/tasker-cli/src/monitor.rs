@@ -72,6 +72,7 @@ pub struct RecentRunSnapshot {
     pub worker_id: String,
     pub outcome: Option<String>,
     pub failure_reason: Option<String>,
+    pub failure_reason_code: Option<String>,
     pub task_state: String,
     pub recovered_by_later_success: bool,
     pub created_at: String,
@@ -493,8 +494,10 @@ fn attention_line(icon: &'static str, label: &'static str, detail: String) -> Li
 }
 
 fn is_unrecovered_attention_outcome(run: &RecentRunSnapshot) -> bool {
-    matches!(run.outcome.as_deref(), Some("failed" | "expired" | "canceled"))
-        && run.task_state != "done"
+    matches!(
+        run.outcome.as_deref(),
+        Some("failed" | "expired" | "canceled")
+    ) && run.task_state != "done"
         && !run.recovered_by_later_success
 }
 
@@ -662,6 +665,7 @@ async fn recent_agent_runs(
             agent_runs.worker_id AS worker_id,
             agent_runs.outcome AS outcome,
             agent_runs.failure_reason AS failure_reason,
+            agent_runs.failure_reason_code AS failure_reason_code,
             tasks.state AS task_state,
             EXISTS (
                 SELECT 1
@@ -783,6 +787,9 @@ pub fn write_snapshot(mut writer: impl Write, snapshot: &MonitorSnapshot) -> io:
             status,
             run.finished_at.as_deref().unwrap_or("-")
         )?;
+        if let Some(code) = &run.failure_reason_code {
+            writeln!(writer, "    failure code: {code}")?;
+        }
         if let Some(reason) = &run.failure_reason {
             writeln!(writer, "    failure reason: {reason}")?;
         }
@@ -850,10 +857,7 @@ mod tests {
         }
     }
 
-    async fn claim_with_worker(
-        pool: &SqlitePool,
-        worker_id: &str,
-    ) -> tasker_db::ClaimedRun {
+    async fn claim_with_worker(pool: &SqlitePool, worker_id: &str) -> tasker_db::ClaimedRun {
         tasker_db::claim_next(
             pool,
             &tasker_db::ClaimNextInput {
@@ -882,6 +886,7 @@ mod tests {
             &tasker_db::FinishRunInput {
                 outcome: outcome.to_string(),
                 failure_reason: failure_reason.map(str::to_string),
+                failure_reason_code: None,
                 retry_hold_seconds: (outcome == "failed").then_some(1),
             },
             &worker_actor(worker_id),
@@ -972,7 +977,14 @@ mod tests {
             .await
             .expect("clear retry hold");
         let recovered = claim_with_worker(&pool, "worker-recovered").await;
-        finish_run(&pool, &recovered.run.id, "worker-recovered", "completed", None).await;
+        finish_run(
+            &pool,
+            &recovered.run.id,
+            "worker-recovered",
+            "completed",
+            None,
+        )
+        .await;
 
         let snapshot = load_snapshot(&pool, &options()).await.expect("snapshot");
         let attention = attention_texts(&snapshot).join("\n");
@@ -1116,6 +1128,7 @@ mod tests {
                 worker_id: "worker".to_string(),
                 outcome: Some("completed".to_string()),
                 failure_reason: None,
+                failure_reason_code: None,
                 task_state: "done".to_string(),
                 recovered_by_later_success: false,
                 created_at: "2026-05-09 00:00:00".to_string(),
@@ -1202,6 +1215,7 @@ mod tests {
                     task_identifier: "TASK-99".to_string(),
                     hold_until: "2026-05-09 00:05:00".to_string(),
                     reason: "agent failed".to_string(),
+                    failure_reason_code: Some("agent_run_failed".to_string()),
                 }],
                 ready_tasks,
                 integrating_tasks: Vec::new(),
@@ -1251,6 +1265,7 @@ mod tests {
                     task_identifier: "TASK-2".to_string(),
                     hold_until: "2026-05-09 00:10:00".to_string(),
                     reason: "retry later".to_string(),
+                    failure_reason_code: Some("launcher_timeout".to_string()),
                 }],
                 ready_tasks: Vec::new(),
                 integrating_tasks: vec![tasker_db::TaskStatusSummary {
@@ -1280,6 +1295,7 @@ mod tests {
                 worker_id: "worker".to_string(),
                 outcome: Some("failed".to_string()),
                 failure_reason: Some("boom".to_string()),
+                failure_reason_code: Some("agent_run_failed".to_string()),
                 task_state: "in_progress".to_string(),
                 recovered_by_later_success: false,
                 created_at: "2026-05-09 00:00:00".to_string(),

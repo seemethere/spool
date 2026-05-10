@@ -411,6 +411,9 @@ enum RunCommand {
         /// Explicit reason recorded on the Agent Run and Retry Hold.
         #[arg(long)]
         reason: String,
+        /// Structured failure reason code. Defaults to operator_failed.
+        #[arg(long)]
+        failure_reason_code: Option<String>,
         /// Retry Hold duration in seconds.
         #[arg(long)]
         retry_hold_seconds: Option<i64>,
@@ -1613,8 +1616,11 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool, json: bool) -> Re
                 .filter(|hold| hold.queue_key.as_str() == row.queue_key.as_str())
             {
                 println!(
-                    "    {}\thold_until={}\treason={}",
-                    hold.task_identifier, hold.hold_until, hold.reason
+                    "    {}\thold_until={}\tfailure_code={}\treason={}",
+                    hold.task_identifier,
+                    hold.hold_until,
+                    hold.failure_reason_code.as_deref().unwrap_or("-"),
+                    hold.reason
                 );
             }
             current_queue = Some(queue_header);
@@ -1820,6 +1826,7 @@ async fn run(paths: &TaskerPaths, db_path_overridden: bool, command: RunCommand)
         RunCommand::Fail {
             run_id,
             reason,
+            failure_reason_code,
             retry_hold_seconds,
             actor,
         } => {
@@ -1828,6 +1835,7 @@ async fn run(paths: &TaskerPaths, db_path_overridden: bool, command: RunCommand)
                 &run_id,
                 &tasker_db::OperatorFailRunInput {
                     failure_reason: reason,
+                    failure_reason_code,
                     retry_hold_seconds,
                 },
                 &tasker_db::Actor::operator(actor),
@@ -3273,6 +3281,7 @@ mod tests {
             task_identifier: "TASK-2".to_string(),
             hold_until: "later".to_string(),
             reason: "retry".to_string(),
+            failure_reason_code: Some("launcher_timeout".to_string()),
         }];
         let status_tasks = vec![tasker_db::TaskStatusSummary {
             queue_key: "TASK".to_string(),
@@ -3963,6 +3972,7 @@ Implement Bootstrap Task Creation.
             RunCommand::Fail {
                 run_id: claimed.run.id,
                 reason: "operator recovery test".to_string(),
+                failure_reason_code: None,
                 retry_hold_seconds: Some(60),
                 actor: "tester".to_string(),
             },

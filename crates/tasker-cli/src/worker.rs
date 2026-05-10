@@ -105,12 +105,14 @@ pub async fn run_worker_once(
             Ok(prepared) => prepared,
             Err(error) => {
                 let failure_reason = format!("Local Worktree setup failed after claim: {error:#}");
+                let failure_reason_code = local_worktree_setup_failure_code(&failure_reason);
                 let finished = tasker_db::finish_run(
                     pool,
                     &claimed.run.id,
                     &tasker_db::FinishRunInput {
                         outcome: "failed".to_string(),
                         failure_reason: Some(failure_reason),
+                        failure_reason_code: Some(failure_reason_code.to_string()),
                         retry_hold_seconds: request.retry_hold_seconds,
                     },
                     &actor,
@@ -169,6 +171,8 @@ pub async fn run_worker_once(
             launcher_result.failure_reason = Some(format!(
                 "Agent-Gated Integration failed unexpectedly after launcher completion: {error:#}"
             ));
+            launcher_result.failure_reason_code =
+                Some("agent_gated_integration_failed".to_string());
             launcher_result.session_data.final_status = Some("failed".to_string());
             launcher_result.session_data.raw_json = Some(
                 serde_json::json!({
@@ -194,6 +198,7 @@ pub async fn run_worker_once(
         &tasker_db::FinishRunInput {
             outcome: launcher_result.outcome,
             failure_reason: launcher_result.failure_reason,
+            failure_reason_code: launcher_result.failure_reason_code,
             retry_hold_seconds: request.retry_hold_seconds,
         },
         &actor,
@@ -210,7 +215,23 @@ pub async fn run_worker_once(
 struct LauncherResult {
     outcome: String,
     failure_reason: Option<String>,
+    failure_reason_code: Option<String>,
     session_data: tasker_db::UpsertLauncherSessionData,
+}
+
+fn local_worktree_setup_failure_code(reason: &str) -> &'static str {
+    if reason.contains("Managed Source Repository has unexpected uncommitted changes") {
+        "dirty_managed_source_repository"
+    } else if reason.contains("Managed Source Repository operation lock is held") {
+        "repo_operation_lock_held"
+    } else if reason.contains("migration compatibility check failed")
+        || reason.contains("pending SQLite migrations")
+        || reason.contains("SQLite migration drift detected")
+    {
+        "migration_incompatible"
+    } else {
+        "local_worktree_setup_failed"
+    }
 }
 
 async fn run_fake_launcher(
@@ -256,6 +277,7 @@ async fn run_fake_launcher(
             request.fake_outcome.clone()
         },
         failure_reason: None,
+        failure_reason_code: None,
         session_data: tasker_db::UpsertLauncherSessionData {
             launcher_kind: "fake".to_string(),
             session_id: Some(claimed.run.id.clone()),
@@ -323,6 +345,7 @@ async fn run_pi_launcher(
                     "failed to start Pi Launcher process {}: {error}",
                     request.pi_bin
                 ),
+                "launcher_start_failed",
                 None,
                 None,
             )
@@ -341,6 +364,7 @@ async fn run_pi_launcher(
                 claimed,
                 &transcript_path,
                 format!("failed to write Worker Role Prompt to Pi RPC stdin: {error}"),
+                "launcher_rpc_io_failed",
                 None,
                 None,
             );
@@ -418,8 +442,12 @@ async fn run_pi_launcher(
     let blocking_ui_request = blocking_ui_request.or(final_scan.blocking_ui_request);
     agent_ended = agent_ended || final_scan.agent_ended;
     let ui_blocked = blocking_ui_request.is_some();
-    let (outcome, failure_reason) = if let Some(reason) = blocking_ui_request {
-        ("failed".to_string(), Some(reason))
+    let (outcome, failure_reason, failure_reason_code) = if let Some(reason) = blocking_ui_request {
+        (
+            "failed".to_string(),
+            Some(reason),
+            Some("unattended_question".to_string()),
+        )
     } else if timed_out {
         (
             "failed".to_string(),
@@ -427,13 +455,15 @@ async fn run_pi_launcher(
                 "Pi Launcher exceeded max run duration of {} seconds before agent_end",
                 request.max_run_seconds.unwrap_or_default()
             )),
+            Some("launcher_timeout".to_string()),
         )
     } else if agent_ended {
-        ("completed".to_string(), None)
+        ("completed".to_string(), None, None)
     } else if exit_code == Some(0) {
         (
             "failed".to_string(),
             Some("Pi Launcher exited without agent_end event".to_string()),
+            Some("launcher_exited".to_string()),
         )
     } else {
         (
@@ -442,6 +472,7 @@ async fn run_pi_launcher(
                 "Pi Launcher exited with status {}",
                 exit_code.map_or_else(|| "signal".to_string(), |c| c.to_string())
             )),
+            Some("launcher_exited".to_string()),
         )
     };
     write_pi_transcript(
@@ -458,6 +489,7 @@ async fn run_pi_launcher(
         &transcript_path,
         outcome,
         failure_reason,
+        failure_reason_code,
         PiResultMetadata {
             exit_code,
             question_detected: ui_blocked,
@@ -496,6 +528,7 @@ fn pi_failure_result(
     claimed: &tasker_db::ClaimedRun,
     transcript_path: &Path,
     failure_reason: String,
+    failure_reason_code: &str,
     stdout: Option<&str>,
     stderr: Option<&str>,
 ) -> Result<LauncherResult> {
@@ -507,6 +540,7 @@ fn pi_failure_result(
         transcript_path,
         "failed".to_string(),
         Some(failure_reason),
+        Some(failure_reason_code.to_string()),
         PiResultMetadata::default(),
     ))
 }
@@ -524,11 +558,13 @@ fn pi_result(
     transcript_path: &Path,
     outcome: String,
     failure_reason: Option<String>,
+    failure_reason_code: Option<String>,
     metadata: PiResultMetadata,
 ) -> LauncherResult {
     LauncherResult {
         outcome: outcome.clone(),
         failure_reason,
+        failure_reason_code,
         session_data: tasker_db::UpsertLauncherSessionData {
             launcher_kind: "pi".to_string(),
             session_id: Some(claimed.run.id.clone()),
@@ -645,7 +681,11 @@ struct PreparedLocalWorktree {
     shared_cargo_target_dir: PathBuf,
 }
 
-pub async fn preflight_worker_claim(pool: &SqlitePool, queue_key: &str, data_dir: &Path) -> Result<()> {
+pub async fn preflight_worker_claim(
+    pool: &SqlitePool,
+    queue_key: &str,
+    data_dir: &Path,
+) -> Result<()> {
     tasker_db::check_migration_compatibility(pool)
         .await
         .context("Worker Loop preflight failed: migration compatibility check failed")?;
@@ -656,7 +696,9 @@ pub async fn preflight_worker_claim(pool: &SqlitePool, queue_key: &str, data_dir
 
     let queue = tasker_db::get_task_queue(pool, queue_key)
         .await?
-        .with_context(|| format!("Worker Loop preflight failed: Task Queue {queue_key} not found"))?;
+        .with_context(|| {
+            format!("Worker Loop preflight failed: Task Queue {queue_key} not found")
+        })?;
 
     if queue.delivery_backend != "local_worktree" {
         return Ok(());
@@ -676,7 +718,11 @@ fn preflight_local_worktree_delivery(queue: &tasker_db::TaskQueue) -> Result<()>
     ensure_git_repository(repo)?;
     ensure_clean_repository(repo)?;
     ensure_worktree_root_accessible(Path::new(&queue.worktree_root))?;
-    run_git(repo, &["rev-parse", "--verify", &queue.main_branch], "validate Main Branch")?;
+    run_git(
+        repo,
+        &["rev-parse", "--verify", &queue.main_branch],
+        "validate Main Branch",
+    )?;
     Ok(())
 }
 

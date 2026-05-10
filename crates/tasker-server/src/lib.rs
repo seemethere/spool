@@ -86,6 +86,7 @@ pub struct FinishRunRequest {
     pub actor: tasker_db::Actor,
     pub outcome: String,
     pub failure_reason: Option<String>,
+    pub failure_reason_code: Option<String>,
     pub retry_hold_seconds: Option<i64>,
 }
 
@@ -394,6 +395,7 @@ async fn finish_run(
         &tasker_db::FinishRunInput {
             outcome: request.outcome,
             failure_reason: request.failure_reason,
+            failure_reason_code: request.failure_reason_code,
             retry_hold_seconds: request.retry_hold_seconds,
         },
         &request.actor,

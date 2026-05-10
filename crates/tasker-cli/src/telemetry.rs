@@ -36,6 +36,7 @@ pub struct TelemetryRun {
     pub agent_run_id: String,
     pub outcome: Option<String>,
     pub failure_reason: Option<String>,
+    pub failure_reason_code: Option<String>,
     pub created_at: String,
     pub finished_at: Option<String>,
     pub duration_seconds: Option<i64>,
@@ -77,6 +78,7 @@ struct TelemetryRunRow {
     agent_run_id: String,
     outcome: Option<String>,
     failure_reason: Option<String>,
+    failure_reason_code: Option<String>,
     created_at: String,
     finished_at: Option<String>,
     integrating_at: Option<String>,
@@ -115,6 +117,7 @@ pub async fn summarize_agent_runs(
             agent_runs.id AS agent_run_id,
             agent_runs.outcome AS outcome,
             agent_runs.failure_reason AS failure_reason,
+            agent_runs.failure_reason_code AS failure_reason_code,
             agent_runs.created_at AS created_at,
             agent_runs.finished_at AS finished_at,
             first_integrating.integrating_at AS integrating_at,
@@ -260,6 +263,7 @@ fn run_from_row(row: &TelemetryRunRow) -> TelemetryRun {
         agent_run_id: row.agent_run_id.clone(),
         outcome: row.outcome.clone(),
         failure_reason: row.failure_reason.clone(),
+        failure_reason_code: row.failure_reason_code.clone(),
         created_at: row.created_at.clone(),
         finished_at: row.finished_at.clone(),
         duration_seconds: row.duration_seconds,
@@ -324,10 +328,12 @@ fn build_efficiency_summary(rows: &[TelemetryRunRow]) -> EfficiencyTelemetrySumm
             summary.max_total_tokens = Some(summary.max_total_tokens.unwrap_or(0).max(tokens));
         }
         if let Some(tokens) = row.cache_read_tokens {
-            summary.max_cache_read_tokens = Some(summary.max_cache_read_tokens.unwrap_or(0).max(tokens));
+            summary.max_cache_read_tokens =
+                Some(summary.max_cache_read_tokens.unwrap_or(0).max(tokens));
         }
         if let Some(tokens) = row.cache_write_tokens {
-            summary.max_cache_write_tokens = Some(summary.max_cache_write_tokens.unwrap_or(0).max(tokens));
+            summary.max_cache_write_tokens =
+                Some(summary.max_cache_write_tokens.unwrap_or(0).max(tokens));
         }
         if let Some(tokens) = row.max_context_tokens {
             summary.max_context_tokens = Some(summary.max_context_tokens.unwrap_or(0).max(tokens));
@@ -548,6 +554,7 @@ struct CorrelationRunRow {
     task_identifier: String,
     outcome: Option<String>,
     failure_reason: Option<String>,
+    failure_reason_code: Option<String>,
     created_epoch: i64,
     integrating_epoch: Option<i64>,
     duration_seconds: Option<i64>,
@@ -682,6 +689,7 @@ async fn load_correlation_runs(pool: &SqlitePool, queue: &str) -> Result<Vec<Cor
             tasks.identifier AS task_identifier,
             agent_runs.outcome AS outcome,
             agent_runs.failure_reason AS failure_reason,
+            agent_runs.failure_reason_code AS failure_reason_code,
             unixepoch(agent_runs.created_at) AS created_epoch,
             first_integrating.integrating_epoch AS integrating_epoch,
             CASE
@@ -752,9 +760,14 @@ fn build_correlation_bucket<'a>(
         *task_counts.entry(&run.task_identifier).or_default() += 1;
         if run.outcome.as_deref() == Some("failed") || run.outcome.as_deref() == Some("expired") {
             let reason = run
-                .failure_reason
+                .failure_reason_code
                 .clone()
-                .filter(|reason| !reason.trim().is_empty())
+                .filter(|code| !code.trim().is_empty())
+                .or_else(|| {
+                    run.failure_reason
+                        .clone()
+                        .filter(|reason| !reason.trim().is_empty())
+                })
                 .unwrap_or_else(|| run.outcome.clone().unwrap_or_else(|| "unknown".to_string()));
             *failures.entry(reason).or_default() += 1;
         }

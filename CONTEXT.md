@@ -364,6 +364,10 @@ _Avoid_: Agent output as liveness
 The execution result recorded when an **Agent Run** ends: completed, failed, canceled, or expired.
 _Avoid_: Task State
 
+**Agent Run Failure Reason Code**:
+A stable structured code recorded with failed, canceled, or expired **Agent Runs** so operators and workflow metrics can group failures without parsing human-readable failure reasons. v1 codes include `agent_run_failed`, `local_worktree_setup_failed`, `dirty_managed_source_repository`, `repo_operation_lock_held`, `migration_incompatible`, `stale_validation_base`, `launcher_start_failed`, `launcher_rpc_io_failed`, `launcher_exited`, `launcher_timeout`, `unattended_question`, `agent_gated_integration_failed`, `operator_failed`, `claim_lease_expired`, and `task_canceled`.
+_Avoid_: Free-form reason as the only machine-readable failure category
+
 **Expired Agent Run**:
 An **Agent Run** whose **Claim Lease** ended without a normal finish signal.
 _Avoid_: Task rollback
@@ -593,7 +597,7 @@ _Avoid_: Separate progress comment
 - The full **Tasker Pi Extension** exposes tools for Task context, **Workpad Note** updates, criteria/validation statuses, **Child Tasks**, **Task Links**, and **State Transitions**.
 - Question UI is allowed in **Interactive Agent Sessions**.
 - Unexpected question UI in an **Unattended Worker Session** fails the **Agent Run** with a clear reason.
-- A **Pi Launcher** max-run timeout fails the **Agent Run** with a clear reason while preserving the **Run Transcript** and **Launcher Session Data**.
+- A **Pi Launcher** max-run timeout fails the **Agent Run** with a clear reason and structured timeout **Agent Run Failure Reason Code** while preserving the **Run Transcript** and **Launcher Session Data**.
 - Tasker may store a **Run Transcript** for each **Agent Run** under the active Tasker data directory, usually `runs/<run_id>/`.
 - Tasker stores **Launcher Session Data** with common fields and launcher-specific raw data.
 - Tasker does not automatically upload or share **Launcher Session Data**.
@@ -604,7 +608,7 @@ _Avoid_: Separate progress comment
 - An **Agent Run** owns one **Claim Lease** while its worker is alive.
 - A **Worker Loop** sends a **Lease Heartbeat** every 30 seconds during an **Agent Run**.
 - A **Claim Lease** expires after about 90 seconds without a **Lease Heartbeat**.
-- Finishing an **Agent Run** records an **Agent Run Outcome** and releases its **Claim Lease**.
+- Finishing an **Agent Run** records an **Agent Run Outcome**, an **Agent Run Failure Reason Code** when applicable, and releases its **Claim Lease**.
 - Finishing an **Agent Run** does not directly change **Task State**.
 - One **Agent Run** may cover execution and **Integrating** when it retains the **Claim Lease**.
 - Claiming a **Ready** **Task** creates an **Agent Run** and moves the **Task** to **In Progress**.
