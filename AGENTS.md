@@ -71,7 +71,7 @@ These do not replace the target model.
 
 ## Project dogfooding command safety
 
-Project dogfooding commands must use the project Tasker database, not the default user Tasker database. Prefer the repo-local `bin/tasker-local` wrapper for project dogfood CLI reads and operator/debug commands. It runs the workspace-built `target/debug/tasker` binary with the repository's `.tasker/config.toml`; build it first with `cargo build -p tasker-cli` when the wrapper reports the binary is missing.
+Project dogfooding commands must use the project Tasker database, not the default user Tasker database. Prefer the repo-local `bin/tasker-local` wrapper for project dogfood CLI reads and operator/debug commands. It runs `cargo run -p tasker-cli --bin tasker` from the Managed Source Repository root with the repository's `.tasker/config.toml`, so the CLI rebuilds automatically when needed. This favors correctness over fastest startup during dogfooding; there is no separate fast path currently.
 
 If the wrapper is unavailable, run Tasker CLI commands from the Managed Source Repository root and pass the project config explicitly:
 
