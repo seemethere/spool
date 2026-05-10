@@ -21,6 +21,8 @@ use ratatui::{
 };
 use sqlx::SqlitePool;
 
+use crate::display;
+
 #[derive(Debug, Clone)]
 pub struct MonitorOptions {
     pub queue: Option<String>,
@@ -50,12 +52,15 @@ pub struct QueueSnapshot {
     pub active_retry_holds: i64,
     pub active_runs: Vec<tasker_db::ActiveAgentRunStatus>,
     pub retry_holds: Vec<tasker_db::ActiveRetryHoldStatus>,
+    pub ready_tasks: Vec<tasker_db::TaskStatusSummary>,
+    pub integrating_tasks: Vec<tasker_db::TaskStatusSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct RecentRunSnapshot {
     pub queue_key: String,
     pub task_identifier: String,
+    pub task_title: String,
     pub agent_run_id: String,
     pub launcher_kind: String,
     pub worker_id: String,
@@ -227,7 +232,7 @@ fn render_recent_runs(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnaps
         for run in &queue.active_runs {
             run_lines.push(Line::from(format!(
                 "{} {} launcher={} worker={} lease={}",
-                run.task_identifier,
+                display::task_label(&run.task_identifier, &run.task_title, 40),
                 run.agent_run_id,
                 run.launcher_kind,
                 run.worker_id,
@@ -240,9 +245,25 @@ fn render_recent_runs(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnaps
                 hold.task_identifier, hold.hold_until, hold.reason
             )));
         }
+        for task in &queue.ready_tasks {
+            run_lines.push(Line::from(format!(
+                "ready {} priority={}",
+                display::task_label(&task.identifier, &task.title, 40),
+                task.priority
+            )));
+        }
+        for task in &queue.integrating_tasks {
+            run_lines.push(Line::from(format!(
+                "integrating {} priority={}",
+                display::task_label(&task.identifier, &task.title, 40),
+                task.priority
+            )));
+        }
     }
     if run_lines.is_empty() {
-        run_lines.push(Line::from("No active Agent Runs or Retry Holds"));
+        run_lines.push(Line::from(
+            "No active Agent Runs, Retry Holds, Ready Tasks, or Integrating Tasks",
+        ));
     }
     frame.render_widget(
         Paragraph::new(run_lines)
@@ -254,7 +275,11 @@ fn render_recent_runs(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnaps
     let recent_rows = snapshot.recent_runs.iter().map(|run| {
         Row::new(vec![
             Cell::from(run.queue_key.clone()),
-            Cell::from(run.task_identifier.clone()),
+            Cell::from(display::task_label(
+                &run.task_identifier,
+                &run.task_title,
+                28,
+            )),
             Cell::from(run.outcome.clone().unwrap_or_else(|| "active".to_string())),
             Cell::from(run.launcher_kind.clone()),
             Cell::from(run.worker_id.clone()),
@@ -265,7 +290,7 @@ fn render_recent_runs(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnaps
         recent_rows,
         [
             Constraint::Length(8),
-            Constraint::Length(14),
+            Constraint::Length(30),
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(14),
@@ -337,12 +362,15 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
     let mut rows = tasker_db::status_by_queue_and_state(pool).await?;
     let mut active_runs = tasker_db::active_agent_runs_for_status(pool).await?;
     let mut retry_holds = tasker_db::active_retry_holds_for_status(pool).await?;
+    let mut status_tasks =
+        tasker_db::tasks_for_status_by_states(pool, &["ready", "integrating"]).await?;
     let recent_runs = recent_agent_runs(pool, options.queue.as_deref()).await?;
 
     if let Some(queue) = &options.queue {
         rows.retain(|row| row.queue_key == *queue);
         active_runs.retain(|run| run.queue_key == *queue);
         retry_holds.retain(|hold| hold.queue_key == *queue);
+        status_tasks.retain(|task| task.queue_key == *queue);
     }
 
     let captured_at: String = sqlx::query_scalar("SELECT CURRENT_TIMESTAMP")
@@ -362,6 +390,8 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
                 active_retry_holds: row.active_retry_holds,
                 active_runs: Vec::new(),
                 retry_holds: Vec::new(),
+                ready_tasks: Vec::new(),
+                integrating_tasks: Vec::new(),
             });
         queue.state_counts.push((row.state, row.task_count));
         queue.active_agent_runs = row.active_agent_runs;
@@ -375,6 +405,15 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
     for hold in retry_holds {
         if let Some(queue) = by_queue.get_mut(&hold.queue_key) {
             queue.retry_holds.push(hold);
+        }
+    }
+    for task in status_tasks {
+        if let Some(queue) = by_queue.get_mut(&task.queue_key) {
+            match task.state.as_str() {
+                "ready" => queue.ready_tasks.push(task),
+                "integrating" => queue.integrating_tasks.push(task),
+                _ => {}
+            }
         }
     }
 
@@ -397,6 +436,7 @@ async fn recent_agent_runs(
         SELECT
             task_queues.key AS queue_key,
             tasks.identifier AS task_identifier,
+            tasks.title AS task_title,
             agent_runs.id AS agent_run_id,
             agent_runs.launcher_kind AS launcher_kind,
             agent_runs.worker_id AS worker_id,
@@ -440,7 +480,7 @@ pub fn write_snapshot(mut writer: impl Write, snapshot: &MonitorSnapshot) -> io:
             writeln!(
                 writer,
                 "    {}\t{}\tlauncher={}\tworker={}\tlease_expires_at={}",
-                run.task_identifier,
+                display::task_label(&run.task_identifier, &run.task_title, 64),
                 run.agent_run_id,
                 run.launcher_kind,
                 run.worker_id,
@@ -453,6 +493,22 @@ pub fn write_snapshot(mut writer: impl Write, snapshot: &MonitorSnapshot) -> io:
                 writer,
                 "    {}\thold_until={}\treason={}",
                 hold.task_identifier, hold.hold_until, hold.reason
+            )?;
+        }
+        for task in &queue.ready_tasks {
+            writeln!(
+                writer,
+                "    ready {}\tpriority={}",
+                display::task_label(&task.identifier, &task.title, 64),
+                task.priority
+            )?;
+        }
+        for task in &queue.integrating_tasks {
+            writeln!(
+                writer,
+                "    integrating {}\tpriority={}",
+                display::task_label(&task.identifier, &task.title, 64),
+                task.priority
             )?;
         }
         for (state, count) in &queue.state_counts {
@@ -470,7 +526,7 @@ pub fn write_snapshot(mut writer: impl Write, snapshot: &MonitorSnapshot) -> io:
             writer,
             "  {}\t{}\t{}\tlauncher={}\tworker={}\tcreated={}\tfinished={}",
             run.queue_key,
-            run.task_identifier,
+            display::task_label(&run.task_identifier, &run.task_title, 64),
             status,
             run.launcher_kind,
             run.worker_id,
@@ -576,6 +632,8 @@ mod tests {
         assert_eq!(queue.key, "TASK");
         assert_eq!(queue.active_agent_runs, 1);
         assert_eq!(queue.active_runs[0].task_identifier, identifier);
+        assert_eq!(queue.active_runs[0].task_title, "Do work");
+        assert_eq!(queue.ready_tasks.len(), 0);
         assert!(queue
             .state_counts
             .iter()
@@ -644,10 +702,19 @@ mod tests {
                 active_retry_holds: 0,
                 active_runs: Vec::new(),
                 retry_holds: Vec::new(),
+                ready_tasks: vec![tasker_db::TaskStatusSummary {
+                    queue_key: "TASK".to_string(),
+                    identifier: "TASK-47".to_string(),
+                    title: "Prepare monitor titles".to_string(),
+                    state: "ready".to_string(),
+                    priority: "normal".to_string(),
+                }],
+                integrating_tasks: Vec::new(),
             }],
             recent_runs: vec![RecentRunSnapshot {
                 queue_key: "TASK".to_string(),
                 task_identifier: "TASK-46".to_string(),
+                task_title: "Show useful Task titles".to_string(),
                 agent_run_id: "run-1".to_string(),
                 launcher_kind: "pi".to_string(),
                 worker_id: "worker".to_string(),
@@ -669,6 +736,7 @@ mod tests {
         assert!(rendered.contains("config: /repo/.tasker/config.toml"));
         assert!(rendered.contains("TASK"));
         assert!(rendered.contains("ready:2"));
+        assert!(rendered.contains("Prepare monitor titles"));
         assert!(rendered.contains("Recent Agent Runs"));
         assert!(rendered.contains("Read-only"));
     }
@@ -688,6 +756,8 @@ mod tests {
                 active_retry_holds: 0,
                 active_runs: Vec::new(),
                 retry_holds: Vec::new(),
+                ready_tasks: Vec::new(),
+                integrating_tasks: Vec::new(),
             }],
             recent_runs: Vec::new(),
         };

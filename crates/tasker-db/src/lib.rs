@@ -581,11 +581,21 @@ pub struct QueueStatus {
 pub struct ActiveAgentRunStatus {
     pub queue_key: String,
     pub task_identifier: String,
+    pub task_title: String,
     pub task_state: String,
     pub agent_run_id: String,
     pub launcher_kind: String,
     pub worker_id: String,
     pub lease_expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct TaskStatusSummary {
+    pub queue_key: String,
+    pub identifier: String,
+    pub title: String,
+    pub state: String,
+    pub priority: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
@@ -1734,6 +1744,7 @@ pub async fn active_agent_runs_for_status(pool: &SqlitePool) -> Result<Vec<Activ
         SELECT
             task_queues.key AS queue_key,
             tasks.identifier AS task_identifier,
+            tasks.title AS task_title,
             tasks.state AS task_state,
             agent_runs.id AS agent_run_id,
             agent_runs.launcher_kind AS launcher_kind,
@@ -1750,6 +1761,39 @@ pub async fn active_agent_runs_for_status(pool: &SqlitePool) -> Result<Vec<Activ
     .fetch_all(pool)
     .await
     .context("failed to load active Agent Runs for status")
+}
+
+pub async fn tasks_for_status_by_states(
+    pool: &SqlitePool,
+    states: &[&str],
+) -> Result<Vec<TaskStatusSummary>> {
+    if states.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = sqlx::QueryBuilder::new(
+        r#"
+        SELECT
+            task_queues.key AS queue_key,
+            tasks.identifier AS identifier,
+            tasks.title AS title,
+            tasks.state AS state,
+            tasks.priority AS priority
+        FROM tasks
+        JOIN task_queues ON task_queues.id = tasks.task_queue_id
+        WHERE tasks.state IN (
+        "#,
+    );
+    let mut separated = query.separated(", ");
+    for state in states {
+        separated.push_bind(*state);
+    }
+    separated.push_unseparated(")");
+    query.push(" ORDER BY task_queues.key, tasks.state, tasks.priority, tasks.identifier");
+    query
+        .build_query_as::<TaskStatusSummary>()
+        .fetch_all(pool)
+        .await
+        .context("failed to load Task summaries for status")
 }
 
 pub async fn active_retry_holds_for_status(

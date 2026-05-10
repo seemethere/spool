@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 use tokio::time::sleep;
 
+use crate::display;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupervisorOptions {
     pub queue: String,
@@ -124,7 +126,8 @@ pub async fn supervise_batch(
     };
 
     while Instant::now() < deadline {
-        reports.refresh(&mut outcome)?;
+        let task_titles = task_titles_for_queue(pool, &options.queue).await?;
+        reports.refresh(&mut outcome, &task_titles)?;
         let unblock = unblocking_state(pool, &options.queue, &reports).await?;
         if !options.watch
             && active.is_empty()
@@ -167,7 +170,8 @@ pub async fn supervise_batch(
         while index < active.len() {
             if active[index].child.try_wait()?.is_some() {
                 let finished = finish_worker(active.remove(index))?;
-                reports.refresh(&mut outcome)?;
+                let task_titles = task_titles_for_queue(pool, &options.queue).await?;
+                reports.refresh(&mut outcome, &task_titles)?;
                 outcome.completed_workers += 1;
                 if !finished.status.success() {
                     outcome.failed_workers += 1;
@@ -196,7 +200,10 @@ pub async fn supervise_batch(
                 for run in stuck {
                     println!(
                         "stuck Agent Run {} for Task {} remains active after worker {} exited; suggested recovery: tasker run fail {} --reason <reason>",
-                        run.agent_run_id, run.task_identifier, run.worker_id, run.agent_run_id
+                        run.agent_run_id,
+                        display::task_label(&run.task_identifier, &run.task_title, 64),
+                        run.worker_id,
+                        run.agent_run_id
                     );
                     outcome.stuck_runs.push(StuckRun {
                         task_identifier: run.task_identifier,
@@ -209,7 +216,8 @@ pub async fn supervise_batch(
             }
         }
 
-        reports.refresh(&mut outcome)?;
+        let task_titles = task_titles_for_queue(pool, &options.queue).await?;
+        reports.refresh(&mut outcome, &task_titles)?;
         let unblock = unblocking_state(pool, &options.queue, &reports).await?;
         if !options.watch && active.is_empty() && (saw_no_eligible || unblock.should_stop()) {
             let reason = if saw_no_eligible {
@@ -319,7 +327,11 @@ struct WorkerStatusReport {
 }
 
 impl SupervisorReports {
-    fn refresh(&mut self, outcome: &mut SupervisorOutcome) -> Result<()> {
+    fn refresh(
+        &mut self,
+        outcome: &mut SupervisorOutcome,
+        task_titles: &HashMap<String, String>,
+    ) -> Result<()> {
         for file in &self.files {
             let Ok(text) = fs::read_to_string(file) else {
                 continue;
@@ -353,9 +365,13 @@ impl SupervisorReports {
                 outcome.blocked_reports = *self.by_status.get("blocked").unwrap_or(&0);
                 outcome.retryable_failure_reports =
                     *self.by_status.get("retryable_failure").unwrap_or(&0);
+                let task_label = task_titles
+                    .get(&task_identifier)
+                    .map(|title| display::task_label(&task_identifier, title, 64))
+                    .unwrap_or(task_identifier);
                 println!(
                     "worker status report Task {} status={}{}",
-                    task_identifier,
+                    task_label,
                     status,
                     report
                         .message
@@ -536,13 +552,41 @@ fn supervisor_status_dir(run_prefix: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+async fn task_titles_for_queue(pool: &SqlitePool, queue: &str) -> Result<HashMap<String, String>> {
+    let rows = sqlx::query_as::<_, TaskTitleRow>(
+        r#"
+        SELECT tasks.identifier AS identifier, tasks.title AS title
+        FROM tasks
+        JOIN task_queues ON task_queues.id = tasks.task_queue_id
+        WHERE task_queues.key = ?
+        "#,
+    )
+    .bind(queue)
+    .fetch_all(pool)
+    .await
+    .context("failed to load supervisor Task titles")?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.identifier, row.title))
+        .collect())
+}
+
+#[derive(Debug, FromRow)]
+struct TaskTitleRow {
+    identifier: String,
+    title: String,
+}
+
 async fn print_progress(pool: &SqlitePool, queue: &str) -> Result<()> {
     let active_runs = tasker_db::active_agent_runs_for_status(pool).await?;
     let holds = tasker_db::active_retry_holds_for_status(pool).await?;
     for run in active_runs.iter().filter(|run| run.queue_key == queue) {
         println!(
             "active Agent Run {} Task {} worker={} lease_expires_at={}",
-            run.agent_run_id, run.task_identifier, run.worker_id, run.lease_expires_at
+            run.agent_run_id,
+            display::task_label(&run.task_identifier, &run.task_title, 64),
+            run.worker_id,
+            run.lease_expires_at
         );
     }
     for hold in holds.iter().filter(|hold| hold.queue_key == queue) {
@@ -578,6 +622,7 @@ impl UnblockingState {
 #[derive(Debug, FromRow)]
 struct EligibleTask {
     identifier: String,
+    title: String,
     state: String,
 }
 
@@ -593,7 +638,7 @@ async fn unblocking_state(
         .count();
     let unclaimed_eligible = sqlx::query_as::<_, EligibleTask>(
         r#"
-        SELECT tasks.identifier AS identifier, tasks.state AS state
+        SELECT tasks.identifier AS identifier, tasks.title AS title, tasks.state AS state
         FROM tasks
         JOIN task_queues ON task_queues.id = tasks.task_queue_id
         WHERE task_queues.key = ?
@@ -621,7 +666,8 @@ async fn unblocking_state(
         for task in &unclaimed_eligible {
             println!(
                 "unblocked Task {} is reported by Worker Agent and left in {}",
-                task.identifier, task.state
+                display::task_label(&task.identifier, &task.title, 64),
+                task.state
             );
         }
     }

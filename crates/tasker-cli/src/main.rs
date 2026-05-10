@@ -11,6 +11,7 @@ use tasker_config::{ensure_data_dir, PathOverrides, TaskerConfig, TaskerPaths};
 
 mod bootstrap;
 mod cleanup;
+mod display;
 mod monitor;
 mod output;
 mod supervisor;
@@ -1067,6 +1068,8 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
 
     let active_runs = tasker_db::active_agent_runs_for_status(&pool).await?;
     let active_holds = tasker_db::active_retry_holds_for_status(&pool).await?;
+    let status_tasks =
+        tasker_db::tasks_for_status_by_states(&pool, &["ready", "integrating"]).await?;
     let conflict_groups = tasker_db::task_conflict_groups_for_status(&pool).await?;
 
     let mut current_queue: Option<String> = None;
@@ -1112,13 +1115,29 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
             for run in &queue_active_runs {
                 println!(
                     "    {}\tstate={}\t{}\tlauncher={}\tworker={}\tlease_expires_at={}",
-                    run.task_identifier,
+                    display::task_label(&run.task_identifier, &run.task_title, 64),
                     run.task_state,
                     run.agent_run_id,
                     run.launcher_kind,
                     run.worker_id,
                     run.lease_expires_at
                 );
+            }
+            for state in ["ready", "integrating"] {
+                let queue_tasks: Vec<_> = status_tasks
+                    .iter()
+                    .filter(|task| task.queue_key == row.queue_key && task.state == state)
+                    .collect();
+                if !queue_tasks.is_empty() {
+                    println!("  {state} Task summaries:");
+                    for task in queue_tasks {
+                        println!(
+                            "    {}\tpriority={}",
+                            display::task_label(&task.identifier, &task.title, 64),
+                            task.priority
+                        );
+                    }
+                }
             }
             if let Some(limit) = row.queue_concurrency_limit {
                 if row.active_agent_runs >= limit {
