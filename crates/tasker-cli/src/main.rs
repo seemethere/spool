@@ -1028,6 +1028,7 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
 
     let active_runs = tasker_db::active_agent_runs_for_status(&pool).await?;
     let active_holds = tasker_db::active_retry_holds_for_status(&pool).await?;
+    let conflict_groups = tasker_db::task_conflict_groups_for_status(&pool).await?;
 
     let mut current_queue: Option<String> = None;
     for row in rows {
@@ -1095,6 +1096,19 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
                             "  capacity saturated: active Agent Runs count against Queue Concurrency Limit. Unblock by waiting for completion or lease expiry, inspecting/finishing stuck runs with `tasker run show`/`tasker run fail`, or raising/clearing the Queue Concurrency Limit only if local resources permit."
                         );
                     }
+                }
+            }
+            let queue_conflict_groups: Vec<_> = conflict_groups
+                .iter()
+                .filter(|group| group.queue_key.as_str() == row.queue_key.as_str())
+                .collect();
+            if !queue_conflict_groups.is_empty() {
+                println!("  advisory Task conflict hints:");
+                for group in queue_conflict_groups {
+                    println!(
+                        "    {}\t{} Task(s): {}",
+                        group.target, group.task_count, group.tasks
+                    );
                 }
             }
             println!("  active Retry Holds: {}", row.active_retry_holds);

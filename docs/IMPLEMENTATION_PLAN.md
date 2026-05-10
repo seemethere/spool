@@ -128,6 +128,7 @@ Add migrations incrementally by milestone.
    - review requirement.
 5. Bootstrap creation:
    - `tasker task create --bootstrap --queue <key> --file task.md`
+   - Optional bootstrap `conflict_hints` / `anticipated_touched_files` front matter records advisory expected file or documentation-area overlap for dogfooding coordination.
    - YAML front matter for structured fields
    - Markdown body as the **Task Brief**
    - default state: **Ready** when omitted.

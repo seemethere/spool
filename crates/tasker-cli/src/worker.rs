@@ -906,6 +906,7 @@ mod tests {
                 acceptance_criteria: vec!["Worktree exists".to_string()],
                 validation_items: vec!["Task Links recorded".to_string()],
                 tags: vec![],
+                conflict_hints: vec![],
             },
             &tasker_db::Actor::operator("tester"),
         )
@@ -1357,6 +1358,7 @@ mod tests {
                 acceptance_criteria: vec!["Works".to_string()],
                 validation_items: vec!["Validated".to_string()],
                 tags: vec![],
+                conflict_hints: vec![],
             },
             &tasker_db::Actor::operator("tester"),
         )

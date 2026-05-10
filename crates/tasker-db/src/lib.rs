@@ -442,6 +442,8 @@ pub struct CreateTask {
     pub acceptance_criteria: Vec<String>,
     pub validation_items: Vec<String>,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub conflict_hints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -454,6 +456,8 @@ pub struct CreateChildTask {
     pub acceptance_criteria: Vec<String>,
     pub validation_items: Vec<String>,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub conflict_hints: Vec<String>,
     pub blocks_parent: bool,
 }
 
@@ -514,6 +518,30 @@ pub struct TaskLink {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct TaskConflictHint {
+    pub id: String,
+    pub task_id: String,
+    pub position: i64,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct TaskConflictOverlap {
+    pub target: String,
+    pub task_identifier: String,
+    pub title: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct TaskConflictGroup {
+    pub queue_key: String,
+    pub target: String,
+    pub task_count: i64,
+    pub tasks: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpsertTaskLink {
     pub kind: String,
@@ -530,6 +558,8 @@ pub struct TaskDetail {
     pub tags: Vec<String>,
     pub workpad_note: Option<WorkpadNote>,
     pub task_links: Vec<TaskLink>,
+    pub conflict_hints: Vec<TaskConflictHint>,
+    pub conflict_overlaps: Vec<TaskConflictOverlap>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
@@ -778,6 +808,23 @@ pub async fn create_task(
             .context("failed to create Task Tag")?;
     }
 
+    let conflict_hints = normalized_conflict_hints(&input.conflict_hints);
+    for (index, target) in conflict_hints.iter().enumerate() {
+        sqlx::query(
+            r#"
+            INSERT INTO task_conflict_hints (id, task_id, position, target)
+            VALUES (?, ?, ?, ?)
+            "#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&task_id)
+        .bind((index + 1) as i64)
+        .bind(target)
+        .execute(&mut *tx)
+        .await
+        .context("failed to create Task Conflict Hint")?;
+    }
+
     let payload_json = serde_json::json!({
         "identifier": identifier,
         "queue_key": queue.key,
@@ -788,6 +835,7 @@ pub async fn create_task(
         "acceptance_criteria_count": input.acceptance_criteria.len(),
         "validation_items_count": input.validation_items.len(),
         "tags": normalized_tags(&input.tags),
+        "conflict_hints": conflict_hints,
     })
     .to_string();
     sqlx::query(
@@ -847,6 +895,7 @@ pub async fn create_child_task(
         acceptance_criteria: input.acceptance_criteria.clone(),
         validation_items: input.validation_items.clone(),
         tags: input.tags.clone(),
+        conflict_hints: input.conflict_hints.clone(),
     };
     validate_create_task(&child_input)?;
 
@@ -913,6 +962,19 @@ pub async fn create_child_task(
             .await
             .context("failed to create Child Task Tag")?;
     }
+    let child_conflict_hints = normalized_conflict_hints(&child_input.conflict_hints);
+    for (index, target) in child_conflict_hints.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO task_conflict_hints (id, task_id, position, target) VALUES (?, ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&child_task_id)
+        .bind((index + 1) as i64)
+        .bind(target)
+        .execute(&mut *tx)
+        .await
+        .context("failed to create Child Task Conflict Hint")?;
+    }
     append_audit_event_in_tx(
         &mut tx,
         actor,
@@ -929,6 +991,7 @@ pub async fn create_child_task(
             "acceptance_criteria_count": child_input.acceptance_criteria.len(),
             "validation_items_count": child_input.validation_items.len(),
             "tags": normalized_tags(&child_input.tags),
+            "conflict_hints": child_conflict_hints,
         }),
     )
     .await?;
@@ -1061,6 +1124,43 @@ pub async fn get_task_detail(pool: &SqlitePool, identifier: &str) -> Result<Opti
     .await
     .context("failed to load Task Links")?;
 
+    let conflict_hints = sqlx::query_as::<_, TaskConflictHint>(
+        r#"
+        SELECT id, task_id, position, target
+        FROM task_conflict_hints
+        WHERE task_id = ?
+        ORDER BY position
+        "#,
+    )
+    .bind(&task.id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load Task Conflict Hints")?;
+
+    let conflict_overlaps = sqlx::query_as::<_, TaskConflictOverlap>(
+        r#"
+        SELECT
+            self_hints.target AS target,
+            other_tasks.identifier AS task_identifier,
+            other_tasks.title AS title,
+            other_tasks.state AS state
+        FROM task_conflict_hints AS self_hints
+        JOIN task_conflict_hints AS other_hints
+          ON other_hints.target = self_hints.target
+         AND other_hints.task_id != self_hints.task_id
+        JOIN tasks AS other_tasks ON other_tasks.id = other_hints.task_id
+        WHERE self_hints.task_id = ?
+          AND other_tasks.task_queue_id = ?
+          AND other_tasks.state IN ('ready', 'in_progress')
+        ORDER BY self_hints.position, other_tasks.identifier
+        "#,
+    )
+    .bind(&task.id)
+    .bind(&task.task_queue_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load Task Conflict overlaps")?;
+
     Ok(Some(TaskDetail {
         task,
         acceptance_criteria,
@@ -1068,6 +1168,8 @@ pub async fn get_task_detail(pool: &SqlitePool, identifier: &str) -> Result<Opti
         tags,
         workpad_note,
         task_links,
+        conflict_hints,
+        conflict_overlaps,
     }))
 }
 
@@ -1625,6 +1727,28 @@ pub async fn active_retry_holds_for_status(
     .fetch_all(pool)
     .await
     .context("failed to load active Retry Holds for status")
+}
+
+pub async fn task_conflict_groups_for_status(pool: &SqlitePool) -> Result<Vec<TaskConflictGroup>> {
+    sqlx::query_as::<_, TaskConflictGroup>(
+        r#"
+        SELECT
+            task_queues.key AS queue_key,
+            task_conflict_hints.target AS target,
+            COUNT(DISTINCT tasks.id) AS task_count,
+            group_concat(tasks.identifier || ' (' || tasks.state || ')', ', ') AS tasks
+        FROM task_conflict_hints
+        JOIN tasks ON tasks.id = task_conflict_hints.task_id
+        JOIN task_queues ON task_queues.id = tasks.task_queue_id
+        WHERE tasks.state IN ('ready', 'in_progress')
+        GROUP BY task_queues.key, task_conflict_hints.target
+        HAVING COUNT(DISTINCT tasks.id) > 1
+        ORDER BY task_queues.key, task_conflict_hints.target
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to load Task conflict hints for status")
 }
 
 pub async fn merge_queue_tasks(
@@ -2664,6 +2788,9 @@ pub fn validate_create_task(input: &CreateTask) -> Result<()> {
     for item in &input.validation_items {
         ensure_not_blank("Validation Item", item)?;
     }
+    for hint in &input.conflict_hints {
+        ensure_not_blank("Task Conflict Hint", hint)?;
+    }
     Ok(())
 }
 
@@ -2747,6 +2874,17 @@ fn normalized_tags(tags: &[String]) -> Vec<String> {
     tags.sort();
     tags.dedup();
     tags
+}
+
+fn normalized_conflict_hints(hints: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for hint in hints {
+        let hint = hint.trim().to_string();
+        if !hint.is_empty() && !normalized.contains(&hint) {
+            normalized.push(hint);
+        }
+    }
+    normalized
 }
 
 #[cfg(test)]
@@ -3202,6 +3340,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_conflict_hints_are_stored_and_render_ready_in_progress_overlaps() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+
+        let mut first = sample_task("TASK", "First");
+        first.conflict_hints = vec!["AGENTS.md".to_string(), "CONTEXT.md".to_string()];
+        create_task(&pool, &first, &Actor::operator("tester"))
+            .await
+            .expect("create first");
+        let mut second = sample_task("TASK", "Second");
+        second.conflict_hints = vec!["AGENTS.md".to_string()];
+        create_task(&pool, &second, &Actor::operator("tester"))
+            .await
+            .expect("create second");
+        let mut backlog = sample_task("TASK", "Backlog");
+        backlog.state = "backlog".to_string();
+        backlog.conflict_hints = vec!["CONTEXT.md".to_string()];
+        create_task(&pool, &backlog, &Actor::operator("tester"))
+            .await
+            .expect("create backlog");
+
+        let detail = get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("load task")
+            .expect("task exists");
+        assert_eq!(
+            detail
+                .conflict_hints
+                .iter()
+                .map(|hint| hint.target.as_str())
+                .collect::<Vec<_>>(),
+            vec!["AGENTS.md", "CONTEXT.md"]
+        );
+        assert_eq!(detail.conflict_overlaps.len(), 1);
+        assert_eq!(detail.conflict_overlaps[0].target, "AGENTS.md");
+        assert_eq!(detail.conflict_overlaps[0].task_identifier, "TASK-2");
+
+        let groups = task_conflict_groups_for_status(&pool)
+            .await
+            .expect("conflict groups");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].target, "AGENTS.md");
+        assert_eq!(groups[0].task_count, 2);
+        assert!(groups[0].tasks.contains("TASK-1 (ready)"));
+        assert!(groups[0].tasks.contains("TASK-2 (ready)"));
+    }
+
+    #[tokio::test]
     async fn creates_child_tasks_in_parent_queue_and_records_relationships() {
         let (_temp, pool) = migrated_pool().await;
         create_task_queue(
@@ -3231,6 +3423,7 @@ mod tests {
                 acceptance_criteria: vec!["Child works".to_string()],
                 validation_items: vec!["Tests pass".to_string()],
                 tags: vec!["child".to_string()],
+                conflict_hints: vec![],
                 blocks_parent: true,
             },
             &worker_actor(),
@@ -3278,6 +3471,7 @@ mod tests {
             acceptance_criteria: vec![],
             validation_items: vec![],
             tags: vec![],
+            conflict_hints: vec![],
             blocks_parent: false,
         };
 
@@ -4676,6 +4870,7 @@ mod tests {
                 "backend".to_string(),
                 "dogfood".to_string(),
             ],
+            conflict_hints: vec![],
         }
     }
 }
