@@ -3214,6 +3214,7 @@ Implement Bootstrap Task Creation.
                 acceptance_criteria: vec!["accepted".to_string()],
                 validation_items: vec!["validated".to_string()],
                 tags: vec![],
+                conflict_hints: vec![],
             },
             &tasker_db::Actor::operator("tester"),
         )
