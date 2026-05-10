@@ -1224,6 +1224,8 @@ async fn supervise(
             worker_command: command,
             lock_dir: paths.data_dir.join("supervisors"),
             allow_overlap: options.allow_overlap,
+            #[cfg(test)]
+            run_prefix: None,
         },
     )
     .await?;
