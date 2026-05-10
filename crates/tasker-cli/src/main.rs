@@ -1020,7 +1020,10 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
             match row.queue_concurrency_limit {
                 Some(limit) => {
                     let available = (limit - row.active_agent_runs).max(0);
-                    println!("  Queue Concurrency Limit: {limit}");
+                    println!(
+                        "  active Agent Runs: {} / Queue Concurrency Limit {limit}",
+                        row.active_agent_runs
+                    );
                     println!("  available claim slots: {available}");
                     if available == 0 && row.ready_tasks > 0 {
                         println!(
@@ -1029,29 +1032,50 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
                     }
                 }
                 None => {
-                    println!("  Queue Concurrency Limit: none");
+                    println!(
+                        "  active Agent Runs: {} / Queue Concurrency Limit none",
+                        row.active_agent_runs
+                    );
                     println!("  available claim slots: unlimited");
                 }
             }
             println!("  Ready Tasks: {}", row.ready_tasks);
             println!("  Integrating Tasks: {}", row.integrating_tasks);
-            println!("  active Agent Runs: {}", row.active_agent_runs);
             println!(
                 "  active Agent Runs on Integrating Tasks: {}",
                 row.active_integrating_agent_runs
             );
-            for run in active_runs
+            let queue_active_runs: Vec<_> = active_runs
                 .iter()
                 .filter(|run| run.queue_key.as_str() == row.queue_key.as_str())
-            {
+                .collect();
+            for run in &queue_active_runs {
                 println!(
-                    "    {}\t{}\tlauncher={}\tworker={}\tlease_expires_at={}",
+                    "    {}\tstate={}\t{}\tlauncher={}\tworker={}\tlease_expires_at={}",
                     run.task_identifier,
+                    run.task_state,
                     run.agent_run_id,
                     run.launcher_kind,
                     run.worker_id,
                     run.lease_expires_at
                 );
+            }
+            if let Some(limit) = row.queue_concurrency_limit {
+                if row.active_agent_runs >= limit {
+                    let active_integrating = queue_active_runs
+                        .iter()
+                        .filter(|run| run.task_state == "integrating")
+                        .count();
+                    if active_integrating > 0 {
+                        println!(
+                            "  capacity saturated: active Agent Runs count against Queue Concurrency Limit, including {active_integrating} Integrating run(s). Unblock by waiting for completion or lease expiry, inspecting/finishing stuck runs with `tasker run show`/`tasker run fail`, or raising/clearing the Queue Concurrency Limit only if local resources permit."
+                        );
+                    } else {
+                        println!(
+                            "  capacity saturated: active Agent Runs count against Queue Concurrency Limit. Unblock by waiting for completion or lease expiry, inspecting/finishing stuck runs with `tasker run show`/`tasker run fail`, or raising/clearing the Queue Concurrency Limit only if local resources permit."
+                        );
+                    }
+                }
             }
             println!("  active Retry Holds: {}", row.active_retry_holds);
             for hold in active_holds

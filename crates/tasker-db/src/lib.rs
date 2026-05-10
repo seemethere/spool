@@ -550,6 +550,7 @@ pub struct QueueStatus {
 pub struct ActiveAgentRunStatus {
     pub queue_key: String,
     pub task_identifier: String,
+    pub task_state: String,
     pub agent_run_id: String,
     pub launcher_kind: String,
     pub worker_id: String,
@@ -1571,6 +1572,7 @@ pub async fn active_agent_runs_for_status(pool: &SqlitePool) -> Result<Vec<Activ
         SELECT
             task_queues.key AS queue_key,
             tasks.identifier AS task_identifier,
+            tasks.state AS task_state,
             agent_runs.id AS agent_run_id,
             agent_runs.launcher_kind AS launcher_kind,
             agent_runs.worker_id AS worker_id,
@@ -3925,7 +3927,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_concurrency_limit_blocks_claims() {
+    async fn queue_concurrency_limit_blocks_claims_including_integrating_runs() {
         let (_temp, pool) = migrated_pool().await;
         let mut queue = sample_queue("TASK", "Tasker");
         queue.queue_concurrency_limit = Some(1);
@@ -3951,6 +3953,14 @@ mod tests {
             .await
             .expect("claim")
             .is_some());
+        sqlx::query("UPDATE tasks SET state = 'integrating' WHERE identifier = 'TASK-1'")
+            .execute(&pool)
+            .await
+            .expect("mark claimed Task Integrating");
+        let active_runs = active_agent_runs_for_status(&pool)
+            .await
+            .expect("active runs");
+        assert_eq!(active_runs[0].task_state, "integrating");
         assert!(claim_next(
             &pool,
             &ClaimNextInput {
