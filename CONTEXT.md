@@ -525,11 +525,16 @@ _Avoid_: Separate progress comment
 - A **Task** has at most one active **Workpad Note**.
 - A **Workpad Note** may have many **Workpad Revisions**.
 - Symphony reads from and writes to the **Task Backend** through the **Tasker API**.
-- `tasker init` creates XDG-style local config and data directories.
+- `tasker init` creates XDG-style local config and data directories and may apply SQLite migrations for a new or explicitly initialized Task Backend.
 - Tasker config defaults to `~/.config/tasker/config.toml`.
 - Tasker data defaults to `~/.local/share/tasker/`, with SQLite at `tasker.db` and run transcripts under `runs/<run_id>/`; when using a repository-local `.tasker/config.toml` without an explicit data override, the active data directory is `.tasker/data/` beside that config.
 - When a repository-local `.tasker/config.toml` is present but not the resolved active Tasker config, unsafe mutating CLI commands refuse to run unless the operator explicitly selects a config or data/database override.
 - In that inactive project-config case, read-only CLI commands warn with the active config and database paths so operators can diagnose wrong-database mistakes.
+- Normal commands validate SQLite migration compatibility but do not apply pending migrations to the Task Backend.
+- `tasker db migrate` is an explicit **Operator** path for applying SQLite migrations from the trusted **Managed Source Repository** **Main Branch**.
+- `tasker db migrate` refuses by default when invoked from a **Local Worktree** or **Task Branch**, because unintegrated Task Branch migrations must not mutate the project Task Backend before integration.
+- Applied-but-missing SQLite migration drift is reported as migration compatibility failure with guidance to restore the missing migration file or migrate from **Main Branch** after integration.
+- **Worker Loop** and supervisor startup check migration compatibility before creating **Agent Runs**.
 - `tasker serve` starts the **Tasker Service**.
 - `tasker work` starts a **Worker Loop**.
 - A **Worker Loop** has default **Worker Concurrency** of 1.
@@ -669,6 +674,7 @@ _Avoid_: Separate progress comment
 - "agent questions" could stall unattended work — resolved: question UI is only for **Interactive Agent Sessions**, not **Unattended Worker Sessions**.
 - "Tasker updates from pi" could mean shelling out through bash — resolved: Worker Agents use the **Tasker Pi Extension** for core workflow updates, with CLI reserved for operator/debug use.
 - "local config" could mean the XDG default or a repository-local dogfooding config — resolved: the CLI warns on inactive project configs and refuses unsafe mutations unless the operator explicitly selects the intended config/data target.
+- "running a command from a Task Branch with a new migration" could imply upgrading the shared project Task Backend from unintegrated code — resolved: normal commands are check-only for migrations, and explicit `tasker db migrate` is guarded to run from the Managed Source Repository Main Branch by default.
 - "retry continuity" could mean resuming hidden pi chat history — resolved: each **Agent Run** starts a fresh **Pi RPC Session**; durable continuity lives in Tasker/worktree data.
 - "failed run retry" could mean immediate re-claim — resolved: failed or expired runs create **Retry Holds** with backoff.
 - "task intake" could mean humans entering work directly — resolved: normal v1 intake is agent delegation through `tasker delegate`; humans delegate to agents rather than creating Tasks themselves.

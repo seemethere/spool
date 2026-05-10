@@ -45,6 +45,11 @@ struct Cli {
 enum Command {
     /// Initialize Tasker local config, data directory, and database.
     Init,
+    /// Manage Tasker database schema migrations.
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
+    },
     /// Manage Task Queues.
     Queue {
         #[command(subcommand)]
@@ -176,6 +181,16 @@ enum Command {
     },
     /// Show the Tasker CLI version.
     Version,
+}
+
+#[derive(Debug, Subcommand)]
+enum DbCommand {
+    /// Apply pending SQLite migrations from the trusted Managed Source Repository Main Branch.
+    Migrate {
+        /// Allow migration from a Local Worktree or Task Branch after explicit operator verification.
+        #[arg(long)]
+        allow_task_branch: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -567,6 +582,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::Init) => init(&paths, db_path_overridden).await,
+        Some(Command::Db { command }) => db(&paths, db_path_overridden, command).await,
         Some(Command::Queue { command }) => queue(&paths, db_path_overridden, command).await,
         Some(Command::Task { command }) => task(&paths, db_path_overridden, command).await,
         Some(Command::Status { json }) => status(&paths, db_path_overridden, json).await,
@@ -753,6 +769,7 @@ fn command_is_unsafe_mutation(command: &Option<Command>) -> bool {
     match command {
         Some(
             Command::Init
+            | Command::Db { .. }
             | Command::Work { .. }
             | Command::Supervise { .. }
             | Command::Serve { .. },
@@ -817,6 +834,7 @@ fn active_tasker_context(
 
 fn command_queue_key(command: &Option<Command>) -> Option<String> {
     match command {
+        Some(Command::Db { .. }) => None,
         Some(Command::Queue { command }) => match command {
             QueueCommand::Create { key, .. } | QueueCommand::Update { key, .. } => {
                 Some(key.clone())
@@ -931,6 +949,76 @@ async fn init(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
     println!("local api token: {token}");
     if !wrote_config {
         println!("config already existed; left unchanged");
+    }
+
+    Ok(())
+}
+
+async fn db(paths: &TaskerPaths, db_path_overridden: bool, command: DbCommand) -> Result<()> {
+    match command {
+        DbCommand::Migrate { allow_task_branch } => {
+            let mut config = TaskerConfig::load_or_default(paths)?;
+            if db_path_overridden {
+                config.database.path = paths.db_path.clone();
+            }
+            ensure_db_parent(&config.database.path)?;
+            let pool = tasker_db::connect(&config.database.path).await?;
+            guard_db_migrate_source(&pool, allow_task_branch).await?;
+            tasker_db::run_migrations(&pool).await?;
+            let token = tasker_db::ensure_local_api_token(&pool).await?;
+            println!("Tasker database migrated");
+            println!("database: {}", config.database.path.display());
+            println!("local api token: {token}");
+        }
+    }
+    Ok(())
+}
+
+async fn guard_db_migrate_source(pool: &sqlx::SqlitePool, allow_task_branch: bool) -> Result<()> {
+    let cwd = std::env::current_dir().context("failed to resolve current directory")?;
+    guard_db_migrate_source_from(pool, allow_task_branch, &cwd).await
+}
+
+async fn guard_db_migrate_source_from(
+    pool: &sqlx::SqlitePool,
+    allow_task_branch: bool,
+    cwd: &Path,
+) -> Result<()> {
+    if allow_task_branch {
+        return Ok(());
+    }
+
+    let queues = tasker_db::list_task_queues(pool).await.unwrap_or_default();
+    if queues.is_empty() {
+        return Ok(());
+    }
+
+    let cwd_git_root = git_output(cwd, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .map(|output| PathBuf::from(output.trim()));
+    for queue in queues {
+        let repo = PathBuf::from(&queue.managed_source_repository);
+        if !cwd_git_root
+            .as_ref()
+            .is_some_and(|root| paths_equivalent(root, &repo))
+        {
+            anyhow::bail!(
+                "refusing to migrate the Task Backend from {} because Task Queue {} is configured for Managed Source Repository {}. Run `tasker db migrate` from the Managed Source Repository Main Branch after integration, or pass --allow-task-branch only after explicit operator verification.",
+                cwd.display(),
+                queue.key,
+                repo.display()
+            );
+        }
+
+        let branch = git_output(&repo, &["branch", "--show-current"])?;
+        let branch = branch.trim();
+        if branch != queue.main_branch {
+            anyhow::bail!(
+                "refusing to migrate the Task Backend from Git branch {branch}; Task Queue {} requires Managed Source Repository Main Branch {}. Switch to Main Branch and rerun `tasker db migrate`, or pass --allow-task-branch only after explicit operator verification.",
+                queue.key,
+                queue.main_branch
+            );
+        }
     }
 
     Ok(())
@@ -1538,7 +1626,7 @@ async fn monitor(
         config.database.path = paths.db_path.clone();
     }
     let pool = tasker_db::connect(&config.database.path).await?;
-    tasker_db::run_migrations(&pool).await?;
+    tasker_db::check_migration_compatibility(&pool).await?;
     monitor::run_monitor(
         &pool,
         monitor::MonitorOptions {
@@ -2884,7 +2972,7 @@ async fn serve(
     };
 
     let pool = tasker_db::connect(&config.database.path).await?;
-    tasker_db::run_migrations(&pool).await?;
+    tasker_db::check_migration_compatibility(&pool).await?;
 
     tasker_server::serve(bind_addr, env!("CARGO_PKG_VERSION"), pool).await
 }
@@ -2895,7 +2983,7 @@ async fn open_pool(paths: &TaskerPaths, db_path_overridden: bool) -> Result<sqlx
         config.database.path = paths.db_path.clone();
     }
     let pool = tasker_db::connect(&config.database.path).await?;
-    tasker_db::run_migrations(&pool).await?;
+    tasker_db::check_migration_compatibility(&pool).await?;
     Ok(pool)
 }
 
@@ -2946,6 +3034,93 @@ mod tests {
         assert!(help.contains("tasker status"));
         assert!(help.contains("tasker monitor"));
         assert!(help.contains("Task titles"));
+    }
+
+    #[tokio::test]
+    async fn db_migrate_guard_refuses_local_worktree_checkout_by_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let main_repo = temp.path().join("repo");
+        let worktree = temp.path().join("worktree");
+        init_git_repo(&main_repo);
+        git(
+            &main_repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "tasker/TASK-1",
+                worktree.to_str().unwrap(),
+            ],
+        );
+
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        tasker_db::create_task_queue(
+            &pool,
+            &tasker_db::CreateTaskQueue {
+                key: "TASK".to_string(),
+                name: "Tasker".to_string(),
+                managed_source_repository: main_repo.display().to_string(),
+                main_branch: "main".to_string(),
+                worktree_root: temp.path().join("worktrees").display().to_string(),
+                branch_template: "tasker/{task_identifier}".to_string(),
+                done_worktree_retention: false,
+                queue_concurrency_limit: None,
+            },
+            &tasker_db::Actor::operator("operator"),
+        )
+        .await
+        .expect("queue");
+
+        let error = guard_db_migrate_source_from(&pool, false, &worktree)
+            .await
+            .expect_err("Local Worktree should be refused");
+        assert!(error.to_string().contains("refusing to migrate"));
+        assert!(error.to_string().contains("Managed Source Repository"));
+
+        guard_db_migrate_source_from(&pool, false, &main_repo)
+            .await
+            .expect("Main Branch should be accepted");
+    }
+
+    #[tokio::test]
+    async fn open_pool_rejects_pending_migrations_before_work_can_claim() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        let data_dir = temp.path().join("data");
+        fs::create_dir_all(&data_dir).expect("data dir");
+        let db_path = data_dir.join("tasker.db");
+        let paths = TaskerPaths {
+            config_path,
+            data_dir,
+            db_path: db_path.clone(),
+        };
+        TaskerConfig::default_for_paths(&paths)
+            .write_if_missing(&paths)
+            .expect("write config");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        sqlx::query(
+            r#"
+            CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create migrations table");
+        drop(pool);
+
+        let error = open_pool(&paths, false)
+            .await
+            .expect_err("pending migrations should prevent Worker Loop setup");
+        assert!(error.to_string().contains("pending SQLite migrations"));
     }
 
     #[test]

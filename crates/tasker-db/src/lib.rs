@@ -45,10 +45,105 @@ pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
 }
 
 pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
-    sqlx::migrate!("./migrations")
+    migration_source()
         .run(pool)
         .await
+        .map_err(friendly_migration_error)
         .context("failed to run SQLite migrations")
+}
+
+pub async fn check_migration_compatibility(pool: &SqlitePool) -> Result<()> {
+    let migrations_table_exists: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM sqlite_master
+        WHERE type = 'table' AND name = '_sqlx_migrations'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("failed to inspect SQLite migration metadata")?;
+
+    if migrations_table_exists == 0 {
+        anyhow::bail!(
+            "Tasker database schema is not initialized. Run `tasker init` for a new Task Backend, or run `tasker db migrate` from the Managed Source Repository Main Branch for an existing Task Backend."
+        );
+    }
+
+    if let Some(version) = sqlx::query_scalar::<_, i64>(
+        "SELECT version FROM _sqlx_migrations WHERE success = false ORDER BY version LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("failed to inspect SQLite dirty migration state")?
+    {
+        anyhow::bail!(
+            "Tasker database migration {version} is marked failed/dirty. Restore from backup or repair the migration state before running Tasker commands."
+        );
+    }
+
+    let applied = sqlx::query_as::<_, (i64, Vec<u8>)>(
+        "SELECT version, checksum FROM _sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to inspect applied SQLite migrations")?;
+    let migrator = migration_source();
+
+    let mut pending = Vec::new();
+    for migration in migrator.iter() {
+        if migration.migration_type.is_down_migration() {
+            continue;
+        }
+        match applied
+            .iter()
+            .find(|(version, _)| *version == migration.version)
+        {
+            Some((_, checksum)) if checksum.as_slice() != migration.checksum.as_ref() => {
+                anyhow::bail!(friendly_migration_error(
+                    sqlx::migrate::MigrateError::VersionMismatch(migration.version,)
+                ));
+            }
+            Some(_) => {}
+            None => pending.push(migration.version),
+        }
+    }
+
+    for (version, _) in &applied {
+        if !migrator.version_exists(*version) {
+            anyhow::bail!(friendly_migration_error(
+                sqlx::migrate::MigrateError::VersionMissing(*version,)
+            ));
+        }
+    }
+
+    if !pending.is_empty() {
+        anyhow::bail!(
+            "Tasker database has pending SQLite migrations {:?}. Normal commands validate schema compatibility but do not apply migrations. Run `tasker db migrate` from the trusted Managed Source Repository Main Branch to upgrade the Task Backend.",
+            pending
+        );
+    }
+
+    Ok(())
+}
+
+fn migration_source() -> sqlx::migrate::Migrator {
+    sqlx::migrate!("./migrations")
+}
+
+fn friendly_migration_error(error: sqlx::migrate::MigrateError) -> anyhow::Error {
+    match error {
+        sqlx::migrate::MigrateError::VersionMissing(version) => anyhow::anyhow!(
+            "SQLite migration drift detected: migration {version} was previously applied to the Task Backend but is missing from the resolved migrations in this checkout. Restore the missing migration file, switch to the Managed Source Repository Main Branch that contains it, or intentionally migrate only from Main Branch after the Task Branch is integrated."
+        ),
+        sqlx::migrate::MigrateError::VersionMismatch(version) => anyhow::anyhow!(
+            "SQLite migration drift detected: migration {version} checksum differs from the migration already applied to the Task Backend. Restore the original migration file or repair the database from a trusted Main Branch checkout."
+        ),
+        sqlx::migrate::MigrateError::Dirty(version) => anyhow::anyhow!(
+            "Tasker database migration {version} is marked failed/dirty. Restore from backup or repair the migration state before running Tasker commands."
+        ),
+        other => anyhow::anyhow!(other),
+    }
 }
 
 async fn with_sqlite_write_retry<T, F, Fut>(mut operation: F) -> Result<T>
@@ -5970,6 +6065,63 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "integration_outcome.recorded"));
+    }
+
+    #[tokio::test]
+    async fn check_migration_compatibility_does_not_apply_pending_migrations() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = connect(&db_path).await.expect("connect");
+        sqlx::query(
+            r#"
+            CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create migrations table");
+
+        let error = check_migration_compatibility(&pool)
+            .await
+            .expect_err("pending migrations should be incompatible");
+        assert!(error.to_string().contains("pending SQLite migrations"));
+
+        let task_queues_table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'task_queues'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("inspect tables");
+        assert_eq!(task_queues_table, 0);
+    }
+
+    #[tokio::test]
+    async fn check_migration_compatibility_reports_applied_but_missing_migration() {
+        let (_temp, pool) = migrated_pool().await;
+        sqlx::query(
+            r#"
+            INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+            VALUES (9999, 'future_task_branch_migration', true, x'abcd', 0)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("insert missing migration marker");
+
+        let error = check_migration_compatibility(&pool)
+            .await
+            .expect_err("missing applied migration should be incompatible");
+        let message = error.to_string();
+        assert!(message.contains("SQLite migration drift detected"));
+        assert!(message.contains("migration 9999 was previously applied"));
+        assert!(message.contains("Managed Source Repository Main Branch"));
     }
 
     async fn migrated_pool() -> (tempfile::TempDir, SqlitePool) {
