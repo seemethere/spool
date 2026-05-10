@@ -15,6 +15,7 @@ mod display;
 mod monitor;
 mod output;
 mod supervisor;
+mod telemetry;
 mod worker;
 
 #[derive(Debug, Parser)]
@@ -54,6 +55,11 @@ enum Command {
     },
     /// Show Tasker queue and Task State counts.
     Status,
+    /// Show Workflow Metric telemetry summaries.
+    Telemetry {
+        #[command(subcommand)]
+        command: TelemetryCommand,
+    },
     /// Open a read-only terminal Task status monitor.
     #[command(
         after_long_help = "Terminal notes:\n  tasker monitor uses raw mode and the alternate screen for interactive rendering.\n  Use --plain, or --once for a single plain snapshot, when terminal capabilities are limited.\n  Remote terminals and tmux should render normally when TERM is not dumb; if output is piped or TERM=dumb, tasker monitor prints one plain snapshot instead.\n\nSmoke fallback:\n  tasker monitor --queue TASKER --once --plain"
@@ -323,6 +329,19 @@ enum WorkpadCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum TelemetryCommand {
+    /// Summarize Task lifecycle latency from Task State transition Audit Events.
+    Lifecycle {
+        /// Optional Task Queue Key filter.
+        #[arg(long)]
+        queue: Option<String>,
+        /// Number of recent slowest Tasks to include.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum RunCommand {
     /// Show one Agent Run, its Task, and Launcher Session Data.
     Show { run_id: String },
@@ -460,6 +479,9 @@ async fn main() -> Result<()> {
         Some(Command::Queue { command }) => queue(&paths, db_path_overridden, command).await,
         Some(Command::Task { command }) => task(&paths, db_path_overridden, command).await,
         Some(Command::Status) => status(&paths, db_path_overridden).await,
+        Some(Command::Telemetry { command }) => {
+            telemetry(&paths, db_path_overridden, command).await
+        }
         Some(Command::Monitor {
             queue,
             refresh_seconds,
@@ -660,7 +682,13 @@ fn command_is_unsafe_mutation(command: &Option<Command>) -> bool {
                 MergeCommand::Integrate { .. } | MergeCommand::Done { .. }
             )
         }
-        Some(Command::Status | Command::Monitor { .. } | Command::Version) | None => false,
+        Some(
+            Command::Status
+            | Command::Telemetry { .. }
+            | Command::Monitor { .. }
+            | Command::Version,
+        )
+        | None => false,
     }
 }
 
@@ -716,6 +744,9 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
                 queue: Some(queue), ..
             },
         ) => Some(queue.clone()),
+        Some(Command::Telemetry { command }) => match command {
+            TelemetryCommand::Lifecycle { queue, .. } => queue.clone(),
+        },
         Some(Command::Monitor { queue: None, .. } | Command::Cleanup { .. }) => None,
         Some(Command::Merge { command }) => match command {
             MergeCommand::Queue { queue } => queue.clone(),
@@ -1055,6 +1086,25 @@ async fn task(paths: &TaskerPaths, db_path_overridden: bool, command: TaskComman
         }
     }
 
+    Ok(())
+}
+
+async fn telemetry(
+    paths: &TaskerPaths,
+    db_path_overridden: bool,
+    command: TelemetryCommand,
+) -> Result<()> {
+    let pool = open_pool(paths, db_path_overridden).await?;
+    match command {
+        TelemetryCommand::Lifecycle { queue, limit } => {
+            let summary = telemetry::lifecycle_summary(
+                &pool,
+                &telemetry::LifecycleTelemetryOptions { queue, limit },
+            )
+            .await?;
+            print!("{}", telemetry::render_lifecycle_summary(&summary));
+        }
+    }
     Ok(())
 }
 
