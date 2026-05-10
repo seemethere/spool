@@ -511,6 +511,8 @@ _Avoid_: Separate progress comment
 - `tasker init` creates XDG-style local config and data directories.
 - Tasker config defaults to `~/.config/tasker/config.toml`.
 - Tasker data defaults to `~/.local/share/tasker/`, with SQLite at `tasker.db` and run transcripts under `runs/<run_id>/`.
+- When a repository-local `.tasker/config.toml` is present but not the resolved active Tasker config, unsafe mutating CLI commands refuse to run unless the operator explicitly selects a config or data/database override.
+- In that inactive project-config case, read-only CLI commands warn with the active config and database paths so operators can diagnose wrong-database mistakes.
 - `tasker serve` starts the **Tasker Service**.
 - `tasker work` starts a **Worker Loop**.
 - A **Worker Loop** has default **Worker Concurrency** of 1.
@@ -639,6 +641,7 @@ _Avoid_: Separate progress comment
 - "metrics" could imply a separate observability database — resolved: **Workflow Metrics** are derived from **Audit Events**, **Agent Runs**, **Launcher Session Data**, and **Integration Outcomes**.
 - "agent questions" could stall unattended work — resolved: question UI is only for **Interactive Agent Sessions**, not **Unattended Worker Sessions**.
 - "Tasker updates from pi" could mean shelling out through bash — resolved: Worker Agents use the **Tasker Pi Extension** for core workflow updates, with CLI reserved for operator/debug use.
+- "local config" could mean the XDG default or a repository-local dogfooding config — resolved: the CLI warns on inactive project configs and refuses unsafe mutations unless the operator explicitly selects the intended config/data target.
 - "retry continuity" could mean resuming hidden pi chat history — resolved: each **Agent Run** starts a fresh **Pi RPC Session**; durable continuity lives in Tasker/worktree data.
 - "failed run retry" could mean immediate re-claim — resolved: failed or expired runs create **Retry Holds** with backoff.
 - "task intake" could mean humans entering work directly — resolved: normal v1 intake is agent delegation through `tasker delegate`; humans delegate to agents rather than creating Tasks themselves.
