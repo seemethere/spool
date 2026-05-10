@@ -535,6 +535,7 @@ _Avoid_: Separate progress comment
 - `tasker db migrate` refuses by default when invoked from a **Local Worktree** or **Task Branch**, because unintegrated Task Branch migrations must not mutate the project Task Backend before integration.
 - Applied-but-missing SQLite migration drift is reported as migration compatibility failure with guidance to restore the missing migration file or migrate from **Main Branch** after integration.
 - **Worker Loop** and supervisor startup check migration compatibility before creating **Agent Runs**.
+- For **Local Worktree Delivery** **Task Queues**, **Worker Loops** and supervisors run local preflight checks before claiming **Tasks**; failures such as a dirty **Managed Source Repository**, held **Managed Source Repository Operation Lock**, inaccessible **Worktree Root**, missing Git, or invalid **Main Branch** block claims with Operator guidance instead of creating doomed **Agent Runs**.
 - `tasker serve` starts the **Tasker Service**.
 - `tasker work` starts a **Worker Loop**.
 - A **Worker Loop** has default **Worker Concurrency** of 1.

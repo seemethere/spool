@@ -1679,8 +1679,12 @@ async fn work(paths: &TaskerPaths, db_path_overridden: bool, options: WorkOption
         worker::WorkOnceOutcome::NoEligibleTask { queue } => {
             println!("no eligible Tasks found for Task Queue {queue}");
         }
+        worker::WorkOnceOutcome::PreflightFailed { queue, message } => {
+            println!("Task Queue {queue} failed Worker Loop preflight; no Task was claimed and no Agent Run was created");
+            println!("{message}");
+        }
         worker::WorkOnceOutcome::RepoOperationLocked { queue, message } => {
-            println!("Task Queue {queue} is blocked by a Managed Source Repository operation lock");
+            println!("Task Queue {queue} is blocked by a Managed Source Repository operation lock; no Task was claimed and no Agent Run was created");
             println!("{message}");
         }
         worker::WorkOnceOutcome::Finished {

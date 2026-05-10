@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{bail, Context, Result};
@@ -35,6 +35,10 @@ pub enum WorkOnceOutcome {
     NoEligibleTask {
         queue: String,
     },
+    PreflightFailed {
+        queue: String,
+        message: String,
+    },
     RepoOperationLocked {
         queue: String,
         message: String,
@@ -59,10 +63,17 @@ pub async fn run_worker_once(
 
     let data_dir =
         absolute_path(&request.data_dir).context("failed to resolve Tasker data directory")?;
-    if let Some(active) = crate::repo_lock::active_lock(&data_dir, &request.queue)? {
-        return Ok(WorkOnceOutcome::RepoOperationLocked {
+    if let Err(error) = preflight_worker_claim(pool, &request.queue, &data_dir).await {
+        let message = format!("{error:#}");
+        if message.contains("Managed Source Repository operation lock is held") {
+            return Ok(WorkOnceOutcome::RepoOperationLocked {
+                queue: request.queue,
+                message,
+            });
+        }
+        return Ok(WorkOnceOutcome::PreflightFailed {
             queue: request.queue,
-            message: crate::repo_lock::blocked_message(&active),
+            message,
         });
     }
 
@@ -634,6 +645,86 @@ struct PreparedLocalWorktree {
     shared_cargo_target_dir: PathBuf,
 }
 
+pub async fn preflight_worker_claim(pool: &SqlitePool, queue_key: &str, data_dir: &Path) -> Result<()> {
+    tasker_db::check_migration_compatibility(pool)
+        .await
+        .context("Worker Loop preflight failed: migration compatibility check failed")?;
+
+    if let Some(active) = crate::repo_lock::active_lock(data_dir, queue_key)? {
+        bail!(crate::repo_lock::blocked_message(&active));
+    }
+
+    let queue = tasker_db::get_task_queue(pool, queue_key)
+        .await?
+        .with_context(|| format!("Worker Loop preflight failed: Task Queue {queue_key} not found"))?;
+
+    if queue.delivery_backend != "local_worktree" {
+        return Ok(());
+    }
+
+    preflight_local_worktree_delivery(&queue).with_context(|| {
+        format!(
+            "Worker Loop preflight failed for Task Queue {} before claiming a Task",
+            queue.key
+        )
+    })
+}
+
+fn preflight_local_worktree_delivery(queue: &tasker_db::TaskQueue) -> Result<()> {
+    ensure_git_available()?;
+    let repo = Path::new(&queue.managed_source_repository);
+    ensure_git_repository(repo)?;
+    ensure_clean_repository(repo)?;
+    ensure_worktree_root_accessible(Path::new(&queue.worktree_root))?;
+    run_git(repo, &["rev-parse", "--verify", &queue.main_branch], "validate Main Branch")?;
+    Ok(())
+}
+
+fn ensure_git_available() -> Result<()> {
+    let output = Command::new("git")
+        .arg("--version")
+        .output()
+        .context("failed to run git --version; install Git or ensure it is on PATH")?;
+    if !output.status.success() {
+        bail!(
+            "git --version failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_worktree_root_accessible(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create Worktree Root {}", path.display()))?;
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to stat Worktree Root {}", path.display()))?;
+    if !metadata.is_dir() {
+        bail!("Worktree Root {} is not a directory", path.display());
+    }
+    let probe = path.join(format!(
+        ".tasker-preflight-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::write(&probe, b"tasker preflight\n").with_context(|| {
+        format!(
+            "failed to write preflight probe in Worktree Root {}; check permissions and disk availability",
+            path.display()
+        )
+    })?;
+    fs::remove_file(&probe).with_context(|| {
+        format!(
+            "failed to remove preflight probe {}; check Worktree Root permissions",
+            probe.display()
+        )
+    })?;
+    Ok(())
+}
+
 async fn prepare_local_worktree(
     pool: &SqlitePool,
     task: &tasker_db::TaskDetail,
@@ -812,7 +903,10 @@ fn ensure_clean_repository(path: &Path) -> Result<()> {
         "check Managed Source Repository cleanliness",
     )?;
     if !output.trim().is_empty() {
-        bail!("Managed Source Repository has unexpected uncommitted changes");
+        bail!(
+            "Managed Source Repository has unexpected uncommitted changes. Inspect with `git -C {} status --short`; commit, stash, remove, or intentionally resolve the changes before starting Worker Loops so no Task is claimed into a doomed Agent Run.",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -1680,6 +1774,7 @@ mod tests {
         let run_id = match outcome {
             WorkOnceOutcome::Finished { run_id, .. } => run_id,
             WorkOnceOutcome::NoEligibleTask { .. }
+            | WorkOnceOutcome::PreflightFailed { .. }
             | WorkOnceOutcome::RepoOperationLocked { .. } => {
                 panic!("expected finished run")
             }
@@ -1976,7 +2071,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_finishes_run_failed_when_local_worktree_setup_fails_after_claim() {
+    async fn worker_does_not_claim_when_dirty_managed_source_repository_fails_preflight() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
         let worktrees = temp.path().join("worktrees");
@@ -2008,21 +2103,70 @@ mod tests {
         .await
         .expect("run worker");
 
-        let WorkOnceOutcome::Finished {
-            run_id, outcome, ..
-        } = outcome
-        else {
-            panic!("finished")
+        let WorkOnceOutcome::PreflightFailed { message, .. } = outcome else {
+            panic!("preflight failed")
         };
-        assert_eq!(outcome, "failed");
-        let run = tasker_db::get_agent_run(&pool, &run_id)
+        assert!(message.contains("unexpected uncommitted changes"));
+        assert!(message.contains("Inspect with `git -C"));
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(&pool)
             .await
-            .expect("load run")
-            .expect("run");
-        assert!(run.finished_at.is_some());
-        let failure_reason = run.failure_reason.expect("failure reason");
-        assert!(failure_reason.contains("Local Worktree setup failed after claim"));
-        assert!(failure_reason.contains("unexpected uncommitted changes"));
+            .expect("count runs");
+        assert_eq!(run_count, 0);
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("load task")
+            .expect("task");
+        assert_eq!(detail.task.state, "ready");
+    }
+
+    #[tokio::test]
+    async fn worker_preflight_migration_failure_prevents_claim() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        sqlx::query(
+            r#"
+            CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create migrations table");
+
+        let outcome = run_worker_once(
+            &pool,
+            WorkOnceRequest {
+                queue: "TASK".to_string(),
+                launcher: "fake".to_string(),
+                actor: "worker".to_string(),
+                fake_outcome: "completed".to_string(),
+                lease_seconds: 90,
+                retry_hold_seconds: None,
+                max_run_seconds: None,
+                data_dir: temp.path().join("data"),
+                api_url: "http://127.0.0.1:4317".to_string(),
+                api_token: "token".to_string(),
+                pi_bin: "pi".to_string(),
+                pi_extension: None,
+                worker_prompt: None,
+            },
+        )
+        .await
+        .expect("run worker");
+
+        let WorkOnceOutcome::PreflightFailed { message, .. } = outcome else {
+            panic!("preflight failed")
+        };
+        assert!(message.contains("migration compatibility check failed"));
+        assert!(message.contains("pending SQLite migrations"));
     }
 
     #[tokio::test]

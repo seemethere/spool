@@ -143,15 +143,25 @@ pub async fn supervise_batch(
         }
 
         let target_starts = worker_start_target(&options, &outcome, &active, &unblock);
+        let mut preflight_ready = true;
         if active.len() < options.concurrency && outcome.started_workers < target_starts {
-            if let Some(active_lock) =
-                crate::repo_lock::active_lock(&options.data_dir, &options.queue)?
+            if let Err(error) =
+                worker::preflight_worker_claim(pool, &options.queue, &options.data_dir).await
             {
-                outcome.repo_operation_lock_blocks += 1;
-                println!("{}", crate::repo_lock::blocked_message(&active_lock));
+                preflight_ready = false;
+                let message = format!("{error:#}");
+                if message.contains("Managed Source Repository operation lock is held") {
+                    outcome.repo_operation_lock_blocks += 1;
+                } else {
+                    outcome.blocked_reports += 1;
+                }
+                println!(
+                    "supervisor preflight blocked Task Queue {}; no worker started and no Agent Run was created: {message:#}",
+                    options.queue
+                );
                 if !options.watch {
                     println!(
-                        "bounded batch blocked by Managed Source Repository operation lock for Task Queue {}",
+                        "bounded batch blocked by Worker Loop preflight for Task Queue {}",
                         options.queue
                     );
                     return Ok(outcome);
@@ -160,7 +170,7 @@ pub async fn supervise_batch(
         }
         while active.len() < options.concurrency
             && outcome.started_workers < target_starts
-            && crate::repo_lock::active_lock(&options.data_dir, &options.queue)?.is_none()
+            && preflight_ready
         {
             next_worker += 1;
             let actor = supervisor_worker_id(&run_prefix, next_worker);
@@ -757,6 +767,7 @@ fn concise_tail(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Row;
     use std::fs;
     use tempfile::TempDir;
 
@@ -771,6 +782,7 @@ mod tests {
         .expect("write script");
         make_executable(&script);
         let pool = empty_pool(temp.path()).await;
+        seed_task(&pool, "backlog").await;
 
         let outcome = supervise_batch(
             &pool,
@@ -907,6 +919,72 @@ mod tests {
             count.exists(),
             "worker should start after repo lock release"
         );
+    }
+
+    #[tokio::test]
+    async fn supervisor_watch_retries_preflight_without_spawning_tight_loop() {
+        let temp = TempDir::new().expect("tempdir");
+        let script = temp.path().join("worker.sh");
+        let count = temp.path().join("worker-count");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho run >> {count}\necho 'no eligible Tasks found for Task Queue TASK'\nexit 0\n",
+                count = count.display()
+            ),
+        )
+        .expect("write script");
+        make_executable(&script);
+        let pool = empty_pool(temp.path()).await;
+        seed_task(&pool, "ready").await;
+        let repo: String = sqlx::query_scalar(
+            "SELECT managed_source_repository FROM task_queues WHERE key = 'TASK'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("repo path");
+        fs::write(PathBuf::from(&repo).join("dirty.txt"), "dirty").expect("dirty repo");
+        let supervise_pool = pool.clone();
+        let lock_dir = temp.path().join("supervisors");
+        let data_dir = temp.path().join("data");
+        let handle = tokio::spawn(async move {
+            supervise_batch(
+                &supervise_pool,
+                SupervisorOptions {
+                    queue: "TASK".to_string(),
+                    concurrency: 1,
+                    timeout_seconds: 3,
+                    poll_seconds: 1,
+                    worker_command: vec![script.display().to_string()],
+                    lock_dir,
+                    data_dir,
+                    allow_overlap: false,
+                    watch: true,
+                    run_prefix: Some("supervisor-test-preflight-watch".to_string()),
+                },
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            !count.exists(),
+            "worker should not start while preflight fails"
+        );
+        fs::remove_file(PathBuf::from(&repo).join("dirty.txt")).expect("clean repo");
+        let outcome = handle.await.expect("join").expect("supervise");
+
+        assert!(outcome.blocked_reports >= 1);
+        assert!(outcome.started_workers >= 1);
+        assert!(
+            count.exists(),
+            "worker should start after preflight recovers"
+        );
+        let active_runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(&pool)
+            .await
+            .expect("count runs");
+        assert_eq!(active_runs, 0);
     }
 
     #[tokio::test]
@@ -1174,9 +1252,15 @@ mod tests {
     }
 
     async fn seed_task(pool: &SqlitePool, state: &str) {
+        let base = test_database_dir(pool).await;
+        let repo = base.join("repo");
+        let worktrees = base.join("worktrees");
+        init_git_repo(&repo);
         sqlx::query(
-            "INSERT INTO task_queues (id, key, name, delivery_backend, managed_source_repository, main_branch, worktree_root, branch_template, done_worktree_retention) VALUES ('queue-1', 'TASK', 'Tasker', 'local_worktree', '/repo', 'main', '/worktrees', 'tasker/{identifier}', false)",
+            "INSERT INTO task_queues (id, key, name, delivery_backend, managed_source_repository, main_branch, worktree_root, branch_template, done_worktree_retention) VALUES ('queue-1', 'TASK', 'Tasker', 'local_worktree', ?, 'main', ?, 'tasker/{identifier}', false)",
         )
+        .bind(repo.display().to_string())
+        .bind(worktrees.display().to_string())
         .execute(pool)
         .await
         .expect("queue");
@@ -1187,6 +1271,46 @@ mod tests {
         .execute(pool)
         .await
         .expect("task");
+    }
+
+    async fn test_database_dir(pool: &SqlitePool) -> PathBuf {
+        let row = sqlx::query("PRAGMA database_list")
+            .fetch_one(pool)
+            .await
+            .expect("database path");
+        let filename: String = row.get("file");
+        PathBuf::from(filename)
+            .parent()
+            .expect("database parent")
+            .to_path_buf()
+    }
+
+    fn init_git_repo(repo: &Path) {
+        if repo.join(".git").exists() {
+            return;
+        }
+        fs::create_dir_all(repo).expect("repo dir");
+        git(repo, &["init", "-b", "main"]);
+        git(repo, &["config", "user.email", "tasker@example.test"]);
+        git(repo, &["config", "user.name", "Tasker Test"]);
+        fs::write(repo.join("README.md"), "test repo\n").expect("readme");
+        git(repo, &["add", "README.md"]);
+        git(repo, &["commit", "-m", "initial"]);
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[cfg(unix)]
