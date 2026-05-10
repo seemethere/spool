@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{future::Future, path::Path};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -7,9 +7,18 @@ use sqlx::{
     FromRow, SqlitePool,
 };
 use std::time::Duration;
+use tokio::time::sleep;
 use uuid::Uuid;
 
 pub const LOCAL_TOKEN_NAME: &str = "local";
+
+const SQLITE_WRITE_RETRY_BACKOFFS: [Duration; 5] = [
+    Duration::from_millis(5),
+    Duration::from_millis(10),
+    Duration::from_millis(20),
+    Duration::from_millis(40),
+    Duration::from_millis(80),
+];
 
 pub fn sqlite_url(db_path: &Path) -> String {
     format!("sqlite://{}", db_path.display())
@@ -42,26 +51,63 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
         .context("failed to run SQLite migrations")
 }
 
-pub async fn ensure_local_api_token(pool: &SqlitePool) -> Result<String> {
-    if let Some(token) = get_api_token(pool, LOCAL_TOKEN_NAME).await? {
-        return Ok(token);
+async fn with_sqlite_write_retry<T, F, Fut>(mut operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    for backoff in SQLITE_WRITE_RETRY_BACKOFFS {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) if is_transient_sqlite_write_error(&error) => sleep(backoff).await,
+            Err(error) => return Err(error),
+        }
     }
 
-    let token = format!("tasker_{}", Uuid::new_v4().simple());
-    sqlx::query(
-        r#"
-        INSERT INTO api_tokens (id, name, token)
-        VALUES (?, ?, ?)
-        "#,
-    )
-    .bind(Uuid::new_v4().to_string())
-    .bind(LOCAL_TOKEN_NAME)
-    .bind(&token)
-    .execute(pool)
-    .await
-    .context("failed to create local API token")?;
+    operation().await
+}
 
-    Ok(token)
+fn is_transient_sqlite_write_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let Some(sqlx_error) = cause.downcast_ref::<sqlx::Error>() else {
+            return false;
+        };
+        let sqlx::Error::Database(database_error) = sqlx_error else {
+            return false;
+        };
+        let code = database_error.code().unwrap_or_default();
+        let message = database_error.message().to_ascii_lowercase();
+
+        matches!(code.as_ref(), "5" | "6" | "SQLITE_BUSY" | "SQLITE_LOCKED")
+            || message.contains("database is locked")
+            || message.contains("database table is locked")
+            || message.contains("database is busy")
+    })
+}
+
+pub async fn ensure_local_api_token(pool: &SqlitePool) -> Result<String> {
+    with_sqlite_write_retry(|| async {
+        if let Some(token) = get_api_token(pool, LOCAL_TOKEN_NAME).await? {
+            return Ok(token);
+        }
+
+        let token = format!("tasker_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            r#"
+            INSERT INTO api_tokens (id, name, token)
+            VALUES (?, ?, ?)
+            "#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(LOCAL_TOKEN_NAME)
+        .bind(&token)
+        .execute(pool)
+        .await
+        .context("failed to create local API token")?;
+
+        Ok(token)
+    })
+    .await
 }
 
 pub async fn get_api_token(pool: &SqlitePool, name: &str) -> Result<Option<String>> {
@@ -146,6 +192,14 @@ pub struct AuditEvent {
 }
 
 pub async fn create_task_queue(
+    pool: &SqlitePool,
+    input: &CreateTaskQueue,
+    actor: &Actor,
+) -> Result<TaskQueue> {
+    with_sqlite_write_retry(|| create_task_queue_once(pool, input, actor)).await
+}
+
+async fn create_task_queue_once(
     pool: &SqlitePool,
     input: &CreateTaskQueue,
     actor: &Actor,
@@ -1003,6 +1057,15 @@ pub async fn upsert_task_link(
     input: &UpsertTaskLink,
     actor: &Actor,
 ) -> Result<TaskDetail> {
+    with_sqlite_write_retry(|| upsert_task_link_once(pool, identifier, input, actor)).await
+}
+
+async fn upsert_task_link_once(
+    pool: &SqlitePool,
+    identifier: &str,
+    input: &UpsertTaskLink,
+    actor: &Actor,
+) -> Result<TaskDetail> {
     validate_actor(actor)?;
     ensure_not_blank("Task Link kind", &input.kind)?;
     ensure_not_blank("Task Link target", &input.target)?;
@@ -1525,6 +1588,14 @@ pub async fn active_retry_holds_for_status(
 }
 
 pub async fn claim_next(
+    pool: &SqlitePool,
+    input: &ClaimNextInput,
+    actor: &Actor,
+) -> Result<Option<ClaimedRun>> {
+    with_sqlite_write_retry(|| claim_next_once(pool, input, actor)).await
+}
+
+async fn claim_next_once(
     pool: &SqlitePool,
     input: &ClaimNextInput,
     actor: &Actor,
@@ -2576,6 +2647,11 @@ fn normalized_tags(tags: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
     use sqlx::Row;
 
     use super::*;
@@ -2596,6 +2672,85 @@ mod tests {
         let value: String = row.get("value");
 
         assert_eq!(value, "1");
+    }
+
+    #[tokio::test]
+    async fn sqlite_write_retry_retries_busy_errors_with_bounded_backoff() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let options = || {
+            SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true)
+                .busy_timeout(Duration::from_millis(1))
+        };
+        let lock_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options())
+            .await
+            .expect("connect lock pool");
+        let write_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options())
+            .await
+            .expect("connect write pool");
+        sqlx::query("CREATE TABLE retry_probe (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+            .execute(&lock_pool)
+            .await
+            .expect("create probe table");
+
+        let mut tx = lock_pool.begin().await.expect("begin lock tx");
+        sqlx::query("INSERT INTO retry_probe (value) VALUES ('lock holder')")
+            .execute(&mut *tx)
+            .await
+            .expect("hold write lock");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let write_attempts = Arc::clone(&attempts);
+        let write = with_sqlite_write_retry(|| {
+            write_attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                sqlx::query("INSERT INTO retry_probe (value) VALUES ('retried')")
+                    .execute(&write_pool)
+                    .await
+                    .context("failed to write retry probe")?;
+                Ok(())
+            }
+        });
+        let release = async move {
+            sleep(Duration::from_millis(15)).await;
+            tx.rollback().await.expect("release lock");
+        };
+
+        let (write_result, _) = tokio::join!(write, release);
+        write_result.expect("write succeeds after retry");
+        assert!(attempts.load(Ordering::SeqCst) > 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_write_retry_does_not_retry_non_transient_errors() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = connect(&db_path).await.expect("connect");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed_attempts = Arc::clone(&attempts);
+
+        let error = with_sqlite_write_retry(|| {
+            observed_attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                sqlx::query("INSERT INTO missing_retry_probe (value) VALUES ('permanent')")
+                    .execute(&pool)
+                    .await
+                    .context("failed to write missing retry probe")?;
+                Ok(())
+            }
+        })
+        .await
+        .expect_err("permanent SQL errors are returned");
+
+        assert!(error
+            .to_string()
+            .contains("failed to write missing retry probe"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
