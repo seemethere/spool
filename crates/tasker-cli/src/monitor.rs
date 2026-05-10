@@ -72,6 +72,8 @@ pub struct RecentRunSnapshot {
     pub worker_id: String,
     pub outcome: Option<String>,
     pub failure_reason: Option<String>,
+    pub task_state: String,
+    pub recovered_by_later_success: bool,
     pub created_at: String,
     pub finished_at: Option<String>,
 }
@@ -396,7 +398,7 @@ fn attention_lines(snapshot: &MonitorSnapshot) -> Vec<Line<'static>> {
         }
     }
     for run in &snapshot.recent_runs {
-        if is_attention_outcome(run.outcome.as_deref()) {
+        if is_unrecovered_attention_outcome(run) {
             lines.push(attention_line(
                 "✖",
                 "failed run",
@@ -464,7 +466,7 @@ fn attention_texts(snapshot: &MonitorSnapshot) -> Vec<String> {
         }
     }
     for run in &snapshot.recent_runs {
-        if is_attention_outcome(run.outcome.as_deref()) {
+        if is_unrecovered_attention_outcome(run) {
             lines.push(format!(
                 "failed run: {} {}{}",
                 compact_task_label(&run.task_identifier, &run.task_title, 64),
@@ -490,8 +492,10 @@ fn attention_line(icon: &'static str, label: &'static str, detail: String) -> Li
     ])
 }
 
-fn is_attention_outcome(outcome: Option<&str>) -> bool {
-    matches!(outcome, Some("failed" | "expired" | "canceled"))
+fn is_unrecovered_attention_outcome(run: &RecentRunSnapshot) -> bool {
+    matches!(run.outcome.as_deref(), Some("failed" | "expired" | "canceled"))
+        && run.task_state != "done"
+        && !run.recovered_by_later_success
 }
 
 fn is_stale_lease(lease_expires_at: &str, captured_at: &str) -> bool {
@@ -658,6 +662,20 @@ async fn recent_agent_runs(
             agent_runs.worker_id AS worker_id,
             agent_runs.outcome AS outcome,
             agent_runs.failure_reason AS failure_reason,
+            tasks.state AS task_state,
+            EXISTS (
+                SELECT 1
+                FROM agent_runs AS later_runs
+                WHERE later_runs.task_id = agent_runs.task_id
+                  AND later_runs.outcome = 'completed'
+                  AND (
+                      later_runs.created_at > agent_runs.created_at
+                      OR (
+                          later_runs.created_at = agent_runs.created_at
+                          AND later_runs.rowid > agent_runs.rowid
+                      )
+                  )
+            ) AS recovered_by_later_success,
             agent_runs.created_at AS created_at,
             agent_runs.finished_at AS finished_at
         FROM agent_runs
@@ -668,7 +686,7 @@ async fn recent_agent_runs(
     if let Some(queue) = queue_filter {
         query.push(" WHERE task_queues.key = ").push_bind(queue);
     }
-    query.push(" ORDER BY agent_runs.created_at DESC, agent_runs.id DESC LIMIT 10");
+    query.push(" ORDER BY agent_runs.created_at DESC, agent_runs.rowid DESC LIMIT 10");
     query
         .build_query_as::<RecentRunSnapshot>()
         .fetch_all(pool)
@@ -824,6 +842,54 @@ mod tests {
         task.task.identifier
     }
 
+    fn worker_actor(id: &str) -> tasker_db::Actor {
+        tasker_db::Actor {
+            kind: "worker_agent".to_string(),
+            id: id.to_string(),
+            display_name: id.to_string(),
+        }
+    }
+
+    async fn claim_with_worker(
+        pool: &SqlitePool,
+        worker_id: &str,
+    ) -> tasker_db::ClaimedRun {
+        tasker_db::claim_next(
+            pool,
+            &tasker_db::ClaimNextInput {
+                queue_key: "TASK".to_string(),
+                worker_id: worker_id.to_string(),
+                launcher_kind: "fake".to_string(),
+                lease_seconds: 90,
+            },
+            &worker_actor(worker_id),
+        )
+        .await
+        .expect("claim")
+        .expect("claimed")
+    }
+
+    async fn finish_run(
+        pool: &SqlitePool,
+        run_id: &str,
+        worker_id: &str,
+        outcome: &str,
+        failure_reason: Option<&str>,
+    ) {
+        tasker_db::finish_run(
+            pool,
+            run_id,
+            &tasker_db::FinishRunInput {
+                outcome: outcome.to_string(),
+                failure_reason: failure_reason.map(str::to_string),
+                retry_hold_seconds: (outcome == "failed").then_some(1),
+            },
+            &worker_actor(worker_id),
+        )
+        .await
+        .expect("finish run");
+    }
+
     fn options() -> MonitorOptions {
         MonitorOptions {
             queue: None,
@@ -886,6 +952,98 @@ mod tests {
 
         assert!(snapshot.queues.is_empty());
         assert!(snapshot.recent_runs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovered_failed_run_is_not_attention_but_stays_recent() {
+        let pool = temp_pool().await;
+        let identifier = seed_queue_and_task(&pool).await;
+        let failed = claim_with_worker(&pool, "worker-failed").await;
+        finish_run(
+            &pool,
+            &failed.run.id,
+            "worker-failed",
+            "failed",
+            Some("first attempt failed"),
+        )
+        .await;
+        sqlx::query("DELETE FROM task_retry_holds")
+            .execute(&pool)
+            .await
+            .expect("clear retry hold");
+        let recovered = claim_with_worker(&pool, "worker-recovered").await;
+        finish_run(&pool, &recovered.run.id, "worker-recovered", "completed", None).await;
+
+        let snapshot = load_snapshot(&pool, &options()).await.expect("snapshot");
+        let attention = attention_texts(&snapshot).join("\n");
+        let failed_run = snapshot
+            .recent_runs
+            .iter()
+            .find(|run| run.agent_run_id == failed.run.id)
+            .expect("failed run remains recent");
+
+        assert_eq!(failed_run.task_identifier, identifier);
+        assert!(failed_run.recovered_by_later_success);
+        assert!(!attention.contains("failed run:"));
+        let mut out = Vec::new();
+        write_snapshot(&mut out, &snapshot).expect("write");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("Recent Agent Runs:"));
+        assert!(text.contains("first attempt failed"));
+    }
+
+    #[tokio::test]
+    async fn unrecovered_latest_failed_run_remains_attention() {
+        let pool = temp_pool().await;
+        seed_queue_and_task(&pool).await;
+        let failed = claim_with_worker(&pool, "worker-failed").await;
+        sqlx::query(
+            "UPDATE agent_runs SET outcome = 'expired', failure_reason = 'lease expired', finished_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(&failed.run.id)
+        .execute(&pool)
+        .await
+        .expect("mark expired");
+
+        let snapshot = load_snapshot(&pool, &options()).await.expect("snapshot");
+        let attention = attention_texts(&snapshot).join("\n");
+
+        assert!(attention.contains("failed run:"));
+        assert!(attention.contains("expired"));
+        assert!(attention.contains("lease expired"));
+    }
+
+    #[tokio::test]
+    async fn done_task_suppresses_older_failed_run_attention() {
+        let pool = temp_pool().await;
+        seed_queue_and_task(&pool).await;
+        let failed = claim_with_worker(&pool, "worker-failed").await;
+        finish_run(
+            &pool,
+            &failed.run.id,
+            "worker-failed",
+            "failed",
+            Some("fixed outside run"),
+        )
+        .await;
+        sqlx::query("DELETE FROM task_retry_holds")
+            .execute(&pool)
+            .await
+            .expect("clear retry hold");
+        sqlx::query("UPDATE tasks SET state = 'done'")
+            .execute(&pool)
+            .await
+            .expect("mark done");
+
+        let snapshot = load_snapshot(&pool, &options()).await.expect("snapshot");
+        let failed_run = snapshot
+            .recent_runs
+            .iter()
+            .find(|run| run.agent_run_id == failed.run.id)
+            .expect("failed run remains recent");
+
+        assert_eq!(failed_run.task_state, "done");
+        assert!(attention_texts(&snapshot).is_empty());
     }
 
     #[test]
@@ -958,6 +1116,8 @@ mod tests {
                 worker_id: "worker".to_string(),
                 outcome: Some("completed".to_string()),
                 failure_reason: None,
+                task_state: "done".to_string(),
+                recovered_by_later_success: false,
                 created_at: "2026-05-09 00:00:00".to_string(),
                 finished_at: Some("2026-05-09 00:01:00".to_string()),
             }],
@@ -1120,6 +1280,8 @@ mod tests {
                 worker_id: "worker".to_string(),
                 outcome: Some("failed".to_string()),
                 failure_reason: Some("boom".to_string()),
+                task_state: "in_progress".to_string(),
+                recovered_by_later_success: false,
                 created_at: "2026-05-09 00:00:00".to_string(),
                 finished_at: Some("2026-05-09 00:01:00".to_string()),
             }],
