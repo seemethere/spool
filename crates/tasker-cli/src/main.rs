@@ -357,6 +357,24 @@ enum TelemetryCommand {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+    /// Correlate Agent Run telemetry before/after dogfood fix landing points.
+    Correlation {
+        /// Task Queue Key to summarize.
+        #[arg(long)]
+        queue: String,
+        /// Fix landing point from a completed Task Identifier.
+        #[arg(long = "landing-task")]
+        landing_tasks: Vec<String>,
+        /// Fix landing point from an Integration Outcome final commit SHA.
+        #[arg(long = "landing-commit")]
+        landing_commits: Vec<String>,
+        /// Explicit fix landing point timestamp (SQLite-compatible UTC string).
+        #[arg(long = "landing-at")]
+        landing_timestamps: Vec<String>,
+        /// Emit machine-readable correlation telemetry JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -806,7 +824,8 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
             },
         ) => Some(queue.clone()),
         Some(Command::Telemetry { command }) => match command {
-            TelemetryCommand::Summary { queue, .. } => Some(queue.clone()),
+            TelemetryCommand::Summary { queue, .. }
+            | TelemetryCommand::Correlation { queue, .. } => Some(queue.clone()),
             TelemetryCommand::Lifecycle { queue, .. } => queue.clone(),
         },
         Some(Command::Monitor { queue: None, .. } | Command::Cleanup { .. }) => None,
@@ -1178,6 +1197,30 @@ async fn telemetry(
             )
             .await?;
             print!("{}", telemetry::render_lifecycle_summary(&summary));
+        }
+        TelemetryCommand::Correlation {
+            queue,
+            landing_tasks,
+            landing_commits,
+            landing_timestamps,
+            json,
+        } => {
+            let summary = telemetry::correlation_summary(
+                &pool,
+                &telemetry::CorrelationOptions {
+                    queue,
+                    landing_tasks,
+                    landing_commits,
+                    landing_timestamps,
+                },
+            )
+            .await?;
+            if json {
+                serde_json::to_writer_pretty(std::io::stdout(), &summary)?;
+                println!();
+            } else {
+                print!("{}", telemetry::render_correlation_summary(&summary));
+            }
         }
     }
     Ok(())

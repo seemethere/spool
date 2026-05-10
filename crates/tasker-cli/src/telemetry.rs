@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use serde::Serialize;
 use sqlx::{FromRow, SqlitePool};
 use std::fmt::Write;
 
@@ -307,6 +308,447 @@ pub fn render_summary(summary: &TelemetrySummary) -> String {
     }
 
     output
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrelationOptions {
+    pub queue: String,
+    pub landing_tasks: Vec<String>,
+    pub landing_commits: Vec<String>,
+    pub landing_timestamps: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CorrelationSummary {
+    pub queue: String,
+    pub landing_points: Vec<LandingPointSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LandingPointSummary {
+    pub label: String,
+    pub source: String,
+    pub landed_at: String,
+    pub before: CorrelationBucket,
+    pub after: CorrelationBucket,
+    pub interpretations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CorrelationBucket {
+    pub agent_runs: usize,
+    pub duplicate_agent_run_waste: usize,
+    pub duplicate_tasks: usize,
+    pub post_integrating_agent_runs: usize,
+    pub failed_agent_runs: usize,
+    pub failed_agent_runs_by_reason: Vec<FailureReasonCount>,
+    pub completed_run_count: usize,
+    pub average_completed_run_duration_seconds: Option<i64>,
+    pub integrating_wait_count: usize,
+    pub average_integrating_wait_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FailureReasonCount {
+    pub reason: String,
+    pub count: usize,
+}
+
+#[derive(Debug, FromRow)]
+struct LandingPointRow {
+    label: String,
+    source: String,
+    landed_at: String,
+    landed_epoch: i64,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct CorrelationRunRow {
+    task_identifier: String,
+    outcome: Option<String>,
+    failure_reason: Option<String>,
+    created_epoch: i64,
+    integrating_epoch: Option<i64>,
+    duration_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct IntegratingWaitRow {
+    integrating_epoch: i64,
+    wait_seconds: i64,
+}
+
+pub async fn correlation_summary(
+    pool: &SqlitePool,
+    options: &CorrelationOptions,
+) -> Result<CorrelationSummary> {
+    let landing_points = resolve_landing_points(pool, options).await?;
+    let runs = load_correlation_runs(pool, &options.queue).await?;
+    let waits = load_integrating_waits(pool, &options.queue).await?;
+    let landing_points = landing_points
+        .into_iter()
+        .map(|landing| {
+            let before = build_correlation_bucket(
+                runs.iter()
+                    .filter(|run| run.created_epoch < landing.landed_epoch),
+                waits
+                    .iter()
+                    .filter(|wait| wait.integrating_epoch < landing.landed_epoch),
+            );
+            let after = build_correlation_bucket(
+                runs.iter()
+                    .filter(|run| run.created_epoch >= landing.landed_epoch),
+                waits
+                    .iter()
+                    .filter(|wait| wait.integrating_epoch >= landing.landed_epoch),
+            );
+            let interpretations = interpret_correlation(&before, &after);
+            LandingPointSummary {
+                label: landing.label,
+                source: landing.source,
+                landed_at: landing.landed_at,
+                before,
+                after,
+                interpretations,
+            }
+        })
+        .collect();
+    Ok(CorrelationSummary {
+        queue: options.queue.clone(),
+        landing_points,
+    })
+}
+
+async fn resolve_landing_points(
+    pool: &SqlitePool,
+    options: &CorrelationOptions,
+) -> Result<Vec<LandingPointRow>> {
+    let mut points = Vec::new();
+    for identifier in &options.landing_tasks {
+        let point = sqlx::query_as::<_, LandingPointRow>(
+            r#"
+            SELECT tasks.identifier AS label, 'task' AS source, COALESCE(done_events.done_at, tasks.updated_at) AS landed_at,
+                   unixepoch(COALESCE(done_events.done_at, tasks.updated_at)) AS landed_epoch
+            FROM tasks
+            JOIN task_queues ON task_queues.id = tasks.task_queue_id
+            LEFT JOIN (
+                SELECT subject_id, MIN(created_at) AS done_at
+                FROM audit_events
+                WHERE subject_type = 'task'
+                  AND event_type IN ('task.state_transitioned', 'task.state_changed')
+                  AND json_extract(payload_json, '$.to') = 'done'
+                GROUP BY subject_id
+            ) done_events ON done_events.subject_id = tasks.id
+            WHERE task_queues.key = ? AND tasks.identifier = ?
+            "#,
+        )
+        .bind(&options.queue)
+        .bind(identifier)
+        .fetch_one(pool)
+        .await
+        .with_context(|| format!("failed to resolve landing Task {identifier}"))?;
+        points.push(point);
+    }
+    for commit in &options.landing_commits {
+        let point = sqlx::query_as::<_, LandingPointRow>(
+            r#"
+            SELECT integration_outcomes.final_commit AS label, 'commit' AS source, integration_outcomes.created_at AS landed_at,
+                   unixepoch(integration_outcomes.created_at) AS landed_epoch
+            FROM integration_outcomes
+            JOIN tasks ON tasks.id = integration_outcomes.task_id
+            JOIN task_queues ON task_queues.id = tasks.task_queue_id
+            WHERE task_queues.key = ? AND integration_outcomes.final_commit = ?
+            ORDER BY integration_outcomes.created_at
+            LIMIT 1
+            "#,
+        )
+        .bind(&options.queue)
+        .bind(commit)
+        .fetch_one(pool)
+        .await
+        .with_context(|| format!("failed to resolve landing commit {commit}"))?;
+        points.push(point);
+    }
+    for timestamp in &options.landing_timestamps {
+        let landed_epoch = sqlx::query_scalar::<_, i64>("SELECT unixepoch(?)")
+            .bind(timestamp)
+            .fetch_one(pool)
+            .await
+            .with_context(|| format!("failed to parse landing timestamp {timestamp}"))?;
+        points.push(LandingPointRow {
+            label: timestamp.clone(),
+            source: "timestamp".to_string(),
+            landed_at: timestamp.clone(),
+            landed_epoch,
+        });
+    }
+    points.sort_by(|left, right| left.landed_at.cmp(&right.landed_at));
+    Ok(points)
+}
+
+async fn load_correlation_runs(pool: &SqlitePool, queue: &str) -> Result<Vec<CorrelationRunRow>> {
+    sqlx::query_as::<_, CorrelationRunRow>(
+        r#"
+        WITH first_integrating AS (
+            SELECT subject_id AS task_id, MIN(unixepoch(created_at)) AS integrating_epoch
+            FROM audit_events
+            WHERE subject_type = 'task'
+              AND event_type IN ('task.state_transitioned', 'task.state_changed')
+              AND json_extract(payload_json, '$.to') = 'integrating'
+            GROUP BY subject_id
+        )
+        SELECT
+            tasks.identifier AS task_identifier,
+            agent_runs.outcome AS outcome,
+            agent_runs.failure_reason AS failure_reason,
+            unixepoch(agent_runs.created_at) AS created_epoch,
+            first_integrating.integrating_epoch AS integrating_epoch,
+            CASE
+                WHEN COALESCE(launcher_session_data.finished_at, agent_runs.finished_at) IS NOT NULL
+                 AND COALESCE(launcher_session_data.started_at, agent_runs.created_at) IS NOT NULL
+                THEN unixepoch(COALESCE(launcher_session_data.finished_at, agent_runs.finished_at))
+                   - unixepoch(COALESCE(launcher_session_data.started_at, agent_runs.created_at))
+                ELSE NULL
+            END AS duration_seconds
+        FROM agent_runs
+        JOIN tasks ON tasks.id = agent_runs.task_id
+        JOIN task_queues ON task_queues.id = agent_runs.task_queue_id
+        LEFT JOIN launcher_session_data ON launcher_session_data.agent_run_id = agent_runs.id
+        LEFT JOIN first_integrating ON first_integrating.task_id = tasks.id
+        WHERE task_queues.key = ?
+        ORDER BY agent_runs.created_at, agent_runs.id
+        "#,
+    )
+    .bind(queue)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("failed to load correlation Agent Runs for Task Queue {queue}"))
+}
+
+async fn load_integrating_waits(pool: &SqlitePool, queue: &str) -> Result<Vec<IntegratingWaitRow>> {
+    sqlx::query_as::<_, IntegratingWaitRow>(
+        r#"
+        WITH integrating AS (
+            SELECT subject_id AS task_id, MIN(unixepoch(created_at)) AS integrating_epoch
+            FROM audit_events
+            WHERE subject_type = 'task'
+              AND event_type IN ('task.state_transitioned', 'task.state_changed')
+              AND json_extract(payload_json, '$.to') = 'integrating'
+            GROUP BY subject_id
+        ), done AS (
+            SELECT subject_id AS task_id, MIN(unixepoch(created_at)) AS done_epoch
+            FROM audit_events
+            WHERE subject_type = 'task'
+              AND event_type IN ('task.state_transitioned', 'task.state_changed')
+              AND json_extract(payload_json, '$.to') = 'done'
+            GROUP BY subject_id
+        )
+        SELECT integrating.integrating_epoch AS integrating_epoch,
+               done.done_epoch - integrating.integrating_epoch AS wait_seconds
+        FROM tasks
+        JOIN task_queues ON task_queues.id = tasks.task_queue_id
+        JOIN integrating ON integrating.task_id = tasks.id
+        JOIN done ON done.task_id = tasks.id
+        WHERE task_queues.key = ? AND done.done_epoch >= integrating.integrating_epoch
+        "#,
+    )
+    .bind(queue)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("failed to load Integrating wait telemetry for Task Queue {queue}"))
+}
+
+fn build_correlation_bucket<'a>(
+    runs: impl Iterator<Item = &'a CorrelationRunRow>,
+    waits: impl Iterator<Item = &'a IntegratingWaitRow>,
+) -> CorrelationBucket {
+    let runs: Vec<_> = runs.collect();
+    let waits: Vec<_> = waits.collect();
+    let mut task_counts = std::collections::BTreeMap::<&str, usize>::new();
+    let mut failures = std::collections::BTreeMap::<String, usize>::new();
+    let mut completed_durations = Vec::new();
+    for run in &runs {
+        *task_counts.entry(&run.task_identifier).or_default() += 1;
+        if run.outcome.as_deref() == Some("failed") || run.outcome.as_deref() == Some("expired") {
+            let reason = run
+                .failure_reason
+                .clone()
+                .filter(|reason| !reason.trim().is_empty())
+                .unwrap_or_else(|| run.outcome.clone().unwrap_or_else(|| "unknown".to_string()));
+            *failures.entry(reason).or_default() += 1;
+        }
+        if run.outcome.as_deref() == Some("completed") {
+            if let Some(duration) = run.duration_seconds {
+                completed_durations.push(duration);
+            }
+        }
+    }
+    let duplicate_agent_run_waste = task_counts
+        .values()
+        .map(|count| count.saturating_sub(1))
+        .sum::<usize>();
+    let failed_agent_runs = failures.values().sum();
+    let integrating_waits = waits
+        .iter()
+        .map(|wait| wait.wait_seconds)
+        .collect::<Vec<_>>();
+    CorrelationBucket {
+        agent_runs: runs.len(),
+        duplicate_agent_run_waste,
+        duplicate_tasks: task_counts.values().filter(|count| **count > 1).count(),
+        post_integrating_agent_runs: runs
+            .iter()
+            .filter(|run| {
+                run.integrating_epoch
+                    .is_some_and(|integrating| run.created_epoch > integrating)
+            })
+            .count(),
+        failed_agent_runs,
+        failed_agent_runs_by_reason: failures
+            .into_iter()
+            .map(|(reason, count)| FailureReasonCount { reason, count })
+            .collect(),
+        completed_run_count: completed_durations.len(),
+        average_completed_run_duration_seconds: average_i64(&completed_durations),
+        integrating_wait_count: integrating_waits.len(),
+        average_integrating_wait_seconds: average_i64(&integrating_waits),
+    }
+}
+
+fn average_i64(values: &[i64]) -> Option<i64> {
+    (!values.is_empty())
+        .then(|| values.iter().sum::<i64>() / i64::try_from(values.len()).unwrap_or(1))
+}
+
+fn interpret_correlation(before: &CorrelationBucket, after: &CorrelationBucket) -> Vec<String> {
+    vec![
+        interpret_count(
+            "duplicate Agent Run waste",
+            before.duplicate_agent_run_waste,
+            after.duplicate_agent_run_waste,
+        ),
+        interpret_count(
+            "post-Integrating Agent Runs",
+            before.post_integrating_agent_runs,
+            after.post_integrating_agent_runs,
+        ),
+        interpret_count(
+            "failed Agent Runs",
+            before.failed_agent_runs,
+            after.failed_agent_runs,
+        ),
+        interpret_optional_average(
+            "completed run duration",
+            before.average_completed_run_duration_seconds,
+            after.average_completed_run_duration_seconds,
+        ),
+        interpret_optional_average(
+            "Integrating wait time",
+            before.average_integrating_wait_seconds,
+            after.average_integrating_wait_seconds,
+        ),
+    ]
+}
+
+fn interpret_count(label: &str, before: usize, after: usize) -> String {
+    match (before, after) {
+        (0, 0) => format!("{label}: no observed problem before or after this landing point"),
+        (_, 0) => format!("{label}: appears historical after this landing point"),
+        (0, _) => format!("{label}: appears newly active after this landing point"),
+        (before, after) if after < before => format!("{label}: improved after this landing point"),
+        (before, after) if after > before => {
+            format!("{label}: still active and worse after this landing point")
+        }
+        _ => format!("{label}: still active at about the same level after this landing point"),
+    }
+}
+
+fn interpret_optional_average(label: &str, before: Option<i64>, after: Option<i64>) -> String {
+    match (before, after) {
+        (None, None) => format!("{label}: no comparable data"),
+        (Some(_), None) => format!("{label}: appears historical after this landing point"),
+        (None, Some(_)) => format!("{label}: now has active observations after this landing point"),
+        (Some(before), Some(after)) if after < before => {
+            format!("{label}: improved after this landing point")
+        }
+        (Some(before), Some(after)) if after > before => {
+            format!("{label}: still active and slower after this landing point")
+        }
+        _ => format!("{label}: still active at about the same level after this landing point"),
+    }
+}
+
+pub fn render_correlation_summary(summary: &CorrelationSummary) -> String {
+    let mut output = String::new();
+    writeln!(output, "Telemetry correlation summary").expect("write string");
+    writeln!(output, "Task Queue: {}", summary.queue).expect("write string");
+    if summary.landing_points.is_empty() {
+        writeln!(
+            output,
+            "No landing points supplied. Use --landing-task, --landing-commit, or --landing-at."
+        )
+        .expect("write string");
+        return output;
+    }
+    for landing in &summary.landing_points {
+        writeln!(
+            output,
+            "\nLanding point: {} ({}) at {}",
+            landing.label, landing.source, landing.landed_at
+        )
+        .expect("write string");
+        write_bucket(&mut output, "before", &landing.before);
+        write_bucket(&mut output, "after", &landing.after);
+        writeln!(output, "interpretation guidance:").expect("write string");
+        for interpretation in &landing.interpretations {
+            writeln!(output, "  - {interpretation}").expect("write string");
+        }
+        writeln!(
+            output,
+            "  - Focus current work on metrics that remain active after this landing point; treat before-only counts as cleanup noise unless they still block delivery."
+        )
+        .expect("write string");
+    }
+    output
+}
+
+fn write_bucket(output: &mut String, label: &str, bucket: &CorrelationBucket) {
+    writeln!(output, "  {label}:").expect("write string");
+    writeln!(output, "    Agent Runs: {}", bucket.agent_runs).expect("write string");
+    writeln!(
+        output,
+        "    duplicate Agent Run waste: {} wasted across {} Task(s)",
+        bucket.duplicate_agent_run_waste, bucket.duplicate_tasks
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "    post-Integrating Agent Runs: {}",
+        bucket.post_integrating_agent_runs
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "    failed Agent Runs: {}",
+        bucket.failed_agent_runs
+    )
+    .expect("write string");
+    for failure in &bucket.failed_agent_runs_by_reason {
+        writeln!(output, "      {}: {}", failure.reason, failure.count).expect("write string");
+    }
+    writeln!(
+        output,
+        "    completed run duration avg: {}",
+        format_duration(bucket.average_completed_run_duration_seconds)
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "    Integrating wait avg: {} across {} Task(s)",
+        format_duration(bucket.average_integrating_wait_seconds),
+        bucket.integrating_wait_count
+    )
+    .expect("write string");
 }
 
 // Task lifecycle latency telemetry
@@ -628,6 +1070,150 @@ mod tests {
         let rendered = render_summary(&summary);
         assert!(rendered.contains("TASK-1 - Repeated work"));
         assert!(rendered.contains("post-Integrating Agent Runs: 1"));
+    }
+
+    #[tokio::test]
+    async fn telemetry_correlation_groups_before_and_after_landing_points() {
+        let pool = memory_pool().await;
+        sqlx::query(
+            r#"
+            INSERT INTO task_queues (
+                id, key, name, managed_source_repository, main_branch, worktree_root, branch_template
+            ) VALUES ('queue-1', 'TASK', 'Tasker', '/repo', 'main', '/worktrees', 'tasker/{task_identifier}')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("queue");
+        for (identifier, sequence, title) in [
+            ("TASK-1", 1, "Before duplicate"),
+            ("TASK-2", 2, "Landing fix"),
+            ("TASK-3", 3, "After failure"),
+            ("TASK-4", 4, "After integrating"),
+        ] {
+            sqlx::query(
+                "INSERT INTO tasks (id, task_queue_id, identifier, sequence, title, brief, priority, state) VALUES (?, 'queue-1', ?, ?, ?, 'brief', 'normal', 'done')",
+            )
+            .bind(identifier)
+            .bind(identifier)
+            .bind(sequence)
+            .bind(title)
+            .execute(&pool)
+            .await
+            .expect("task");
+        }
+        insert_run(
+            &pool,
+            "TASK-1",
+            "queue-1",
+            "before-1",
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:01:00",
+            Some("completed"),
+            None,
+        )
+        .await;
+        insert_run(
+            &pool,
+            "TASK-1",
+            "queue-1",
+            "before-2",
+            "2026-01-01 00:02:00",
+            "2026-01-01 00:03:00",
+            Some("completed"),
+            None,
+        )
+        .await;
+        audit(
+            &pool,
+            "TASK-2",
+            "task.state_transitioned",
+            serde_json::json!({"from":"integrating","to":"done"}),
+            "2026-01-01 01:00:00",
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO integration_outcomes (id, task_id, agent_run_id, outcome_kind, final_commit, created_at) VALUES ('outcome-1', 'TASK-2', NULL, 'success', 'abc123', '2026-01-01 01:00:00')",
+        )
+        .execute(&pool)
+        .await
+        .expect("outcome");
+        insert_run(
+            &pool,
+            "TASK-3",
+            "queue-1",
+            "after-failed",
+            "2026-01-01 02:00:00",
+            "2026-01-01 02:01:00",
+            Some("failed"),
+            Some("launcher timed out"),
+        )
+        .await;
+        audit(
+            &pool,
+            "TASK-4",
+            "task.state_transitioned",
+            serde_json::json!({"from":"in_progress","to":"integrating"}),
+            "2026-01-01 02:10:00",
+        )
+        .await;
+        insert_run(
+            &pool,
+            "TASK-4",
+            "queue-1",
+            "post-integrating",
+            "2026-01-01 02:20:00",
+            "2026-01-01 02:30:00",
+            Some("completed"),
+            None,
+        )
+        .await;
+        audit(
+            &pool,
+            "TASK-4",
+            "task.state_transitioned",
+            serde_json::json!({"from":"integrating","to":"done"}),
+            "2026-01-01 03:10:00",
+        )
+        .await;
+
+        let summary = correlation_summary(
+            &pool,
+            &CorrelationOptions {
+                queue: "TASK".to_string(),
+                landing_tasks: vec!["TASK-2".to_string()],
+                landing_commits: vec!["abc123".to_string()],
+                landing_timestamps: vec!["2026-01-01 01:00:00".to_string()],
+            },
+        )
+        .await
+        .expect("correlation");
+
+        assert_eq!(summary.landing_points.len(), 3);
+        let task_landing = summary
+            .landing_points
+            .iter()
+            .find(|landing| landing.source == "task")
+            .expect("task landing");
+        assert_eq!(task_landing.before.duplicate_agent_run_waste, 1);
+        assert_eq!(task_landing.after.failed_agent_runs, 1);
+        assert_eq!(task_landing.after.post_integrating_agent_runs, 1);
+        assert_eq!(
+            task_landing.after.average_integrating_wait_seconds,
+            Some(3600)
+        );
+        assert!(task_landing
+            .interpretations
+            .iter()
+            .any(|line| line.contains("appears historical")));
+        let json = serde_json::to_value(&summary).expect("json");
+        assert_eq!(json["queue"], "TASK");
+        assert!(json["landing_points"]
+            .as_array()
+            .expect("landing points")
+            .iter()
+            .any(|point| point["before"]["duplicate_agent_run_waste"] == 1));
+        assert!(render_correlation_summary(&summary).contains("Focus current work"));
     }
 
     #[tokio::test]
