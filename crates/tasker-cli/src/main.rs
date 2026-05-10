@@ -462,6 +462,20 @@ enum MergeCommand {
         #[arg(long, default_value = "local-operator")]
         actor: String,
     },
+    /// Retry Local Worktree Delivery for an Integrating Task without launching a new Agent Run.
+    #[command(
+        after_long_help = "Use this operator recovery command when an Integrating Task's latest Integration Outcome is a retryable operational_failure and the local operational issue has been fixed. It re-runs only the Delivery Adapter path; it does not claim work, launch a new Agent Run, or re-run Worker Agent code. Use `tasker task retry` for failed/stuck agent work that should return to Ready, and use Rework for work_change_failure outcomes that require Task changes."
+    )]
+    Retry {
+        /// Task Identifier.
+        identifier: String,
+        /// Bypass Task State/latest Integration Outcome safety checks after operator verification.
+        #[arg(long)]
+        force: bool,
+        /// Operator actor display name for audit attribution.
+        #[arg(long, default_value = "local-operator")]
+        actor: String,
+    },
     /// Mark a manually merged Integrating Task Done after explicit confirmation.
     Done {
         /// Task Identifier.
@@ -754,6 +768,7 @@ fn command_is_unsafe_mutation(command: &Option<Command>) -> bool {
             matches!(
                 command,
                 MergeCommand::Integrate { .. }
+                    | MergeCommand::Retry { .. }
                     | MergeCommand::Done { .. }
                     | MergeCommand::Lock {
                         command: MergeLockCommand::Acquire { .. }
@@ -832,9 +847,9 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
         Some(Command::Merge { command }) => match command {
             MergeCommand::Queue { queue } => queue.clone(),
             MergeCommand::Inspect { .. } => None,
-            MergeCommand::Integrate { identifier, .. } | MergeCommand::Done { identifier, .. } => {
-                queue_key_from_task_identifier(identifier)
-            }
+            MergeCommand::Integrate { identifier, .. }
+            | MergeCommand::Retry { identifier, .. }
+            | MergeCommand::Done { identifier, .. } => queue_key_from_task_identifier(identifier),
             MergeCommand::Lock { command } => match command {
                 MergeLockCommand::Acquire { queue, .. }
                 | MergeLockCommand::Status { queue }
@@ -1864,6 +1879,22 @@ async fn merge(paths: &TaskerPaths, db_path_overridden: bool, command: MergeComm
                 integrate_local_worktree(&pool, &identifier, &actor, &paths.data_dir).await?;
             println!("{}", outcome.summary);
         }
+        MergeCommand::Retry {
+            identifier,
+            force,
+            actor,
+        } => {
+            let actor = tasker_db::Actor::operator(actor);
+            let outcome = retry_local_worktree_integration(
+                &pool,
+                &identifier,
+                force,
+                &actor,
+                &paths.data_dir,
+            )
+            .await?;
+            println!("{}", outcome.summary);
+        }
         MergeCommand::Done {
             identifier,
             manual,
@@ -1949,6 +1980,109 @@ async fn integrate_local_worktree(
         task_branch: &task_branch,
     };
     adapter.integrate().await
+}
+
+async fn retry_local_worktree_integration(
+    pool: &sqlx::SqlitePool,
+    identifier: &str,
+    force: bool,
+    actor: &tasker_db::Actor,
+    data_dir: &Path,
+) -> Result<LocalIntegrationResult> {
+    let detail = tasker_db::get_task_detail(pool, identifier)
+        .await?
+        .with_context(|| format!("Task {identifier} not found"))?;
+    if detail.task.state != "integrating" {
+        if !force {
+            anyhow::bail!(
+                "Integration retry requires Task State integrating; current state is {}; use --force only after operator verification",
+                detail.task.state
+            );
+        }
+        tasker_db::transition_task_state(
+            pool,
+            identifier,
+            &tasker_db::TransitionTaskState {
+                to_state: "integrating".to_string(),
+                agent_run_id: None,
+            },
+            actor,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "forced Integration retry could not move Task {identifier} from {} to Integrating",
+                detail.task.state
+            )
+        })?;
+    }
+
+    if !force {
+        match latest_integration_outcome_for_task(pool, identifier).await? {
+            Some(LatestIntegrationOutcome {
+                outcome_kind,
+                retryable: true,
+            }) if outcome_kind == "operational_failure" => {}
+            Some(LatestIntegrationOutcome {
+                outcome_kind,
+                retryable: false,
+            }) if outcome_kind == "operational_failure" => anyhow::bail!(
+                "refusing Integration retry for Task {identifier}: latest operational_failure is no longer retryable; use --force only after operator verification"
+            ),
+            Some(LatestIntegrationOutcome { outcome_kind, .. })
+                if outcome_kind == "work_change_failure" =>
+            {
+                anyhow::bail!(
+                    "refusing Integration retry for Task {identifier}: latest Integration Outcome is work_change_failure and requires Rework; use --force only after operator verification"
+                )
+            }
+            Some(LatestIntegrationOutcome { outcome_kind, .. }) => anyhow::bail!(
+                "refusing Integration retry for Task {identifier}: latest Integration Outcome is {outcome_kind}, not a retryable operational_failure; use --force only after operator verification"
+            ),
+            None => anyhow::bail!(
+                "refusing Integration retry for Task {identifier}: no previous Integration Outcome found; use `tasker merge integrate` for a first integration attempt"
+            ),
+        }
+    }
+
+    let mut outcome = integrate_local_worktree(pool, identifier, actor, data_dir).await?;
+    outcome.summary = format!(
+        "retried Integration for Task {identifier} without launching a new Agent Run: {}",
+        outcome.summary
+    );
+    Ok(outcome)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LatestIntegrationOutcome {
+    outcome_kind: String,
+    retryable: bool,
+}
+
+async fn latest_integration_outcome_for_task(
+    pool: &sqlx::SqlitePool,
+    identifier: &str,
+) -> Result<Option<LatestIntegrationOutcome>> {
+    let row = sqlx::query_as::<_, (String, bool)>(
+        r#"
+        SELECT integration_outcomes.outcome_kind, integration_outcomes.retryable
+        FROM integration_outcomes
+        JOIN tasks ON tasks.id = integration_outcomes.task_id
+        WHERE tasks.identifier = ?
+        ORDER BY integration_outcomes.created_at DESC, integration_outcomes.rowid DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(identifier)
+    .fetch_optional(pool)
+    .await
+    .context("failed to load latest Integration Outcome")?;
+    Ok(
+        row.map(|(outcome_kind, retryable)| LatestIntegrationOutcome {
+            outcome_kind,
+            retryable,
+        }),
+    )
 }
 
 async fn validation_base_commit_for_status(
@@ -3729,6 +3863,137 @@ Implement Bootstrap Task Creation.
         .await
         .expect("outcome count");
         assert_eq!(outcomes, 1);
+    }
+
+    #[tokio::test]
+    async fn merge_retry_retries_retryable_operational_failure_without_new_agent_run() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = TaskerPaths::resolve(temp.path(), PathOverrides::default());
+        init(&paths, false).await.expect("init");
+        let pool = open_pool(&paths, false).await.expect("pool");
+        seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        tasker_db::record_integration_outcome(
+            &pool,
+            &tasker_db::RecordIntegrationOutcomeInput {
+                task_identifier: "TASK-1".to_string(),
+                agent_run_id: None,
+                outcome_kind: "operational_failure".to_string(),
+                final_commit: None,
+                pre_merge_head: None,
+                message: Some("fixed local operational issue".to_string()),
+                retryable: true,
+                retry_attempt: Some(1),
+                retry_delay_seconds: Some(30),
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("record operational failure");
+        let runs_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(&pool)
+            .await
+            .expect("run count before");
+
+        merge(
+            &paths,
+            false,
+            MergeCommand::Retry {
+                identifier: "TASK-1".to_string(),
+                force: false,
+                actor: "tester".to_string(),
+            },
+        )
+        .await
+        .expect("retry integration");
+
+        let runs_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(&pool)
+            .await
+            .expect("run count after");
+        assert_eq!(runs_before, runs_after);
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "done");
+        let successes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'success'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("success count");
+        assert_eq!(successes, 1);
+    }
+
+    #[tokio::test]
+    async fn merge_retry_refuses_non_integrating_and_work_change_by_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = TaskerPaths::resolve(temp.path(), PathOverrides::default());
+        init(&paths, false).await.expect("init");
+        let pool = open_pool(&paths, false).await.expect("pool");
+        seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        tasker_db::transition_task_state(
+            &pool,
+            "TASK-1",
+            &tasker_db::TransitionTaskState {
+                to_state: "rework".to_string(),
+                agent_run_id: None,
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("move to rework");
+
+        let non_integrating = merge(
+            &paths,
+            false,
+            MergeCommand::Retry {
+                identifier: "TASK-1".to_string(),
+                force: false,
+                actor: "tester".to_string(),
+            },
+        )
+        .await
+        .expect_err("non-Integrating Task refused");
+        assert!(non_integrating
+            .to_string()
+            .contains("Task State integrating"));
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = TaskerPaths::resolve(temp.path(), PathOverrides::default());
+        init(&paths, false).await.expect("init");
+        let pool = open_pool(&paths, false).await.expect("pool");
+        seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        tasker_db::record_integration_outcome(
+            &pool,
+            &tasker_db::RecordIntegrationOutcomeInput {
+                task_identifier: "TASK-1".to_string(),
+                agent_run_id: None,
+                outcome_kind: "work_change_failure".to_string(),
+                final_commit: None,
+                pre_merge_head: None,
+                message: Some("requires Task work changes".to_string()),
+                retryable: false,
+                retry_attempt: None,
+                retry_delay_seconds: None,
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("record work-change failure");
+
+        let work_change = merge(
+            &paths,
+            false,
+            MergeCommand::Retry {
+                identifier: "TASK-1".to_string(),
+                force: false,
+                actor: "tester".to_string(),
+            },
+        )
+        .await
+        .expect_err("work-change failure refused");
+        assert!(work_change.to_string().contains("work_change_failure"));
     }
 
     #[tokio::test]

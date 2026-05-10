@@ -125,6 +125,14 @@ cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data 
 
 This helper runs in the CLI/worker process, not in the **Tasker Service**. Operational failures leave the Task in **Integrating** for retry; work-change failures such as dirty worktrees, stale branches, or merge conflicts move the Task to **Rework**.
 
+If a retryable **Operational Delivery Failure** has been fixed and the Task is still **Integrating**, retry only Local Worktree Delivery without claiming work or launching a new **Agent Run**:
+
+```bash
+cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data merge retry <task-identifier>
+```
+
+Use `tasker task retry` instead when failed or stuck agent work should return to **Ready**. Use **Rework** for work-change failures unless an operator has explicitly verified a forced delivery retry is safe.
+
 For the remaining fully manual path, from the **Managed Source Repository**, inspect the **Task Branch** against the **Main Branch** and prefer the planned v1 shape: a squash-style **Local Merge** that produces one **Final Commit** containing Tasker metadata such as **Task Identifier**, title, and optionally run ID.
 
 Example operator-side squash integration:
