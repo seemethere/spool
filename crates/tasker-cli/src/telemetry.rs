@@ -190,8 +190,7 @@ async fn load_lifecycle_audits(pool: &SqlitePool, task_ids: &[String]) -> Result
     if task_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = std::iter::repeat("?")
-        .take(task_ids.len())
+    let placeholders = std::iter::repeat_n("?", task_ids.len())
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
@@ -221,10 +220,10 @@ fn derive_times(task_id: &str, audits: &[AuditRow]) -> StateTimes {
             continue;
         };
         match audit.event_type.as_str() {
-            "task.created" => {
-                if payload.get("state").and_then(|value| value.as_str()) == Some("ready") {
-                    set_once(&mut times.ready, audit.created_epoch);
-                }
+            "task.created"
+                if payload.get("state").and_then(|value| value.as_str()) == Some("ready") =>
+            {
+                set_once(&mut times.ready, audit.created_epoch);
             }
             "task.state_transitioned" | "task.state_changed" => {
                 match payload.get("to").and_then(|value| value.as_str()) {
