@@ -72,6 +72,9 @@ enum Command {
         /// Retry Hold duration in seconds for failed runs.
         #[arg(long)]
         retry_hold_seconds: Option<i64>,
+        /// Maximum launcher execution duration in seconds before failing the Agent Run.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        max_run_seconds: Option<u64>,
         /// Tasker API URL exposed to launched pi sessions.
         #[arg(long)]
         api_url: Option<String>,
@@ -281,6 +284,7 @@ struct WorkOptions {
     fake_outcome: String,
     lease_seconds: i64,
     retry_hold_seconds: Option<i64>,
+    max_run_seconds: Option<u64>,
     api_url: Option<String>,
     pi_bin: String,
     pi_extension: Option<PathBuf>,
@@ -310,6 +314,7 @@ async fn main() -> Result<()> {
             fake_outcome,
             lease_seconds,
             retry_hold_seconds,
+            max_run_seconds,
             api_url,
             pi_bin,
             pi_extension,
@@ -326,6 +331,7 @@ async fn main() -> Result<()> {
                     fake_outcome,
                     lease_seconds,
                     retry_hold_seconds,
+                    max_run_seconds,
                     api_url,
                     pi_bin,
                     pi_extension,
@@ -688,6 +694,7 @@ async fn work(paths: &TaskerPaths, db_path_overridden: bool, options: WorkOption
             fake_outcome: options.fake_outcome,
             lease_seconds: options.lease_seconds,
             retry_hold_seconds: options.retry_hold_seconds,
+            max_run_seconds: options.max_run_seconds,
             data_dir: paths.data_dir.clone(),
             api_url,
             api_token,
@@ -1191,6 +1198,7 @@ Implement Bootstrap Task Creation.
                 fake_outcome: "completed".to_string(),
                 lease_seconds: 90,
                 retry_hold_seconds: None,
+                max_run_seconds: None,
                 api_url: None,
                 pi_bin: "pi".to_string(),
                 pi_extension: None,

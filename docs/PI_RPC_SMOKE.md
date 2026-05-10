@@ -29,7 +29,8 @@ cargo run -p tasker-cli -- \
   --config .tasker/config.toml \
   --data-dir .tasker/data \
   work --once --queue TASKER --launcher pi \
-  --api-url http://127.0.0.1:4317
+  --api-url http://127.0.0.1:4317 \
+  --max-run-seconds 1800
 ```
 
 The Worker Loop claims one Task, prepares a Local Worktree, starts `pi --mode rpc`, and exports Tasker extension environment variables including `TASKER_API_URL`, `TASKER_API_TOKEN`, and `TASKER_AGENT_RUN_ID`.
@@ -43,7 +44,7 @@ cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data 
 cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data task show <task-identifier>
 ```
 
-The Run Transcript is stored under `.tasker/data/runs/<agent-run-id>/`. The Pi Launcher treats stdout as JSONL RPC events: fire-and-forget extension UI requests such as `notify` are safe to ignore, while blocking `select`, `confirm`, `input`, or `editor` extension UI requests fail the unattended Agent Run with a clear failure reason.
+The Run Transcript is stored under `.tasker/data/runs/<agent-run-id>/`. The Pi Launcher treats stdout as JSONL RPC events: fire-and-forget extension UI requests such as `notify` are safe to ignore, while blocking `select`, `confirm`, `input`, or `editor` extension UI requests fail the unattended Agent Run with a clear failure reason. Supplying `--max-run-seconds` bounds launcher execution; if the duration elapses before an `agent_end` event, the Agent Run fails with a timeout reason while keeping Run Transcript and Launcher Session Data for inspection.
 
 ## First Dogfood Run Notes
 

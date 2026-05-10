@@ -18,6 +18,7 @@ pub struct WorkOnceRequest {
     pub fake_outcome: String,
     pub lease_seconds: i64,
     pub retry_hold_seconds: Option<i64>,
+    pub max_run_seconds: Option<u64>,
     pub data_dir: PathBuf,
     pub api_url: String,
     pub api_token: String,
@@ -258,6 +259,8 @@ async fn run_pi_launcher(
     let mut blocking_ui_request: Option<String> = None;
     let mut agent_ended = false;
     let mut exit_code = None;
+    let started_at = Instant::now();
+    let mut timed_out = false;
 
     loop {
         let current_stdout = locked_string(&stdout);
@@ -283,6 +286,14 @@ async fn run_pi_launcher(
             exit_code = status.code();
             break;
         }
+        if let Some(max_run_seconds) = request.max_run_seconds {
+            if started_at.elapsed() >= Duration::from_secs(max_run_seconds) {
+                timed_out = true;
+                let _ = child.kill();
+                exit_code = child.wait().ok().and_then(|status| status.code());
+                break;
+            }
+        }
         if last_heartbeat.elapsed() >= heartbeat_interval {
             tasker_db::heartbeat_run(pool, &claimed.run.id, request.lease_seconds, actor).await?;
             last_heartbeat = Instant::now();
@@ -306,6 +317,14 @@ async fn run_pi_launcher(
     let ui_blocked = blocking_ui_request.is_some();
     let (outcome, failure_reason) = if let Some(reason) = blocking_ui_request {
         ("failed".to_string(), Some(reason))
+    } else if timed_out {
+        (
+            "failed".to_string(),
+            Some(format!(
+                "Pi Launcher exceeded max run duration of {} seconds before agent_end",
+                request.max_run_seconds.unwrap_or_default()
+            )),
+        )
     } else if agent_ended {
         ("completed".to_string(), None)
     } else if exit_code == Some(0) {
@@ -329,14 +348,19 @@ async fn run_pi_launcher(
         &stdout_text,
         &stderr_text,
         ui_blocked,
+        timed_out,
     )?;
     Ok(pi_result(
         claimed,
         &transcript_path,
         outcome,
         failure_reason,
-        exit_code,
-        ui_blocked,
+        PiResultMetadata {
+            exit_code,
+            question_detected: ui_blocked,
+            timed_out,
+            max_run_seconds: request.max_run_seconds,
+        },
     ))
 }
 
@@ -374,15 +398,22 @@ fn pi_failure_result(
 ) -> Result<LauncherResult> {
     let stdout = stdout.unwrap_or_default();
     let stderr = stderr.unwrap_or_default();
-    write_pi_transcript(claimed, transcript_path, None, stdout, stderr, false)?;
+    write_pi_transcript(claimed, transcript_path, None, stdout, stderr, false, false)?;
     Ok(pi_result(
         claimed,
         transcript_path,
         "failed".to_string(),
         Some(failure_reason),
-        None,
-        false,
+        PiResultMetadata::default(),
     ))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PiResultMetadata {
+    exit_code: Option<i32>,
+    question_detected: bool,
+    timed_out: bool,
+    max_run_seconds: Option<u64>,
 }
 
 fn pi_result(
@@ -390,8 +421,7 @@ fn pi_result(
     transcript_path: &Path,
     outcome: String,
     failure_reason: Option<String>,
-    exit_code: Option<i32>,
-    question_detected: bool,
+    metadata: PiResultMetadata,
 ) -> LauncherResult {
     LauncherResult {
         outcome: outcome.clone(),
@@ -407,8 +437,10 @@ fn pi_result(
             transcript_path: Some(transcript_path.display().to_string()),
             raw_json: Some(
                 serde_json::json!({
-                    "exit_code": exit_code,
-                    "unattended_question_detected": question_detected,
+                    "exit_code": metadata.exit_code,
+                    "unattended_question_detected": metadata.question_detected,
+                    "timed_out": metadata.timed_out,
+                    "max_run_seconds": metadata.max_run_seconds,
                 })
                 .to_string(),
             ),
@@ -423,6 +455,7 @@ fn write_pi_transcript(
     stdout: &str,
     stderr: &str,
     question_detected: bool,
+    timed_out: bool,
 ) -> Result<()> {
     let transcript = serde_json::json!({
         "launcher": "pi",
@@ -432,6 +465,7 @@ fn write_pi_transcript(
         "stdout": stdout,
         "stderr": stderr,
         "unattended_question_detected": question_detected,
+        "timed_out": timed_out,
     });
     fs::write(transcript_path, format!("{}\n", transcript)).with_context(|| {
         format!(
@@ -764,6 +798,7 @@ mod tests {
                 fake_outcome: "completed".to_string(),
                 lease_seconds: 90,
                 retry_hold_seconds: None,
+                max_run_seconds: None,
                 data_dir: temp.path().join("data"),
                 api_url: "http://127.0.0.1:4317".to_string(),
                 api_token: "token".to_string(),
@@ -819,6 +854,7 @@ mod tests {
                 fake_outcome: "completed".to_string(),
                 lease_seconds: 90,
                 retry_hold_seconds: None,
+                max_run_seconds: None,
                 data_dir: temp.path().join("data"),
                 api_url: "http://127.0.0.1:4317".to_string(),
                 api_token: "token".to_string(),
@@ -872,6 +908,7 @@ mod tests {
                 fake_outcome: "completed".to_string(),
                 lease_seconds: 90,
                 retry_hold_seconds: None,
+                max_run_seconds: None,
                 data_dir: temp.path().join("data"),
                 api_url: "http://127.0.0.1:4317".to_string(),
                 api_token: "token".to_string(),
@@ -902,6 +939,83 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn pi_worker_fails_when_max_run_duration_elapses() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let worktrees = temp.path().join("worktrees");
+        init_git_repo(&repo);
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        seed_ready_task(&pool, &repo, &worktrees).await;
+        let pi_bin = temp.path().join("fake-pi-timeout");
+        write_executable(
+            &pi_bin,
+            "#!/bin/sh\nread line\necho '{\"type\":\"turn_start\"}'\nsleep 5\necho '{\"type\":\"agent_end\"}'\n",
+        );
+
+        let outcome = run_worker_once(
+            &pool,
+            WorkOnceRequest {
+                queue: "TASK".to_string(),
+                launcher: "pi".to_string(),
+                actor: "worker".to_string(),
+                fake_outcome: "completed".to_string(),
+                lease_seconds: 90,
+                retry_hold_seconds: Some(7),
+                max_run_seconds: Some(1),
+                data_dir: temp.path().join("data"),
+                api_url: "http://127.0.0.1:4317".to_string(),
+                api_token: "token".to_string(),
+                pi_bin: pi_bin.display().to_string(),
+                pi_extension: None,
+                worker_prompt: None,
+            },
+        )
+        .await
+        .expect("run worker");
+
+        let WorkOnceOutcome::Finished {
+            run_id, outcome, ..
+        } = outcome
+        else {
+            panic!("finished")
+        };
+        assert_eq!(outcome, "failed");
+        let detail = tasker_db::get_agent_run_detail(&pool, &run_id)
+            .await
+            .expect("load run")
+            .expect("run detail");
+        assert_eq!(
+            detail.run.failure_reason.as_deref(),
+            Some("Pi Launcher exceeded max run duration of 1 seconds before agent_end")
+        );
+        let session = detail.launcher_session_data.expect("session");
+        assert_eq!(session.final_status.as_deref(), Some("failed"));
+        let raw: serde_json::Value =
+            serde_json::from_str(&session.raw_json.expect("raw json")).expect("raw session json");
+        assert_eq!(
+            raw.get("timed_out").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            raw.get("max_run_seconds").and_then(|value| value.as_u64()),
+            Some(1)
+        );
+        let transcript_path = session.transcript_path.expect("transcript");
+        let transcript_text = fs::read_to_string(&transcript_path).expect("transcript text");
+        let transcript: serde_json::Value =
+            serde_json::from_str(transcript_text.trim()).expect("transcript json");
+        assert_eq!(
+            transcript
+                .get("timed_out")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn pi_worker_fails_blocking_extension_ui_request() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
@@ -926,6 +1040,7 @@ mod tests {
                 fake_outcome: "completed".to_string(),
                 lease_seconds: 90,
                 retry_hold_seconds: None,
+                max_run_seconds: None,
                 data_dir: temp.path().join("data"),
                 api_url: "http://127.0.0.1:4317".to_string(),
                 api_token: "token".to_string(),
@@ -980,6 +1095,7 @@ mod tests {
                 fake_outcome: "completed".to_string(),
                 lease_seconds: 90,
                 retry_hold_seconds: None,
+                max_run_seconds: None,
                 data_dir: temp.path().join("data"),
                 api_url: "http://127.0.0.1:4317".to_string(),
                 api_token: "secret-token-that-must-not-be-in-raw-json".to_string(),

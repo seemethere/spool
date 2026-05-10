@@ -516,6 +516,7 @@ _Avoid_: Separate progress comment
 - A **Worker Loop** has default **Worker Concurrency** of 1.
 - `tasker work --concurrency N` raises **Worker Concurrency** up to the **Queue Concurrency Limit**.
 - `tasker work --once` claims and runs at most one **Task**.
+- `tasker work --max-run-seconds N` bounds one launcher execution and fails the **Agent Run** if the **Pi Launcher** does not emit `agent_end` before the duration elapses.
 - `tasker status` shows queue counts, running work, and retry holds.
 - `tasker task show` shows full **Task** state.
 - `tasker run show` shows **Agent Run**, **Run Transcript**, and **Launcher Session Data** metadata.
@@ -557,6 +558,7 @@ _Avoid_: Separate progress comment
 - The full **Tasker Pi Extension** exposes tools for Task context, **Workpad Note** updates, criteria/validation statuses, **Child Tasks**, **Task Links**, and **State Transitions**.
 - Question UI is allowed in **Interactive Agent Sessions**.
 - Unexpected question UI in an **Unattended Worker Session** fails the **Agent Run** with a clear reason.
+- A **Pi Launcher** max-run timeout fails the **Agent Run** with a clear reason while preserving the **Run Transcript** and **Launcher Session Data**.
 - Tasker may store a **Run Transcript** for each **Agent Run**.
 - Tasker stores **Launcher Session Data** with common fields and launcher-specific raw data.
 - Tasker does not automatically upload or share **Launcher Session Data**.
