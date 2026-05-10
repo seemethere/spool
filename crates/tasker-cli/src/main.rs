@@ -181,6 +181,17 @@ enum TaskCommand {
     },
     /// Show a Task by Task Identifier.
     Show { identifier: String },
+    /// Retry recovery: move a resolved failed, canceled, or stuck Task back to Ready.
+    Retry {
+        /// Task Identifier.
+        identifier: String,
+        /// Explicit operator reason for retry recovery.
+        #[arg(long)]
+        reason: String,
+        /// Operator actor display name for audit attribution.
+        #[arg(long, default_value = "local-operator")]
+        actor: String,
+    },
     /// Request a normal State Transition for a Task.
     Transition {
         /// Task Identifier.
@@ -257,6 +268,20 @@ enum WorkpadCommand {
 enum RunCommand {
     /// Show one Agent Run, its Task, and Launcher Session Data.
     Show { run_id: String },
+    /// Operator recovery: fail an active Agent Run and create a Retry Hold.
+    Fail {
+        /// Agent Run ID.
+        run_id: String,
+        /// Explicit reason recorded on the Agent Run and Retry Hold.
+        #[arg(long)]
+        reason: String,
+        /// Retry Hold duration in seconds.
+        #[arg(long)]
+        retry_hold_seconds: Option<i64>,
+        /// Operator actor display name for audit attribution.
+        #[arg(long, default_value = "local-operator")]
+        actor: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -507,6 +532,20 @@ async fn task(paths: &TaskerPaths, db_path_overridden: bool, command: TaskComman
                 .with_context(|| format!("Task {identifier} not found"))?;
             output::print_task_detail(&detail)?;
         }
+        TaskCommand::Retry {
+            identifier,
+            reason,
+            actor,
+        } => {
+            let detail = tasker_db::retry_task(
+                &pool,
+                &identifier,
+                &tasker_db::RetryTaskInput { reason },
+                &tasker_db::Actor::operator(actor),
+            )
+            .await?;
+            println!("retried Task {} to Ready", detail.task.identifier);
+        }
         TaskCommand::Transition {
             identifier,
             to,
@@ -729,6 +768,31 @@ async fn run(paths: &TaskerPaths, db_path_overridden: bool, command: RunCommand)
                 .await?
                 .with_context(|| format!("Agent Run {run_id} not found"))?;
             output::print_run_detail(&detail)?;
+        }
+        RunCommand::Fail {
+            run_id,
+            reason,
+            retry_hold_seconds,
+            actor,
+        } => {
+            let run = tasker_db::operator_fail_run(
+                &pool,
+                &run_id,
+                &tasker_db::OperatorFailRunInput {
+                    failure_reason: reason,
+                    retry_hold_seconds,
+                },
+                &tasker_db::Actor::operator(actor),
+            )
+            .await?;
+            let detail = tasker_db::get_agent_run_detail(&pool, &run.id)
+                .await?
+                .with_context(|| format!("Agent Run {} not found after failure", run.id))?;
+            println!("failed Agent Run {}", detail.run.id);
+            println!(
+                "retry hold created for Task {}",
+                detail.task.task.identifier
+            );
         }
     }
     Ok(())
@@ -1208,10 +1272,10 @@ Implement Bootstrap Task Creation.
         .await
         .expect("fake work");
         let pool = open_pool(&paths, false).await.expect("pool");
-        let run = tasker_db::get_agent_run(&pool, "not-a-real-run")
+        let missing_run = tasker_db::get_agent_run(&pool, "not-a-real-run")
             .await
             .expect("get missing run");
-        assert!(run.is_none());
+        assert!(missing_run.is_none());
         let detail = tasker_db::get_task_detail(&pool, "TASK-1")
             .await
             .expect("get task")
@@ -1276,6 +1340,64 @@ Implement Bootstrap Task Creation.
             .expect("get task")
             .expect("task");
         assert_eq!(detail.task.state, "done");
+
+        task(
+            &paths,
+            false,
+            TaskCommand::Create {
+                bootstrap: true,
+                queue: "TASK".to_string(),
+                file: temp.path().join("task.md"),
+                actor: "tester".to_string(),
+            },
+        )
+        .await
+        .expect("create retry task");
+        let claimed = tasker_db::claim_next(
+            &pool,
+            &tasker_db::ClaimNextInput {
+                queue_key: "TASK".to_string(),
+                worker_id: "worker".to_string(),
+                launcher_kind: "fake".to_string(),
+                lease_seconds: 90,
+            },
+            &tasker_db::Actor {
+                kind: "worker_agent".to_string(),
+                id: "worker".to_string(),
+                display_name: "worker".to_string(),
+            },
+        )
+        .await
+        .expect("claim retry task")
+        .expect("claimed retry task");
+        run(
+            &paths,
+            false,
+            RunCommand::Fail {
+                run_id: claimed.run.id,
+                reason: "operator recovery test".to_string(),
+                retry_hold_seconds: Some(60),
+                actor: "tester".to_string(),
+            },
+        )
+        .await
+        .expect("fail active run");
+        task(
+            &paths,
+            false,
+            TaskCommand::Retry {
+                identifier: "TASK-2".to_string(),
+                reason: "retry after operator failure".to_string(),
+                actor: "tester".to_string(),
+            },
+        )
+        .await
+        .expect("retry task");
+        let retry_detail = tasker_db::get_task_detail(&pool, "TASK-2")
+            .await
+            .expect("get retry task")
+            .expect("retry task");
+        assert_eq!(retry_detail.task.state, "ready");
         status(&paths, false).await.expect("status");
     }
 

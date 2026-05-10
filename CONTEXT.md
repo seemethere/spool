@@ -519,8 +519,10 @@ _Avoid_: Separate progress comment
 - `tasker work --max-run-seconds N` bounds one launcher execution and fails the **Agent Run** if the **Pi Launcher** does not emit `agent_end` before the duration elapses.
 - `tasker status` shows queue counts, running work, and retry holds.
 - `tasker task show` shows full **Task** state.
+- `tasker task retry` is an **Operator** recovery command that clears a **Retry Hold** and moves a resolved failed, canceled, or stuck **Task** back to **Ready** without changing normal completion gates.
 - `tasker run show` shows **Agent Run**, **Run Transcript**, and **Launcher Session Data** metadata.
-- Dogfooding API covers health/version, queue create/show/list, bootstrap task create, task show, claim-next, heartbeat, finish-run, Workpad Note update, criterion/validation status update, child task creation, state transition request, local worktree/delivery metadata, status summary, and run show.
+- `tasker run fail` is an **Operator** recovery command that fails an active **Agent Run** with an explicit reason and records a **Retry Hold**.
+- Dogfooding API covers health/version, queue create/show/list, bootstrap task create, task show, claim-next, heartbeat, finish-run, Workpad Note update, criterion/validation status update, child task creation, state transition request, local worktree/delivery metadata, status summary, run show, and operator recovery for failed or stuck work.
 - Search, bulk edits, review sessions, pruning, metrics export, and token admin APIs are deferred until after **Dogfooding Readiness**.
 - Dogfooding persistence includes queues, tasks, acceptance criteria, validation items, workpad notes/revisions, task links, task relationships, agent runs/heartbeats, delivery records, launcher session data, audit events, and API tokens.
 - **Dogfooding Readiness** comes before full v1 polish.
