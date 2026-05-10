@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 use tokio::time::sleep;
 
-use crate::display;
+use crate::{display, worker};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupervisorOptions {
@@ -129,6 +129,7 @@ pub async fn supervise_batch(
     };
 
     while Instant::now() < deadline {
+        retry_due_integrations(pool, &options.queue, &run_prefix).await?;
         let task_titles = task_titles_for_queue(pool, &options.queue).await?;
         reports.refresh(&mut outcome, &task_titles)?;
         let unblock = unblocking_state(pool, &options.queue, &reports).await?;
@@ -571,6 +572,27 @@ fn supervisor_status_dir(run_prefix: &str) -> Result<PathBuf> {
         )
     })?;
     Ok(dir)
+}
+
+async fn retry_due_integrations(pool: &SqlitePool, queue: &str, run_prefix: &str) -> Result<()> {
+    let retries = tasker_db::due_integration_retries(pool, queue).await?;
+    if retries.is_empty() {
+        return Ok(());
+    }
+    let actor = tasker_db::Actor::operator(format!("{run_prefix}-integration-retry"));
+    for retry in retries {
+        println!(
+            "retrying Integrating Task {} after operational Delivery Failure attempt={} next_retry_at={}",
+            display::task_label(&retry.task_identifier, &retry.task_title, 64),
+            retry.retry_attempt.unwrap_or_default(),
+            retry.next_retry_at.as_deref().unwrap_or("due")
+        );
+        let outcome =
+            worker::integrate_local_worktree_for_run(pool, &retry.task_identifier, None, &actor)
+                .await?;
+        println!("{}", outcome.summary);
+    }
+    Ok(())
 }
 
 async fn task_titles_for_queue(pool: &SqlitePool, queue: &str) -> Result<HashMap<String, String>> {

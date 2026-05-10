@@ -1206,6 +1206,7 @@ struct QueueTelemetry<'a> {
     integrating_task_summaries: Vec<&'a tasker_db::TaskStatusSummary>,
     advisory_conflict_hints: Vec<&'a tasker_db::TaskConflictGroup>,
     retry_holds: Vec<&'a tasker_db::ActiveRetryHoldStatus>,
+    integration_retries: Vec<&'a tasker_db::IntegrationRetryStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1220,6 +1221,7 @@ fn build_status_telemetry<'a>(
     active_holds: &'a [tasker_db::ActiveRetryHoldStatus],
     status_tasks: &'a [tasker_db::TaskStatusSummary],
     conflict_groups: &'a [tasker_db::TaskConflictGroup],
+    integration_retries: &'a [tasker_db::IntegrationRetryStatus],
 ) -> StatusTelemetry<'a> {
     let mut queues = Vec::new();
     let mut index = 0;
@@ -1273,6 +1275,10 @@ fn build_status_telemetry<'a>(
                 .iter()
                 .filter(|hold| hold.queue_key == row.queue_key)
                 .collect(),
+            integration_retries: integration_retries
+                .iter()
+                .filter(|retry| retry.queue_key == row.queue_key)
+                .collect(),
             state_counts,
         });
     }
@@ -1296,6 +1302,7 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool, json: bool) -> Re
     let status_tasks =
         tasker_db::tasks_for_status_by_states(&pool, &["ready", "integrating"]).await?;
     let conflict_groups = tasker_db::task_conflict_groups_for_status(&pool).await?;
+    let integration_retries = tasker_db::integration_retries_for_status(&pool).await?;
 
     if json {
         serde_json::to_writer_pretty(
@@ -1306,6 +1313,7 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool, json: bool) -> Re
                 &active_holds,
                 &status_tasks,
                 &conflict_groups,
+                &integration_retries,
             ),
         )?;
         println!();
@@ -1406,6 +1414,26 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool, json: bool) -> Re
                     println!(
                         "    {}\t{} Task(s): {}",
                         group.target, group.task_count, group.tasks
+                    );
+                }
+            }
+            let queue_integration_retries: Vec<_> = integration_retries
+                .iter()
+                .filter(|retry| retry.queue_key.as_str() == row.queue_key.as_str())
+                .collect();
+            if !queue_integration_retries.is_empty() {
+                println!("  Integration retry waits:");
+                for retry in queue_integration_retries {
+                    println!(
+                        "    {}\tattempt={}\tnext_retry_at={}\tretryable={}\treason={}",
+                        display::task_label(&retry.task_identifier, &retry.task_title, 64),
+                        retry.retry_attempt.unwrap_or_default(),
+                        retry
+                            .next_retry_at
+                            .as_deref()
+                            .unwrap_or("operator intervention required"),
+                        retry.retryable,
+                        retry.reason.as_deref().unwrap_or("")
                     );
                 }
             }
@@ -2152,6 +2180,9 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
                 final_commit,
                 pre_merge_head,
                 message,
+                retryable: false,
+                retry_attempt: None,
+                retry_delay_seconds: None,
             },
             self.actor,
         )
@@ -2784,6 +2815,15 @@ mod tests {
             task_count: 2,
             tasks: "TASK-3,TASK-4".to_string(),
         }];
+        let integration_retries = vec![tasker_db::IntegrationRetryStatus {
+            queue_key: "TASK".to_string(),
+            task_identifier: "TASK-5".to_string(),
+            task_title: "Retry integration".to_string(),
+            retryable: true,
+            retry_attempt: Some(1),
+            next_retry_at: Some("later".to_string()),
+            reason: Some("dirty repo".to_string()),
+        }];
 
         let value = serde_json::to_value(build_status_telemetry(
             &rows,
@@ -2791,6 +2831,7 @@ mod tests {
             &active_holds,
             &status_tasks,
             &conflicts,
+            &integration_retries,
         ))
         .expect("status json");
 

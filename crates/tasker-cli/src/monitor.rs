@@ -56,6 +56,7 @@ pub struct QueueSnapshot {
     pub retry_holds: Vec<tasker_db::ActiveRetryHoldStatus>,
     pub ready_tasks: Vec<tasker_db::TaskStatusSummary>,
     pub integrating_tasks: Vec<tasker_db::TaskStatusSummary>,
+    pub integration_retries: Vec<tasker_db::IntegrationRetryStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -262,6 +263,15 @@ fn render_recent_runs(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnaps
                 task.priority
             )));
         }
+        for retry in &queue.integration_retries {
+            run_lines.push(Line::from(format!(
+                "integration retry {} attempt={} next={} reason={}",
+                display::task_label(&retry.task_identifier, &retry.task_title, 40),
+                retry.retry_attempt.unwrap_or_default(),
+                retry.next_retry_at.as_deref().unwrap_or("operator"),
+                retry.reason.as_deref().unwrap_or("")
+            )));
+        }
     }
     if run_lines.is_empty() {
         run_lines.push(Line::from(
@@ -368,12 +378,14 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
     let mut status_tasks =
         tasker_db::tasks_for_status_by_states(pool, &["ready", "integrating"]).await?;
     let recent_runs = recent_agent_runs(pool, options.queue.as_deref()).await?;
+    let mut integration_retries = tasker_db::integration_retries_for_status(pool).await?;
 
     if let Some(queue) = &options.queue {
         rows.retain(|row| row.queue_key == *queue);
         active_runs.retain(|run| run.queue_key == *queue);
         retry_holds.retain(|hold| hold.queue_key == *queue);
         status_tasks.retain(|task| task.queue_key == *queue);
+        integration_retries.retain(|retry| retry.queue_key == *queue);
     }
 
     let captured_at: String = sqlx::query_scalar("SELECT CURRENT_TIMESTAMP")
@@ -395,6 +407,7 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
                 retry_holds: Vec::new(),
                 ready_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
+                integration_retries: Vec::new(),
             });
         queue.state_counts.push((row.state, row.task_count));
         queue.active_agent_runs = row.active_agent_runs;
@@ -417,6 +430,11 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
                 "integrating" => queue.integrating_tasks.push(task),
                 _ => {}
             }
+        }
+    }
+    for retry in integration_retries {
+        if let Some(queue) = by_queue.get_mut(&retry.queue_key) {
+            queue.integration_retries.push(retry);
         }
     }
 
@@ -514,6 +532,20 @@ pub fn write_snapshot(mut writer: impl Write, snapshot: &MonitorSnapshot) -> io:
                 "    integrating {}\tpriority={}",
                 display::task_label(&task.identifier, &task.title, 64),
                 task.priority
+            )?;
+        }
+        for retry in &queue.integration_retries {
+            writeln!(
+                writer,
+                "    integration retry {}\tattempt={}\tnext_retry_at={}\tretryable={}\treason={}",
+                display::task_label(&retry.task_identifier, &retry.task_title, 64),
+                retry.retry_attempt.unwrap_or_default(),
+                retry
+                    .next_retry_at
+                    .as_deref()
+                    .unwrap_or("operator intervention required"),
+                retry.retryable,
+                retry.reason.as_deref().unwrap_or("")
             )?;
         }
         for (state, count) in &queue.state_counts {
@@ -719,6 +751,7 @@ mod tests {
                     priority: "normal".to_string(),
                 }],
                 integrating_tasks: Vec::new(),
+                integration_retries: Vec::new(),
             }],
             recent_runs: vec![RecentRunSnapshot {
                 queue_key: "TASK".to_string(),
@@ -768,6 +801,7 @@ mod tests {
                 retry_holds: Vec::new(),
                 ready_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
+                integration_retries: Vec::new(),
             }],
             recent_runs: Vec::new(),
         };

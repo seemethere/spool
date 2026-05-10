@@ -470,7 +470,7 @@ _Avoid_: Separate progress comment
 - A **Work-Change Delivery Failure** moves a **Task** from **Integrating** to **Rework**.
 - **Rework** continues from the existing **Local Worktree** and **Task Branch** by default.
 - **Reset Rework** discards the current **Local Worktree** and restarts from the **Main Branch**.
-- An **Operational Delivery Failure** leaves a **Task** in **Integrating** for retry.
+- A retryable **Operational Delivery Failure** leaves a **Task** in **Integrating** with a recorded next integration retry time and bounded backoff attempts before operator intervention is required.
 - Tasker does not run arbitrary Git commands for **Local Worktree Delivery**.
 - Configuring **Local Worktree Delivery** opts the **Operator** into Tasker/Symphony mutating the **Managed Source Repository**.
 - The **Managed Source Repository** may contain **Prompt Overrides** at `.tasker/prompts/delegate.md`, `.tasker/prompts/worker.md`, and `.tasker/prompts/review.md`.
@@ -546,6 +546,7 @@ _Avoid_: Separate progress comment
 - `tasker supervise` uses a local per-**Task Queue** supervisor lock to prevent overlapping supervisors from starting duplicate **Worker Loop** claims; stale locks from crashed supervisors are removed when the recorded process is gone, and `--allow-overlap` is an explicit recovery override.
 - `tasker merge lock acquire/status/release --queue <key>` manages the queue-scoped **Managed Source Repository Operation Lock** for Manual Dogfood Merge windows.
 - `tasker supervise --watch` keeps polling a **Task Queue** for newly eligible **Tasks** until timeout or interruption instead of exiting when a bounded batch drains.
+- `tasker supervise` retries due **Integrating** Tasks after retryable **Operational Delivery Failures** without launching a new **Agent Run**.
 - Dogfooding API covers health/version, queue create/show/list, bootstrap task create, task show, claim-next, heartbeat, finish-run, Workpad Note update, criterion/validation status update, child task creation, state transition request, local worktree/delivery metadata, status summary, run show, and operator recovery for failed or stuck work.
 - Search, bulk edits, review sessions, metrics export, and token admin APIs are deferred until after **Dogfooding Readiness**.
 - Dogfooding persistence includes queues, tasks, acceptance criteria, validation items, workpad notes/revisions, task links, task relationships, agent runs/heartbeats, delivery records, launcher session data, audit events, and API tokens.

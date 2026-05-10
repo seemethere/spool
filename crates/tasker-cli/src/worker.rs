@@ -8,7 +8,10 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
+
+const INTEGRATION_RETRY_MAX_ATTEMPTS: i64 = 3;
+const INTEGRATION_RETRY_INITIAL_DELAY_SECONDS: i64 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkOnceRequest {
@@ -1104,21 +1107,68 @@ struct LocalWorktreeIntegrationAdapter<'a> {
     task_branch: &'a str,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct IntegrationOutcomeRetryFields {
+    retryable: bool,
+    retry_attempt: Option<i64>,
+    retry_delay_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IntegrationRetryPolicy {
+    attempt: i64,
+    retryable: bool,
+    delay_seconds: Option<i64>,
+}
+
+fn retryable_operational_failure_message(reason: &str, retry: &IntegrationRetryPolicy) -> String {
+    serde_json::json!({
+        "reason": reason,
+        "retryable": retry.retryable,
+        "retry_attempt": retry.attempt,
+        "max_attempts": INTEGRATION_RETRY_MAX_ATTEMPTS,
+        "retry_delay_seconds": retry.delay_seconds,
+    })
+    .to_string()
+}
+
 impl<'a> LocalWorktreeIntegrationAdapter<'a> {
     async fn integrate(&mut self) -> Result<LocalIntegrationResult> {
         if let Err(error) = self.validate_operational_safety() {
-            self.record_outcome("operational_failure", None, None, Some(error.to_string()))
-                .await?;
+            let retry = self.next_retry_policy().await?;
+            let message = retryable_operational_failure_message(&error.to_string(), &retry);
+            self.record_outcome(
+                "operational_failure",
+                None,
+                None,
+                Some(message),
+                IntegrationOutcomeRetryFields {
+                    retryable: retry.retryable,
+                    retry_attempt: Some(retry.attempt),
+                    retry_delay_seconds: retry.delay_seconds,
+                },
+            )
+            .await?;
+            let retry_summary = retry
+                .delay_seconds
+                .map(|seconds| format!("; retry attempt {} scheduled in {seconds}s", retry.attempt))
+                .unwrap_or_else(|| format!("; retry attempt {} reached max attempts {}; operator intervention required", retry.attempt, INTEGRATION_RETRY_MAX_ATTEMPTS));
             return Ok(LocalIntegrationResult {
                 summary: format!(
-                    "operational Delivery Failure for Task {}; left in Integrating: {error:#}",
+                    "operational Delivery Failure for Task {}; left in Integrating{retry_summary}: {error:#}",
                     self.task.task.identifier
                 ),
             });
         }
         if let Err(error) = self.validate_work_change_safety() {
-            self.record_outcome("work_change_failure", None, None, Some(error.to_string()))
-                .await?;
+            self.record_outcome(
+                "work_change_failure",
+                None,
+                None,
+                Some(error.to_string()),
+                IntegrationOutcomeRetryFields::default(),
+            )
+            .await?;
             self.transition("rework").await?;
             return Ok(LocalIntegrationResult {
                 summary: format!(
@@ -1146,8 +1196,14 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
         )?
         .success()
         {
-            self.record_outcome("no_changes", None, Some(pre_merge_head.clone()), None)
-                .await?;
+            self.record_outcome(
+                "no_changes",
+                None,
+                Some(pre_merge_head.clone()),
+                None,
+                IntegrationOutcomeRetryFields::default(),
+            )
+            .await?;
             self.transition("done").await?;
             let cleanup = self.cleanup_after_success();
             let mut summary = format!(
@@ -1171,6 +1227,7 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
                 None,
                 Some(pre_merge_head.clone()),
                 Some(format!("Squash Merge failed: {error:#}")),
+                IntegrationOutcomeRetryFields::default(),
             )
             .await?;
             self.transition("rework").await?;
@@ -1190,6 +1247,7 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
                 None,
                 Some(pre_merge_head.clone()),
                 Some(format!("Final Commit failed: {error:#}")),
+                IntegrationOutcomeRetryFields::default(),
             )
             .await?;
             self.transition("rework").await?;
@@ -1209,6 +1267,7 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
             Some(final_commit.clone()),
             Some(pre_merge_head),
             None,
+            IntegrationOutcomeRetryFields::default(),
         )
         .await
         .with_context(|| {
@@ -1335,6 +1394,7 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
         final_commit: Option<String>,
         pre_merge_head: Option<String>,
         message: Option<String>,
+        retry: IntegrationOutcomeRetryFields,
     ) -> Result<()> {
         tasker_db::record_integration_outcome(
             self.pool,
@@ -1345,11 +1405,49 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
                 final_commit,
                 pre_merge_head,
                 message,
+                retryable: retry.retryable,
+                retry_attempt: retry.retry_attempt,
+                retry_delay_seconds: retry.retry_delay_seconds,
             },
             self.actor,
         )
         .await?;
         Ok(())
+    }
+
+    async fn next_retry_policy(&self) -> Result<IntegrationRetryPolicy> {
+        let previous_attempt: Option<i64> = sqlx::query(
+            r#"
+            SELECT retry_attempt
+            FROM integration_outcomes
+            WHERE task_id = ?
+              AND outcome_kind = 'operational_failure'
+              AND retry_attempt IS NOT NULL
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&self.task.task.id)
+        .fetch_optional(self.pool)
+        .await
+        .context("failed to load Integration retry attempt")?
+        .and_then(|row| {
+            row.try_get::<Option<i64>, _>("retry_attempt")
+                .ok()
+                .flatten()
+        });
+        let attempt = previous_attempt.unwrap_or(0) + 1;
+        let retryable = attempt < INTEGRATION_RETRY_MAX_ATTEMPTS;
+        let delay_seconds = if retryable {
+            Some(INTEGRATION_RETRY_INITIAL_DELAY_SECONDS * (1_i64 << (attempt - 1)))
+        } else {
+            None
+        };
+        Ok(IntegrationRetryPolicy {
+            attempt,
+            retryable,
+            delay_seconds,
+        })
     }
 
     async fn transition(&self, to_state: &str) -> Result<()> {
@@ -1700,13 +1798,14 @@ mod tests {
             .expect("task");
         assert_eq!(detail.task.state, "rework");
         assert!(worktrees.join("TASK-1").exists());
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'work_change_failure'",
+        let (count, retryable_count): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), SUM(CASE WHEN retryable THEN 1 ELSE 0 END) FROM integration_outcomes WHERE outcome_kind = 'work_change_failure'",
         )
         .fetch_one(&pool)
         .await
         .expect("count outcomes");
         assert_eq!(count, 1);
+        assert_eq!(retryable_count, 0);
     }
 
     #[tokio::test]
@@ -1750,13 +1849,123 @@ mod tests {
             .expect("load task")
             .expect("task");
         assert_eq!(detail.task.state, "integrating");
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'operational_failure'",
+        let (count, retryable, attempt, next_retry_at): (i64, bool, i64, Option<String>) = sqlx::query_as(
+            "SELECT COUNT(*), retryable, retry_attempt, next_retry_at FROM integration_outcomes WHERE outcome_kind = 'operational_failure'",
         )
         .fetch_one(&pool)
         .await
         .expect("count outcomes");
         assert_eq!(count, 1);
+        assert!(retryable);
+        assert_eq!(attempt, 1);
+        assert!(next_retry_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn local_integration_retry_succeeds_after_managed_source_becomes_clean() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let worktrees = temp.path().join("worktrees");
+        init_git_repo(&repo);
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        seed_ready_task(&pool, &repo, &worktrees).await;
+
+        run_worker_once(
+            &pool,
+            WorkOnceRequest {
+                queue: "TASK".to_string(),
+                launcher: "fake".to_string(),
+                actor: "worker".to_string(),
+                fake_outcome: "integrating-operational-failure".to_string(),
+                lease_seconds: 90,
+                retry_hold_seconds: None,
+                max_run_seconds: None,
+                data_dir: temp.path().join("data"),
+                api_url: "http://127.0.0.1:4317".to_string(),
+                api_token: "token".to_string(),
+                pi_bin: "pi".to_string(),
+                pi_extension: None,
+                worker_prompt: None,
+            },
+        )
+        .await
+        .expect("run worker");
+        fs::remove_file(repo.join("dirty-managed-source.txt")).expect("clean managed source");
+
+        let actor = tasker_db::Actor::operator("retry-adapter");
+        let retry = integrate_local_worktree_for_run(&pool, "TASK-1", None, &actor)
+            .await
+            .expect("retry integration");
+
+        assert!(
+            retry.summary.contains("Integrated Task TASK-1")
+                || retry
+                    .summary
+                    .contains("No-Change Integration recorded for Task TASK-1")
+        );
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("load task")
+            .expect("task");
+        assert_eq!(detail.task.state, "done");
+        let success_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind IN ('success', 'no_changes') AND agent_run_id IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count success outcomes");
+        assert_eq!(success_count, 1);
+    }
+
+    #[tokio::test]
+    async fn local_integration_operational_retry_policy_is_bounded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let worktrees = temp.path().join("worktrees");
+        init_git_repo(&repo);
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        seed_ready_task(&pool, &repo, &worktrees).await;
+        run_worker_once(
+            &pool,
+            WorkOnceRequest {
+                queue: "TASK".to_string(),
+                launcher: "fake".to_string(),
+                actor: "worker".to_string(),
+                fake_outcome: "integrating-operational-failure".to_string(),
+                lease_seconds: 90,
+                retry_hold_seconds: None,
+                max_run_seconds: None,
+                data_dir: temp.path().join("data"),
+                api_url: "http://127.0.0.1:4317".to_string(),
+                api_token: "token".to_string(),
+                pi_bin: "pi".to_string(),
+                pi_extension: None,
+                worker_prompt: None,
+            },
+        )
+        .await
+        .expect("run worker");
+        let actor = tasker_db::Actor::operator("retry-adapter");
+        integrate_local_worktree_for_run(&pool, "TASK-1", None, &actor)
+            .await
+            .expect("second failure");
+        integrate_local_worktree_for_run(&pool, "TASK-1", None, &actor)
+            .await
+            .expect("third failure");
+
+        let (retryable, attempt, next_retry_at): (bool, i64, Option<String>) = sqlx::query_as(
+            "SELECT retryable, retry_attempt, next_retry_at FROM integration_outcomes WHERE outcome_kind = 'operational_failure' ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("latest outcome");
+        assert!(!retryable);
+        assert_eq!(attempt, INTEGRATION_RETRY_MAX_ATTEMPTS);
+        assert!(next_retry_at.is_none());
     }
 
     #[tokio::test]

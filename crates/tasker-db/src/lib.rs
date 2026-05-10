@@ -746,6 +746,9 @@ pub struct IntegrationOutcome {
     pub final_commit: Option<String>,
     pub pre_merge_head: Option<String>,
     pub message: Option<String>,
+    pub retryable: bool,
+    pub retry_attempt: Option<i64>,
+    pub next_retry_at: Option<String>,
     pub created_at: String,
 }
 
@@ -757,6 +760,20 @@ pub struct RecordIntegrationOutcomeInput {
     pub final_commit: Option<String>,
     pub pre_merge_head: Option<String>,
     pub message: Option<String>,
+    pub retryable: bool,
+    pub retry_attempt: Option<i64>,
+    pub retry_delay_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct IntegrationRetryStatus {
+    pub queue_key: String,
+    pub task_identifier: String,
+    pub task_title: String,
+    pub retryable: bool,
+    pub retry_attempt: Option<i64>,
+    pub next_retry_at: Option<String>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1840,6 +1857,80 @@ pub async fn active_retry_holds_for_status(
     .context("failed to load active Retry Holds for status")
 }
 
+pub async fn integration_retries_for_status(
+    pool: &SqlitePool,
+) -> Result<Vec<IntegrationRetryStatus>> {
+    sqlx::query_as::<_, IntegrationRetryStatus>(
+        r#"
+        SELECT
+            task_queues.key AS queue_key,
+            tasks.identifier AS task_identifier,
+            tasks.title AS task_title,
+            latest.retryable AS retryable,
+            latest.retry_attempt AS retry_attempt,
+            latest.next_retry_at AS next_retry_at,
+            latest.message AS reason
+        FROM tasks
+        JOIN task_queues ON task_queues.id = tasks.task_queue_id
+        JOIN integration_outcomes latest ON latest.id = (
+            SELECT integration_outcomes.id FROM integration_outcomes
+            WHERE integration_outcomes.task_id = tasks.id
+            ORDER BY integration_outcomes.created_at DESC, integration_outcomes.rowid DESC
+            LIMIT 1
+        )
+        WHERE tasks.state = 'integrating'
+          AND latest.outcome_kind = 'operational_failure'
+        ORDER BY task_queues.key, tasks.identifier
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to load Integration retry status")
+}
+
+pub async fn due_integration_retries(
+    pool: &SqlitePool,
+    queue_key: &str,
+) -> Result<Vec<IntegrationRetryStatus>> {
+    sqlx::query_as::<_, IntegrationRetryStatus>(
+        r#"
+        SELECT
+            task_queues.key AS queue_key,
+            tasks.identifier AS task_identifier,
+            tasks.title AS task_title,
+            latest.retryable AS retryable,
+            latest.retry_attempt AS retry_attempt,
+            latest.next_retry_at AS next_retry_at,
+            latest.message AS reason
+        FROM tasks
+        JOIN task_queues ON task_queues.id = tasks.task_queue_id
+        JOIN integration_outcomes latest ON latest.id = (
+            SELECT integration_outcomes.id FROM integration_outcomes
+            WHERE integration_outcomes.task_id = tasks.id
+            ORDER BY integration_outcomes.created_at DESC, integration_outcomes.rowid DESC
+            LIMIT 1
+        )
+        WHERE task_queues.key = ?
+          AND tasks.state = 'integrating'
+          AND latest.outcome_kind = 'operational_failure'
+          AND latest.retryable = 1
+          AND latest.next_retry_at IS NOT NULL
+          AND latest.next_retry_at <= CURRENT_TIMESTAMP
+          AND NOT EXISTS (
+              SELECT 1 FROM agent_runs
+              WHERE agent_runs.task_id = tasks.id
+                AND agent_runs.outcome IS NULL
+                AND agent_runs.lease_expires_at > CURRENT_TIMESTAMP
+          )
+        ORDER BY latest.next_retry_at, tasks.identifier
+        "#,
+    )
+    .bind(queue_key)
+    .fetch_all(pool)
+    .await
+    .context("failed to load due Integration retries")
+}
+
 pub async fn task_conflict_groups_for_status(pool: &SqlitePool) -> Result<Vec<TaskConflictGroup>> {
     sqlx::query_as::<_, TaskConflictGroup>(
         r#"
@@ -2475,12 +2566,26 @@ pub async fn record_integration_outcome(
         }
     }
 
+    if input.retryable && input.outcome_kind != "operational_failure" {
+        anyhow::bail!("only operational Integration Outcomes may be marked retryable");
+    }
+    if input.retry_attempt.is_some_and(|attempt| attempt <= 0) {
+        anyhow::bail!("retry_attempt must be positive");
+    }
+    if input
+        .retry_delay_seconds
+        .is_some_and(|seconds| seconds <= 0)
+    {
+        anyhow::bail!("retry_delay_seconds must be positive");
+    }
+
     let outcome_id = Uuid::new_v4().to_string();
     sqlx::query(
         r#"
         INSERT INTO integration_outcomes (
-            id, task_id, agent_run_id, outcome_kind, final_commit, pre_merge_head, message
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            id, task_id, agent_run_id, outcome_kind, final_commit, pre_merge_head, message,
+            retryable, retry_attempt, next_retry_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IS NULL THEN NULL ELSE datetime('now', '+' || ? || ' seconds') END)
         "#,
     )
     .bind(&outcome_id)
@@ -2490,6 +2595,10 @@ pub async fn record_integration_outcome(
     .bind(&input.final_commit)
     .bind(&input.pre_merge_head)
     .bind(&input.message)
+    .bind(input.retryable)
+    .bind(input.retry_attempt)
+    .bind(input.retry_delay_seconds)
+    .bind(input.retry_delay_seconds)
     .execute(&mut *tx)
     .await
     .context("failed to record Integration Outcome")?;
@@ -2507,6 +2616,9 @@ pub async fn record_integration_outcome(
             "final_commit": input.final_commit,
             "pre_merge_head": input.pre_merge_head,
             "message": input.message,
+            "retryable": input.retryable,
+            "retry_attempt": input.retry_attempt,
+            "retry_delay_seconds": input.retry_delay_seconds,
         }),
     )
     .await?;
@@ -2515,7 +2627,8 @@ pub async fn record_integration_outcome(
 
     sqlx::query_as::<_, IntegrationOutcome>(
         r#"
-        SELECT id, task_id, agent_run_id, outcome_kind, final_commit, pre_merge_head, message, created_at
+        SELECT id, task_id, agent_run_id, outcome_kind, final_commit, pre_merge_head, message,
+               retryable, retry_attempt, next_retry_at, created_at
         FROM integration_outcomes
         WHERE id = ?
         "#,
@@ -5654,6 +5767,9 @@ mod tests {
                 final_commit: Some("abc123".to_string()),
                 pre_merge_head: Some("def456".to_string()),
                 message: None,
+                retryable: false,
+                retry_attempt: None,
+                retry_delay_seconds: None,
             },
             &actor,
         )
