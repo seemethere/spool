@@ -357,6 +357,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let paths = cli.paths()?;
     let db_path_overridden = cli.db_path.is_some();
+    guard_project_config(&cli, &paths, db_path_overridden)?;
 
     match cli.command {
         Some(Command::Init) => init(&paths, db_path_overridden).await,
@@ -440,6 +441,90 @@ impl Cli {
             data_dir: self.data_dir.clone(),
             db_path: self.db_path.clone(),
         })
+    }
+
+    fn has_intentional_config_override(&self) -> bool {
+        self.config.is_some() || self.data_dir.is_some() || self.db_path.is_some()
+    }
+}
+
+fn guard_project_config(cli: &Cli, paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
+    let cwd = std::env::current_dir().context("failed to resolve current directory")?;
+    guard_project_config_from(cli, paths, db_path_overridden, &cwd)
+}
+
+fn guard_project_config_from(
+    cli: &Cli,
+    paths: &TaskerPaths,
+    db_path_overridden: bool,
+    cwd: &Path,
+) -> Result<()> {
+    let Some(project_config) = discover_project_config(cwd) else {
+        return Ok(());
+    };
+    if paths_equivalent(&paths.config_path, &project_config) {
+        return Ok(());
+    }
+
+    let mut config = TaskerConfig::load_or_default(paths)?;
+    if db_path_overridden {
+        config.database.path = paths.db_path.clone();
+    }
+
+    if command_is_unsafe_mutation(&cli.command) && !cli.has_intentional_config_override() {
+        anyhow::bail!(
+            "refusing mutating Tasker command because project config {} is present but inactive; active config is {} and active database is {}. Re-run with --config .tasker/config.toml, set TASKER_CONFIG, use bin/tasker-local, or pass an intentional --data-dir/--db-path override.",
+            project_config.display(),
+            paths.config_path.display(),
+            config.database.path.display()
+        );
+    }
+
+    eprintln!(
+        "warning: project config {} is present but inactive; active config is {} and active database is {}. Use --config .tasker/config.toml or bin/tasker-local to target this project.",
+        project_config.display(),
+        paths.config_path.display(),
+        config.database.path.display()
+    );
+    Ok(())
+}
+
+fn discover_project_config(start: &Path) -> Option<PathBuf> {
+    for ancestor in start.ancestors() {
+        let candidate = ancestor.join(".tasker/config.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn command_is_unsafe_mutation(command: &Option<Command>) -> bool {
+    match command {
+        Some(
+            Command::Init
+            | Command::Work { .. }
+            | Command::Supervise { .. }
+            | Command::Serve { .. },
+        ) => true,
+        Some(Command::Queue { command }) => matches!(
+            command,
+            QueueCommand::Create { .. } | QueueCommand::Update { .. }
+        ),
+        Some(Command::Task { command }) => !matches!(
+            command,
+            TaskCommand::Show { .. } | TaskCommand::Audit { .. }
+        ),
+        Some(Command::Run { command }) => matches!(command, RunCommand::Fail { .. }),
+        Some(Command::Merge { command }) => matches!(command, MergeCommand::Done { .. }),
+        Some(Command::Status | Command::Version) | None => false,
     }
 }
 
@@ -1214,6 +1299,116 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn project_config_guard_refuses_mutating_command_when_inactive() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let nested = repo.join("src");
+        fs::create_dir_all(&nested).expect("nested repo dir");
+        let project_config = repo.join(".tasker/config.toml");
+        write_config(&project_config, &repo.join(".tasker/data/tasker.db"));
+        let paths = TaskerPaths::resolve(temp.path().join("home"), PathOverrides::default());
+        let cli = Cli {
+            config: None,
+            data_dir: None,
+            db_path: None,
+            command: Some(Command::Task {
+                command: TaskCommand::Create {
+                    bootstrap: true,
+                    queue: "TASK".to_string(),
+                    file: repo.join("task.md"),
+                    actor: "tester".to_string(),
+                },
+            }),
+        };
+
+        let error = guard_project_config_from(&cli, &paths, false, &nested)
+            .expect_err("inactive project config should refuse mutation");
+        let message = error.to_string();
+
+        assert!(message.contains("refusing mutating Tasker command"));
+        assert!(message.contains("--config .tasker/config.toml"));
+        assert!(message.contains("bin/tasker-local"));
+        assert!(message.contains(&project_config.display().to_string()));
+        assert!(message.contains(&paths.config_path.display().to_string()));
+        assert!(message.contains(&paths.db_path.display().to_string()));
+    }
+
+    #[test]
+    fn project_config_guard_allows_explicit_config_for_mutating_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let nested = repo.join("src");
+        fs::create_dir_all(&nested).expect("nested repo dir");
+        let project_config = repo.join(".tasker/config.toml");
+        let project_db = repo.join(".tasker/data/tasker.db");
+        write_config(&project_config, &project_db);
+        let paths = TaskerPaths::resolve(
+            temp.path().join("home"),
+            PathOverrides {
+                config_path: Some(project_config),
+                ..PathOverrides::default()
+            },
+        );
+        let cli = Cli {
+            config: Some(paths.config_path.clone()),
+            data_dir: None,
+            db_path: None,
+            command: Some(Command::Task {
+                command: TaskCommand::Create {
+                    bootstrap: true,
+                    queue: "TASK".to_string(),
+                    file: repo.join("task.md"),
+                    actor: "tester".to_string(),
+                },
+            }),
+        };
+
+        guard_project_config_from(&cli, &paths, false, &nested)
+            .expect("explicit project config should allow mutation");
+    }
+
+    #[test]
+    fn project_config_guard_allows_read_only_command_when_inactive() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let nested = repo.join("src");
+        fs::create_dir_all(&nested).expect("nested repo dir");
+        write_config(
+            &repo.join(".tasker/config.toml"),
+            &repo.join(".tasker/data/tasker.db"),
+        );
+        let paths = TaskerPaths::resolve(temp.path().join("home"), PathOverrides::default());
+        let cli = Cli {
+            config: None,
+            data_dir: None,
+            db_path: None,
+            command: Some(Command::Task {
+                command: TaskCommand::Show {
+                    identifier: "TASK-1".to_string(),
+                },
+            }),
+        };
+
+        guard_project_config_from(&cli, &paths, false, &nested)
+            .expect("read-only command should warn but continue");
+    }
+
+    fn write_config(config_path: &Path, db_path: &Path) {
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent).expect("config parent");
+        }
+        fs::write(
+            config_path,
+            format!(
+                "[service]\nbind_addr = \"{}\"\n\n[database]\npath = \"{}\"\n",
+                tasker_config::DEFAULT_BIND_ADDR,
+                db_path.display()
+            ),
+        )
+        .expect("write config");
     }
 
     #[tokio::test]
