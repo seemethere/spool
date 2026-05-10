@@ -327,6 +327,7 @@ struct RunTelemetry<'a> {
     created_at: &'a str,
     finished_at: Option<&'a str>,
     launcher_session_data: Option<LauncherSessionTelemetry<'a>>,
+    normalized_metrics: Option<&'a tasker_db::AgentRunMetrics>,
 }
 
 fn run_telemetry(detail: &tasker_db::AgentRunDetail) -> RunTelemetry<'_> {
@@ -360,6 +361,7 @@ fn run_telemetry(detail: &tasker_db::AgentRunDetail) -> RunTelemetry<'_> {
         created_at: &detail.run.created_at,
         finished_at: detail.run.finished_at.as_deref(),
         launcher_session_data,
+        normalized_metrics: detail.metrics.as_ref(),
     }
 }
 
@@ -469,6 +471,27 @@ pub fn write_run_detail(mut writer: impl Write, detail: &tasker_db::AgentRunDeta
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "unknown".to_string())
             )?;
+        }
+        if metrics.tool_call_count.is_some()
+            || metrics.tool_error_count.is_some()
+            || metrics.assistant_turn_count.is_some()
+            || metrics.user_turn_count.is_some()
+        {
+            writeln!(
+                writer,
+                "  efficiency: tool_calls={} tool_errors={} repeated_failed_tools={} assistant_turns={} user_turns={} max_context_tokens={}",
+                metrics.tool_call_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                metrics.tool_error_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                metrics.repeated_failed_tool_attempt_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                metrics.assistant_turn_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                metrics.user_turn_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                metrics.max_context_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string())
+            )?;
+        }
+        if let Ok(hints) = serde_json::from_str::<Vec<String>>(&metrics.efficiency_hints_json) {
+            for hint in hints {
+                writeln!(writer, "  optimization hint: {hint}")?;
+            }
         }
         if let Ok(warnings) = serde_json::from_str::<Vec<String>>(&metrics.warnings_json) {
             for warning in warnings {

@@ -684,6 +684,13 @@ pub struct AgentRunMetrics {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
+    pub tool_call_count: Option<i64>,
+    pub tool_error_count: Option<i64>,
+    pub repeated_failed_tool_attempt_count: Option<i64>,
+    pub assistant_turn_count: Option<i64>,
+    pub user_turn_count: Option<i64>,
+    pub max_context_tokens: Option<i64>,
+    pub efficiency_hints_json: String,
     pub warnings_json: String,
     pub created_at: String,
     pub updated_at: String,
@@ -2744,7 +2751,9 @@ pub async fn get_agent_run_metrics(
         SELECT agent_run_id, duration_ms, launcher_kind, final_status, exit_code, timed_out,
                unattended_question_detected, blocking_ui_detected, transcript_path,
                transcript_byte_size, transcript_jsonl_event_count, input_tokens, output_tokens,
-               total_tokens, warnings_json, created_at, updated_at
+               total_tokens, tool_call_count, tool_error_count, repeated_failed_tool_attempt_count,
+               assistant_turn_count, user_turn_count, max_context_tokens, efficiency_hints_json,
+               warnings_json, created_at, updated_at
         FROM agent_run_metrics
         WHERE agent_run_id = ?
         "#,
@@ -2790,12 +2799,14 @@ pub async fn refresh_agent_run_metrics(
             agent_run_id, duration_ms, launcher_kind, final_status, exit_code, timed_out,
             unattended_question_detected, blocking_ui_detected, transcript_path,
             transcript_byte_size, transcript_jsonl_event_count, input_tokens, output_tokens,
-            total_tokens, warnings_json
+            total_tokens, tool_call_count, tool_error_count, repeated_failed_tool_attempt_count,
+            assistant_turn_count, user_turn_count, max_context_tokens, efficiency_hints_json,
+            warnings_json
         )
         SELECT
             agent_runs.id,
             CAST((julianday(agent_runs.finished_at) - julianday(agent_runs.created_at)) * 86400000 AS INTEGER),
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         FROM agent_runs
         WHERE agent_runs.id = ? AND agent_runs.outcome IS NOT NULL
         ON CONFLICT(agent_run_id) DO UPDATE SET
@@ -2812,6 +2823,13 @@ pub async fn refresh_agent_run_metrics(
             input_tokens = excluded.input_tokens,
             output_tokens = excluded.output_tokens,
             total_tokens = excluded.total_tokens,
+            tool_call_count = excluded.tool_call_count,
+            tool_error_count = excluded.tool_error_count,
+            repeated_failed_tool_attempt_count = excluded.repeated_failed_tool_attempt_count,
+            assistant_turn_count = excluded.assistant_turn_count,
+            user_turn_count = excluded.user_turn_count,
+            max_context_tokens = excluded.max_context_tokens,
+            efficiency_hints_json = excluded.efficiency_hints_json,
             warnings_json = excluded.warnings_json,
             updated_at = CURRENT_TIMESTAMP
         "#,
@@ -2828,6 +2846,13 @@ pub async fn refresh_agent_run_metrics(
     .bind(summary.input_tokens)
     .bind(summary.output_tokens)
     .bind(summary.total_tokens)
+    .bind(summary.tool_call_count)
+    .bind(summary.tool_error_count)
+    .bind(summary.repeated_failed_tool_attempt_count)
+    .bind(summary.assistant_turn_count)
+    .bind(summary.user_turn_count)
+    .bind(summary.max_context_tokens)
+    .bind(summary.efficiency_hints_json()?)
     .bind(warnings_json)
     .bind(agent_run_id)
     .execute(pool)
@@ -2850,6 +2875,13 @@ struct AgentRunMetricsSummary {
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
     total_tokens: Option<i64>,
+    tool_call_count: Option<i64>,
+    tool_error_count: Option<i64>,
+    repeated_failed_tool_attempt_count: Option<i64>,
+    assistant_turn_count: Option<i64>,
+    user_turn_count: Option<i64>,
+    max_context_tokens: Option<i64>,
+    failed_tool_signatures: std::collections::HashMap<String, i64>,
     warnings: Vec<String>,
 }
 
@@ -2885,6 +2917,17 @@ impl AgentRunMetricsSummary {
                 });
                 self.total_tokens = self.total_tokens.or_else(|| {
                     first_json_i64(&value, &[&["total_tokens"], &["usage", "total_tokens"]])
+                });
+                self.max_context_tokens = self.max_context_tokens.or_else(|| {
+                    first_json_i64(
+                        &value,
+                        &[
+                            &["context_tokens"],
+                            &["max_context_tokens"],
+                            &["usage", "context_tokens"],
+                            &["usage", "total_tokens"],
+                        ],
+                    )
                 });
             }
             Err(error) => self.warnings.push(format!(
@@ -2972,7 +3015,137 @@ impl AgentRunMetricsSummary {
         if value.get("event").and_then(|value| value.as_str()) == Some("question") {
             self.unattended_question_detected = Some(true);
         }
+        self.observe_roles_and_usage(value);
+        self.observe_tool_event(value);
     }
+
+    fn observe_roles_and_usage(&mut self, value: &serde_json::Value) {
+        if let Some(role) = value.get("role").and_then(|value| value.as_str()) {
+            match role {
+                "assistant" => {
+                    self.assistant_turn_count = Some(self.assistant_turn_count.unwrap_or(0) + 1)
+                }
+                "user" => self.user_turn_count = Some(self.user_turn_count.unwrap_or(0) + 1),
+                _ => {}
+            }
+        }
+        self.input_tokens = self.input_tokens.or_else(|| {
+            first_json_i64(
+                value,
+                &[
+                    &["input_tokens"],
+                    &["usage", "input_tokens"],
+                    &["usage", "prompt_tokens"],
+                ],
+            )
+        });
+        self.output_tokens = self.output_tokens.or_else(|| {
+            first_json_i64(
+                value,
+                &[
+                    &["output_tokens"],
+                    &["usage", "output_tokens"],
+                    &["usage", "completion_tokens"],
+                ],
+            )
+        });
+        self.total_tokens = self
+            .total_tokens
+            .or_else(|| first_json_i64(value, &[&["total_tokens"], &["usage", "total_tokens"]]));
+        if let Some(total) = first_json_i64(
+            value,
+            &[
+                &["context_tokens"],
+                &["max_context_tokens"],
+                &["usage", "context_tokens"],
+                &["usage", "total_tokens"],
+            ],
+        ) {
+            self.max_context_tokens = Some(self.max_context_tokens.unwrap_or(0).max(total));
+        }
+    }
+
+    fn observe_tool_event(&mut self, value: &serde_json::Value) {
+        let type_text = value
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let has_tool_name = value
+            .get("tool_name")
+            .or_else(|| value.get("tool"))
+            .or_else(|| value.get("name"))
+            .is_some();
+        let is_tool_call = (type_text.contains("tool")
+            && (type_text.contains("call")
+                || type_text.contains("use")
+                || type_text.contains("start")))
+            || type_text == "function_call"
+            || value.get("function_call").is_some();
+        if is_tool_call {
+            self.tool_call_count = Some(self.tool_call_count.unwrap_or(0) + 1);
+        }
+        let status = value
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let is_error = value
+            .get("is_error")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+            || status == "error"
+            || status == "failed"
+            || type_text.contains("error");
+        if is_error && (has_tool_name || type_text.contains("tool")) {
+            self.tool_error_count = Some(self.tool_error_count.unwrap_or(0) + 1);
+            let signature = tool_signature(value);
+            let count = self.failed_tool_signatures.entry(signature).or_insert(0);
+            *count += 1;
+            if *count > 1 {
+                self.repeated_failed_tool_attempt_count =
+                    Some(self.repeated_failed_tool_attempt_count.unwrap_or(0) + 1);
+            }
+        }
+    }
+
+    fn efficiency_hints_json(&self) -> Result<String> {
+        let mut hints = Vec::new();
+        if self.tool_call_count.unwrap_or(0) >= 30 {
+            hints.push("excessive tool calls".to_string());
+        }
+        if self.repeated_failed_tool_attempt_count.unwrap_or(0) > 0 {
+            hints.push("repeated failed tool attempts".to_string());
+        }
+        if self.max_context_tokens.unwrap_or(0) >= 100_000 {
+            hints.push("large context growth".to_string());
+        }
+        if self.blocking_ui_detected == Some(true)
+            || self.unattended_question_detected == Some(true)
+        {
+            hints.push("unexpected UI/questions".to_string());
+        }
+        if self.tool_error_count.unwrap_or(0) >= 5 {
+            hints.push("validation/tool loop".to_string());
+        }
+        serde_json::to_string(&hints).context("failed to serialize Agent Run efficiency hints")
+    }
+}
+
+fn tool_signature(value: &serde_json::Value) -> String {
+    let name = value
+        .get("tool_name")
+        .or_else(|| value.get("tool"))
+        .or_else(|| value.get("name"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let args = value
+        .get("args")
+        .or_else(|| value.get("arguments"))
+        .or_else(|| value.get("input"))
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    format!("{name}:{args}")
 }
 
 fn bool_to_i64(value: bool) -> i64 {
@@ -5432,7 +5605,7 @@ mod tests {
             serde_json::json!({
                 "launcher":"pi",
                 "status":0,
-                "stdout":"{\"type\":\"agent_end\"}\n",
+                "stdout":"{\"role\":\"user\",\"content\":\"brief\"}\n{\"role\":\"assistant\",\"content\":\"plan\",\"usage\":{\"input_tokens\":30,\"output_tokens\":12,\"total_tokens\":42}}\n{\"type\":\"tool_call\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"}}\n{\"type\":\"tool_error\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"},\"status\":\"error\"}\n{\"type\":\"tool_error\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"},\"status\":\"error\"}\n{\"type\":\"agent_end\"}\n",
                 "stderr":"",
                 "unattended_question_detected":false,
                 "timed_out":false
@@ -5484,6 +5657,19 @@ mod tests {
         assert_eq!(metrics.timed_out, Some(0));
         assert_eq!(metrics.unattended_question_detected, Some(0));
         assert_eq!(metrics.transcript_jsonl_event_count, Some(1));
+        assert_eq!(metrics.tool_call_count, Some(1));
+        assert_eq!(metrics.tool_error_count, Some(2));
+        assert_eq!(metrics.repeated_failed_tool_attempt_count, Some(1));
+        assert_eq!(metrics.assistant_turn_count, Some(1));
+        assert_eq!(metrics.user_turn_count, Some(1));
+        assert_eq!(metrics.input_tokens, Some(30));
+        assert_eq!(metrics.output_tokens, Some(12));
+        assert_eq!(metrics.total_tokens, Some(42));
+        let hints: Vec<String> =
+            serde_json::from_str(&metrics.efficiency_hints_json).expect("hints");
+        assert!(hints
+            .iter()
+            .any(|hint| hint == "repeated failed tool attempts"));
     }
 
     #[tokio::test]

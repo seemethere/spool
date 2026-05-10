@@ -9,7 +9,7 @@ pub struct TelemetryOptions {
     pub slow_limit: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TelemetrySummary {
     pub queue: String,
     pub total_runs: usize,
@@ -18,9 +18,10 @@ pub struct TelemetrySummary {
     pub failed_or_timed_out_runs: Vec<TelemetryRun>,
     pub completed_duration_seconds: Vec<i64>,
     pub slowest_completed_runs: Vec<TelemetryRun>,
+    pub efficiency: EfficiencyTelemetrySummary,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DuplicateTaskRun {
     pub task_identifier: String,
     pub task_title: String,
@@ -28,7 +29,7 @@ pub struct DuplicateTaskRun {
     pub wasted_runs: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TelemetryRun {
     pub task_identifier: String,
     pub task_title: String,
@@ -38,6 +39,25 @@ pub struct TelemetryRun {
     pub created_at: String,
     pub finished_at: Option<String>,
     pub duration_seconds: Option<i64>,
+    pub tool_call_count: Option<i64>,
+    pub tool_error_count: Option<i64>,
+    pub repeated_failed_tool_attempt_count: Option<i64>,
+    pub assistant_turn_count: Option<i64>,
+    pub user_turn_count: Option<i64>,
+    pub max_context_tokens: Option<i64>,
+    pub efficiency_hints_json: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EfficiencyTelemetrySummary {
+    pub runs_with_metrics: usize,
+    pub total_tool_calls: i64,
+    pub total_tool_errors: i64,
+    pub total_repeated_failed_tool_attempts: i64,
+    pub total_assistant_turns: i64,
+    pub total_user_turns: i64,
+    pub max_context_tokens: Option<i64>,
+    pub inefficient_runs: Vec<TelemetryRun>,
 }
 
 #[derive(Debug, FromRow)]
@@ -51,6 +71,13 @@ struct TelemetryRunRow {
     finished_at: Option<String>,
     integrating_at: Option<String>,
     duration_seconds: Option<i64>,
+    tool_call_count: Option<i64>,
+    tool_error_count: Option<i64>,
+    repeated_failed_tool_attempt_count: Option<i64>,
+    assistant_turn_count: Option<i64>,
+    user_turn_count: Option<i64>,
+    max_context_tokens: Option<i64>,
+    efficiency_hints_json: Option<String>,
 }
 
 pub async fn summarize_agent_runs(
@@ -82,11 +109,19 @@ pub async fn summarize_agent_runs(
                 THEN CAST(strftime('%s', COALESCE(launcher_session_data.finished_at, agent_runs.finished_at)) AS INTEGER)
                    - CAST(strftime('%s', COALESCE(launcher_session_data.started_at, agent_runs.created_at)) AS INTEGER)
                 ELSE NULL
-            END AS duration_seconds
+            END AS duration_seconds,
+            agent_run_metrics.tool_call_count AS tool_call_count,
+            agent_run_metrics.tool_error_count AS tool_error_count,
+            agent_run_metrics.repeated_failed_tool_attempt_count AS repeated_failed_tool_attempt_count,
+            agent_run_metrics.assistant_turn_count AS assistant_turn_count,
+            agent_run_metrics.user_turn_count AS user_turn_count,
+            agent_run_metrics.max_context_tokens AS max_context_tokens,
+            agent_run_metrics.efficiency_hints_json AS efficiency_hints_json
         FROM agent_runs
         JOIN tasks ON tasks.id = agent_runs.task_id
         JOIN task_queues ON task_queues.id = agent_runs.task_queue_id
         LEFT JOIN launcher_session_data ON launcher_session_data.agent_run_id = agent_runs.id
+        LEFT JOIN agent_run_metrics ON agent_run_metrics.agent_run_id = agent_runs.id
         LEFT JOIN first_integrating ON first_integrating.task_id = tasks.id
         WHERE task_queues.key = ?
         ORDER BY tasks.sequence, agent_runs.created_at, agent_runs.id
@@ -184,6 +219,8 @@ pub async fn summarize_agent_runs(
         .map(|(_, run)| run)
         .collect();
 
+    let efficiency = build_efficiency_summary(&rows);
+
     Ok(TelemetrySummary {
         queue: options.queue.clone(),
         total_runs: rows.len(),
@@ -192,6 +229,7 @@ pub async fn summarize_agent_runs(
         failed_or_timed_out_runs,
         completed_duration_seconds,
         slowest_completed_runs,
+        efficiency,
     })
 }
 
@@ -205,7 +243,65 @@ fn run_from_row(row: &TelemetryRunRow) -> TelemetryRun {
         created_at: row.created_at.clone(),
         finished_at: row.finished_at.clone(),
         duration_seconds: row.duration_seconds,
+        tool_call_count: row.tool_call_count,
+        tool_error_count: row.tool_error_count,
+        repeated_failed_tool_attempt_count: row.repeated_failed_tool_attempt_count,
+        assistant_turn_count: row.assistant_turn_count,
+        user_turn_count: row.user_turn_count,
+        max_context_tokens: row.max_context_tokens,
+        efficiency_hints_json: row.efficiency_hints_json.clone(),
     }
+}
+
+fn build_efficiency_summary(rows: &[TelemetryRunRow]) -> EfficiencyTelemetrySummary {
+    let mut summary = EfficiencyTelemetrySummary {
+        runs_with_metrics: 0,
+        total_tool_calls: 0,
+        total_tool_errors: 0,
+        total_repeated_failed_tool_attempts: 0,
+        total_assistant_turns: 0,
+        total_user_turns: 0,
+        max_context_tokens: None,
+        inefficient_runs: Vec::new(),
+    };
+    for row in rows {
+        let has_metrics = row.tool_call_count.is_some()
+            || row.tool_error_count.is_some()
+            || row.assistant_turn_count.is_some()
+            || row.user_turn_count.is_some()
+            || row.max_context_tokens.is_some();
+        if has_metrics {
+            summary.runs_with_metrics += 1;
+        }
+        summary.total_tool_calls += row.tool_call_count.unwrap_or(0);
+        summary.total_tool_errors += row.tool_error_count.unwrap_or(0);
+        summary.total_repeated_failed_tool_attempts +=
+            row.repeated_failed_tool_attempt_count.unwrap_or(0);
+        summary.total_assistant_turns += row.assistant_turn_count.unwrap_or(0);
+        summary.total_user_turns += row.user_turn_count.unwrap_or(0);
+        if let Some(tokens) = row.max_context_tokens {
+            summary.max_context_tokens = Some(summary.max_context_tokens.unwrap_or(0).max(tokens));
+        }
+        let hints = row
+            .efficiency_hints_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
+            .unwrap_or_default();
+        if !hints.is_empty()
+            || row.tool_call_count.unwrap_or(0) >= 30
+            || row.repeated_failed_tool_attempt_count.unwrap_or(0) > 0
+        {
+            summary.inefficient_runs.push(run_from_row(row));
+        }
+    }
+    summary.inefficient_runs.sort_by(|left, right| {
+        right
+            .tool_call_count
+            .unwrap_or(0)
+            .cmp(&left.tool_call_count.unwrap_or(0))
+            .then_with(|| left.task_identifier.cmp(&right.task_identifier))
+    });
+    summary
 }
 
 pub fn render_summary(summary: &TelemetrySummary) -> String {
@@ -287,6 +383,36 @@ pub fn render_summary(summary: &TelemetrySummary) -> String {
             summary.completed_duration_seconds.len()
         )
         .expect("write string");
+    }
+
+    writeln!(
+        output,
+        "efficiency metrics: {} run(s), {} tool call(s), {} tool error(s), {} repeated failed tool attempt(s), assistant/user turns {}/{}, max context tokens {}",
+        summary.efficiency.runs_with_metrics,
+        summary.efficiency.total_tool_calls,
+        summary.efficiency.total_tool_errors,
+        summary.efficiency.total_repeated_failed_tool_attempts,
+        summary.efficiency.total_assistant_turns,
+        summary.efficiency.total_user_turns,
+        summary.efficiency.max_context_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string())
+    )
+    .expect("write string");
+    if !summary.efficiency.inefficient_runs.is_empty() {
+        writeln!(output, "optimization hints:").expect("write string");
+        for run in &summary.efficiency.inefficient_runs {
+            let hints = run.efficiency_hints_json.as_deref().unwrap_or("[]");
+            writeln!(
+                output,
+                "  {} - {}: {} tool_calls={} tool_errors={} hints={}",
+                run.task_identifier,
+                run.task_title,
+                run.agent_run_id,
+                run.tool_call_count.unwrap_or(0),
+                run.tool_error_count.unwrap_or(0),
+                hints
+            )
+            .expect("write string");
+        }
     }
 
     writeln!(output, "slowest completed Agent Runs:").expect("write string");
@@ -1051,6 +1177,19 @@ mod tests {
             None,
         )
         .await;
+        sqlx::query(
+            r#"
+            INSERT INTO agent_run_metrics (
+                agent_run_id, launcher_kind, final_status, tool_call_count, tool_error_count,
+                repeated_failed_tool_attempt_count, assistant_turn_count, user_turn_count,
+                max_context_tokens, efficiency_hints_json
+            ) VALUES ('run-2', 'pi', 'completed', 42, 6, 2, 9, 4, 123456,
+                '["excessive tool calls","repeated failed tool attempts","large context growth","validation/tool loop"]')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("metrics");
 
         let summary = summarize_agent_runs(
             &pool,
@@ -1067,9 +1206,20 @@ mod tests {
         assert_eq!(summary.duplicate_tasks[0].wasted_runs, 1);
         assert_eq!(summary.post_integrating_runs.len(), 1);
         assert_eq!(summary.post_integrating_runs[0].agent_run_id, "run-2");
+        assert_eq!(summary.efficiency.runs_with_metrics, 1);
+        assert_eq!(summary.efficiency.total_tool_calls, 42);
+        assert_eq!(summary.efficiency.total_tool_errors, 6);
+        assert_eq!(summary.efficiency.total_repeated_failed_tool_attempts, 2);
+        assert_eq!(summary.efficiency.max_context_tokens, Some(123456));
+        assert_eq!(summary.efficiency.inefficient_runs[0].agent_run_id, "run-2");
+        let json = serde_json::to_value(&summary).expect("json");
+        assert_eq!(json["efficiency"]["total_tool_calls"], 42);
+        assert!(json.to_string().contains("excessive tool calls"));
+        assert!(!json.to_string().contains("brief"));
         let rendered = render_summary(&summary);
         assert!(rendered.contains("TASK-1 - Repeated work"));
         assert!(rendered.contains("post-Integrating Agent Runs: 1"));
+        assert!(rendered.contains("optimization hints:"));
     }
 
     #[tokio::test]

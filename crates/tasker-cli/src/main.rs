@@ -347,6 +347,9 @@ enum TelemetryCommand {
         /// Number of slow completed Agent Runs to list.
         #[arg(long, default_value_t = 5)]
         slow_limit: usize,
+        /// Emit machine-readable Agent Run telemetry JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Summarize Task lifecycle latency from Task State transition Audit Events.
     Lifecycle {
@@ -1197,13 +1200,22 @@ async fn telemetry(
 ) -> Result<()> {
     let pool = open_pool(paths, db_path_overridden).await?;
     match command {
-        TelemetryCommand::Summary { queue, slow_limit } => {
+        TelemetryCommand::Summary {
+            queue,
+            slow_limit,
+            json,
+        } => {
             let summary = telemetry::summarize_agent_runs(
                 &pool,
                 &telemetry::TelemetryOptions { queue, slow_limit },
             )
             .await?;
-            print!("{}", telemetry::render_summary(&summary));
+            if json {
+                serde_json::to_writer_pretty(std::io::stdout(), &summary)?;
+                println!();
+            } else {
+                print!("{}", telemetry::render_summary(&summary));
+            }
         }
         TelemetryCommand::Lifecycle { queue, limit } => {
             let summary = telemetry::lifecycle_summary(
