@@ -14,14 +14,16 @@ use crossterm::{
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
-    text::Line,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
     Frame, Terminal,
 };
 use sqlx::SqlitePool;
 
-use crate::display;
+use crate::{display, repo_lock};
+
+const NEXT_TASK_LIMIT: usize = 5;
 
 #[derive(Debug, Clone)]
 pub struct MonitorOptions {
@@ -57,6 +59,7 @@ pub struct QueueSnapshot {
     pub ready_tasks: Vec<tasker_db::TaskStatusSummary>,
     pub integrating_tasks: Vec<tasker_db::TaskStatusSummary>,
     pub integration_retries: Vec<tasker_db::IntegrationRetryStatus>,
+    pub repo_operation_lock: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -149,185 +152,358 @@ fn render_snapshot(frame: &mut Frame<'_>, snapshot: &MonitorSnapshot) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(6),
+            Constraint::Percentage(42),
             Constraint::Percentage(38),
-            Constraint::Percentage(34),
             Constraint::Length(3),
         ])
         .split(frame.area());
 
     render_header(frame, chunks[0], snapshot);
-    render_queues(frame, chunks[1], snapshot);
-    render_recent_runs(frame, chunks[2], snapshot);
+    render_attention(frame, chunks[1], snapshot);
+    render_work_board(frame, chunks[2], snapshot);
     render_footer(frame, chunks[3]);
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot) {
     let queue = snapshot.queue_filter.as_deref().unwrap_or("all");
+    let attention_count = attention_lines(snapshot).len();
+    let running_count: usize = snapshot
+        .queues
+        .iter()
+        .map(|queue| queue.active_runs.len())
+        .sum();
+    let next_count: usize = snapshot
+        .queues
+        .iter()
+        .map(|queue| queue.ready_tasks.len().min(NEXT_TASK_LIMIT))
+        .sum();
     let lines = vec![
-        Line::from("Tasker terminal status monitor"),
+        Line::from(vec![
+            Span::styled("◆ Tasker", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(" attention board"),
+        ]),
         Line::from(format!(
-            "captured at: {} | queue filter: {queue}",
-            snapshot.captured_at
+            "needs attention: {attention_count} | running: {running_count} | next shown: {next_count} | queue: {queue}"
         )),
+        Line::from(format!("captured: {}", snapshot.captured_at)),
         Line::from(format!("config: {}", snapshot.config_path.display())),
-        Line::from(format!("data: {}", snapshot.data_dir.display())),
-        Line::from(format!("database: {}", snapshot.db_path.display())),
+        Line::from(format!("data: {} | db: {}", snapshot.data_dir.display(), snapshot.db_path.display())),
     ];
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().title("Context").borders(Borders::ALL))
+            .block(Block::default().title("Status").borders(Borders::ALL))
             .wrap(Wrap { trim: true }),
         area,
     );
 }
 
-fn render_queues(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot) {
-    if snapshot.queues.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No Task Queues found")
-                .block(Block::default().title("Task Queues").borders(Borders::ALL)),
-            area,
-        );
-        return;
-    }
-
-    let rows = snapshot.queues.iter().map(|queue| {
-        let state_counts = queue
-            .state_counts
-            .iter()
-            .map(|(state, count)| format!("{state}:{count}"))
-            .collect::<Vec<_>>()
-            .join("  ");
-        Row::new(vec![
-            Cell::from(queue.key.clone()),
-            Cell::from(queue.name.clone()),
-            Cell::from(state_counts),
-            Cell::from(queue.active_agent_runs.to_string()),
-            Cell::from(queue.active_retry_holds.to_string()),
-        ])
-    });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(10),
-            Constraint::Length(22),
-            Constraint::Min(24),
-            Constraint::Length(11),
-            Constraint::Length(11),
-        ],
-    )
-    .header(
-        Row::new(["Queue", "Name", "Task States", "Agent Runs", "Retry Holds"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
-    )
-    .block(Block::default().title("Task Queues").borders(Borders::ALL));
-    frame.render_widget(table, area);
-}
-
-fn render_recent_runs(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot) {
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-
-    let mut run_lines = Vec::new();
-    for queue in &snapshot.queues {
-        for run in &queue.active_runs {
-            run_lines.push(Line::from(format!(
-                "{} {} launcher={} worker={} lease={}",
-                display::task_label(&run.task_identifier, &run.task_title, 40),
-                run.agent_run_id,
-                run.launcher_kind,
-                run.worker_id,
-                run.lease_expires_at
-            )));
-        }
-        for hold in &queue.retry_holds {
-            run_lines.push(Line::from(format!(
-                "{} retry hold until {} reason={}",
-                hold.task_identifier, hold.hold_until, hold.reason
-            )));
-        }
-        for task in &queue.ready_tasks {
-            run_lines.push(Line::from(format!(
-                "ready {} priority={}",
-                display::task_label(&task.identifier, &task.title, 40),
-                task.priority
-            )));
-        }
-        for task in &queue.integrating_tasks {
-            run_lines.push(Line::from(format!(
-                "integrating {} priority={}",
-                display::task_label(&task.identifier, &task.title, 40),
-                task.priority
-            )));
-        }
-        for retry in &queue.integration_retries {
-            run_lines.push(Line::from(format!(
-                "integration retry {} attempt={} next={} reason={}",
-                display::task_label(&retry.task_identifier, &retry.task_title, 40),
-                retry.retry_attempt.unwrap_or_default(),
-                retry.next_retry_at.as_deref().unwrap_or("operator"),
-                retry.reason.as_deref().unwrap_or("")
-            )));
-        }
-    }
-    if run_lines.is_empty() {
-        run_lines.push(Line::from(
-            "No active Agent Runs, Retry Holds, Ready Tasks, or Integrating Tasks",
-        ));
+fn render_attention(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot) {
+    let mut lines = attention_lines(snapshot);
+    if lines.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("✓", Style::default().fg(Color::Green)),
+            Span::raw(" no operator attention needed"),
+        ]));
     }
     frame.render_widget(
-        Paragraph::new(run_lines)
-            .block(Block::default().title("Active Work").borders(Borders::ALL))
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title("Needs Attention")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow)),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_work_board(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot) {
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(area);
+
+    let mut running_lines = Vec::new();
+    for queue in &snapshot.queues {
+        for run in &queue.active_runs {
+            if is_stale_lease(&run.lease_expires_at, &snapshot.captured_at) {
+                continue;
+            }
+            running_lines.push(Line::from(vec![
+                Span::styled("● ", Style::default().fg(Color::Green)),
+                Span::styled(
+                    compact_task_label(&run.task_identifier, &run.task_title, 38),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "  {}  {}",
+                    run.task_state,
+                    compact_run_id(&run.agent_run_id)
+                )),
+            ]));
+        }
+    }
+    if running_lines.is_empty() {
+        running_lines.push(Line::from("No healthy active Agent Runs"));
+    }
+    frame.render_widget(
+        Paragraph::new(running_lines)
+            .block(Block::default().title("Running").borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
         panes[0],
     );
 
-    let recent_rows = snapshot.recent_runs.iter().map(|run| {
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(panes[1]);
+
+    let mut next_lines = Vec::new();
+    for queue in &snapshot.queues {
+        for task in queue.ready_tasks.iter().take(NEXT_TASK_LIMIT) {
+            next_lines.push(Line::from(format!(
+                "› {}  {}",
+                compact_task_label(&task.identifier, &task.title, 34),
+                task.priority
+            )));
+        }
+        if queue.ready_tasks.len() > NEXT_TASK_LIMIT {
+            next_lines.push(Line::from(format!(
+                "… {} more Ready Tasks in {} (use tasker status)",
+                queue.ready_tasks.len() - NEXT_TASK_LIMIT,
+                queue.key
+            )));
+        }
+    }
+    if next_lines.is_empty() {
+        next_lines.push(Line::from("No Ready Tasks waiting"));
+    }
+    frame.render_widget(
+        Paragraph::new(next_lines)
+            .block(Block::default().title("Next").borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
+        right[0],
+    );
+
+    render_recent_runs(frame, right[1], snapshot);
+}
+
+fn render_recent_runs(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot) {
+    let recent_rows = snapshot.recent_runs.iter().take(5).map(|run| {
         Row::new(vec![
-            Cell::from(run.queue_key.clone()),
-            Cell::from(display::task_label(
+            Cell::from(compact_task_label(
                 &run.task_identifier,
                 &run.task_title,
-                28,
+                24,
             )),
             Cell::from(run.outcome.clone().unwrap_or_else(|| "active".to_string())),
-            Cell::from(run.launcher_kind.clone()),
-            Cell::from(run.worker_id.clone()),
             Cell::from(run.finished_at.clone().unwrap_or_else(|| "-".to_string())),
         ])
     });
     let table = Table::new(
         recent_rows,
         [
-            Constraint::Length(8),
-            Constraint::Length(30),
+            Constraint::Length(26),
             Constraint::Length(10),
-            Constraint::Length(10),
-            Constraint::Length(14),
-            Constraint::Min(10),
+            Constraint::Min(8),
         ],
     )
     .header(
-        Row::new(["Queue", "Task", "Outcome", "Launcher", "Worker", "Finished"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+        Row::new(["Task", "Outcome", "Finished"]).style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
     )
-    .block(
-        Block::default()
-            .title("Recent Agent Runs")
-            .borders(Borders::ALL),
-    );
-    frame.render_widget(table, panes[1]);
+    .block(Block::default().title("Recent").borders(Borders::ALL));
+    frame.render_widget(table, area);
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
-        Paragraph::new("Read-only. Keys: q/Esc/Ctrl-C quit, r refresh. Use --plain or --once for script-friendly snapshots.")
-            .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(
+            "q quit  r refresh  ? help: use `tasker monitor --help` or `tasker status` for detail",
+        )
+        .block(Block::default().borders(Borders::ALL)),
         area,
     );
+}
+
+fn attention_lines(snapshot: &MonitorSnapshot) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for queue in &snapshot.queues {
+        if let Some(lock) = &queue.repo_operation_lock {
+            lines.push(attention_line("⛔", "repo lock", lock.clone()));
+        }
+        for run in &queue.active_runs {
+            if is_stale_lease(&run.lease_expires_at, &snapshot.captured_at) {
+                lines.push(attention_line(
+                    "⚠",
+                    "stale run",
+                    format!(
+                        "{} lease expired {} worker={}",
+                        compact_task_label(&run.task_identifier, &run.task_title, 44),
+                        run.lease_expires_at,
+                        run.worker_id
+                    ),
+                ));
+            }
+        }
+        for hold in &queue.retry_holds {
+            lines.push(attention_line(
+                "⏸",
+                "retry hold",
+                format!(
+                    "{} until {} — {}",
+                    hold.task_identifier, hold.hold_until, hold.reason
+                ),
+            ));
+        }
+        for retry in &queue.integration_retries {
+            lines.push(attention_line(
+                "↻",
+                "integration",
+                format!(
+                    "{} attempt={} next={}{}",
+                    compact_task_label(&retry.task_identifier, &retry.task_title, 44),
+                    retry.retry_attempt.unwrap_or_default(),
+                    retry.next_retry_at.as_deref().unwrap_or("operator"),
+                    retry
+                        .reason
+                        .as_deref()
+                        .map(|r| format!(" — {r}"))
+                        .unwrap_or_default()
+                ),
+            ));
+        }
+        for task in &queue.integrating_tasks {
+            if !queue
+                .active_runs
+                .iter()
+                .any(|run| run.task_identifier == task.identifier)
+            {
+                lines.push(attention_line(
+                    "◈",
+                    "integrating",
+                    format!(
+                        "{} waiting for delivery progress",
+                        compact_task_label(&task.identifier, &task.title, 44)
+                    ),
+                ));
+            }
+        }
+    }
+    for run in &snapshot.recent_runs {
+        if is_attention_outcome(run.outcome.as_deref()) {
+            lines.push(attention_line(
+                "✖",
+                "failed run",
+                format!(
+                    "{} {}{}",
+                    compact_task_label(&run.task_identifier, &run.task_title, 44),
+                    run.outcome.as_deref().unwrap_or("failed"),
+                    run.failure_reason
+                        .as_deref()
+                        .map(|reason| format!(" — {reason}"))
+                        .unwrap_or_default()
+                ),
+            ));
+        }
+    }
+    lines
+}
+
+fn attention_texts(snapshot: &MonitorSnapshot) -> Vec<String> {
+    let mut lines = Vec::new();
+    for queue in &snapshot.queues {
+        if let Some(lock) = &queue.repo_operation_lock {
+            lines.push(format!("repo lock: {lock}"));
+        }
+        for run in &queue.active_runs {
+            if is_stale_lease(&run.lease_expires_at, &snapshot.captured_at) {
+                lines.push(format!(
+                    "stale run: {} lease expired {} worker={}",
+                    compact_task_label(&run.task_identifier, &run.task_title, 64),
+                    run.lease_expires_at,
+                    run.worker_id
+                ));
+            }
+        }
+        for hold in &queue.retry_holds {
+            lines.push(format!(
+                "retry hold: {} until {} — {}",
+                hold.task_identifier, hold.hold_until, hold.reason
+            ));
+        }
+        for retry in &queue.integration_retries {
+            lines.push(format!(
+                "integration: {} attempt={} next={}{}",
+                compact_task_label(&retry.task_identifier, &retry.task_title, 64),
+                retry.retry_attempt.unwrap_or_default(),
+                retry.next_retry_at.as_deref().unwrap_or("operator"),
+                retry
+                    .reason
+                    .as_deref()
+                    .map(|r| format!(" — {r}"))
+                    .unwrap_or_default()
+            ));
+        }
+        for task in &queue.integrating_tasks {
+            if !queue
+                .active_runs
+                .iter()
+                .any(|run| run.task_identifier == task.identifier)
+            {
+                lines.push(format!(
+                    "integrating: {} waiting for delivery progress",
+                    compact_task_label(&task.identifier, &task.title, 64)
+                ));
+            }
+        }
+    }
+    for run in &snapshot.recent_runs {
+        if is_attention_outcome(run.outcome.as_deref()) {
+            lines.push(format!(
+                "failed run: {} {}{}",
+                compact_task_label(&run.task_identifier, &run.task_title, 64),
+                run.outcome.as_deref().unwrap_or("failed"),
+                run.failure_reason
+                    .as_deref()
+                    .map(|reason| format!(" — {reason}"))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    lines
+}
+
+fn attention_line(icon: &'static str, label: &'static str, detail: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{icon} "), Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!("{label}: "),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(detail),
+    ])
+}
+
+fn is_attention_outcome(outcome: Option<&str>) -> bool {
+    matches!(outcome, Some("failed" | "expired" | "canceled"))
+}
+
+fn is_stale_lease(lease_expires_at: &str, captured_at: &str) -> bool {
+    lease_expires_at <= captured_at
+}
+
+fn compact_task_label(identifier: &str, title: &str, width: usize) -> String {
+    display::task_label(identifier, title, width)
+}
+
+fn compact_run_id(run_id: &str) -> String {
+    run_id.chars().take(8).collect()
 }
 
 #[cfg(test)]
@@ -408,6 +584,7 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
                 ready_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
                 integration_retries: Vec::new(),
+                repo_operation_lock: None,
             });
         queue.state_counts.push((row.state, row.task_count));
         queue.active_agent_runs = row.active_agent_runs;
@@ -435,6 +612,23 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
     for retry in integration_retries {
         if let Some(queue) = by_queue.get_mut(&retry.queue_key) {
             queue.integration_retries.push(retry);
+        }
+    }
+
+    for queue in by_queue.values_mut() {
+        if let Some(active) = repo_lock::active_lock(&options.data_dir, &queue.key)? {
+            queue.repo_operation_lock = Some(format!(
+                "{} pid={} operation={}{}",
+                queue.key,
+                active.lock.pid,
+                active.lock.operation,
+                active
+                    .lock
+                    .task_identifier
+                    .as_deref()
+                    .map(|task| format!(" task={task}"))
+                    .unwrap_or_default()
+            ));
         }
     }
 
@@ -483,7 +677,7 @@ async fn recent_agent_runs(
 }
 
 pub fn write_snapshot(mut writer: impl Write, snapshot: &MonitorSnapshot) -> io::Result<()> {
-    writeln!(writer, "Tasker terminal status monitor")?;
+    writeln!(writer, "Tasker attention board")?;
     writeln!(writer, "captured at: {}", snapshot.captured_at)?;
     writeln!(writer, "config: {}", snapshot.config_path.display())?;
     writeln!(writer, "data: {}", snapshot.data_dir.display())?;
@@ -491,83 +685,84 @@ pub fn write_snapshot(mut writer: impl Write, snapshot: &MonitorSnapshot) -> io:
     if let Some(queue) = &snapshot.queue_filter {
         writeln!(writer, "queue filter: {queue}")?;
     }
-    writeln!(writer, "keys: q/esc quit, r refresh, Ctrl-C quit")?;
+    writeln!(
+        writer,
+        "keys: q quit, r refresh; use tasker status for details"
+    )?;
 
     if snapshot.queues.is_empty() {
         writeln!(writer, "\nNo Task Queues found")?;
     }
+
+    writeln!(writer, "\nNeeds Attention:")?;
+    let attention = attention_texts(snapshot);
+    if attention.is_empty() {
+        writeln!(writer, "  ✓ none")?;
+    } else {
+        for item in attention {
+            writeln!(writer, "  {item}")?;
+        }
+    }
+
+    writeln!(writer, "\nRunning:")?;
+    let mut running = 0;
     for queue in &snapshot.queues {
-        writeln!(writer, "\nTask Queue: {}\t{}", queue.key, queue.name)?;
-        writeln!(writer, "  active Agent Runs: {}", queue.active_agent_runs)?;
         for run in &queue.active_runs {
+            if is_stale_lease(&run.lease_expires_at, &snapshot.captured_at) {
+                continue;
+            }
+            running += 1;
             writeln!(
                 writer,
-                "    {}\t{}\tlauncher={}\tworker={}\tlease_expires_at={}",
-                display::task_label(&run.task_identifier, &run.task_title, 64),
-                run.agent_run_id,
-                run.launcher_kind,
-                run.worker_id,
-                run.lease_expires_at
+                "  ● {}\tstate={}\trun={}\tworker={}",
+                compact_task_label(&run.task_identifier, &run.task_title, 64),
+                run.task_state,
+                compact_run_id(&run.agent_run_id),
+                run.worker_id
             )?;
         }
-        writeln!(writer, "  active Retry Holds: {}", queue.active_retry_holds)?;
-        for hold in &queue.retry_holds {
+    }
+    if running == 0 {
+        writeln!(writer, "  (none)")?;
+    }
+
+    writeln!(writer, "\nNext:")?;
+    let mut next = 0;
+    for queue in &snapshot.queues {
+        for task in queue.ready_tasks.iter().take(NEXT_TASK_LIMIT) {
+            next += 1;
             writeln!(
                 writer,
-                "    {}\thold_until={}\treason={}",
-                hold.task_identifier, hold.hold_until, hold.reason
-            )?;
-        }
-        for task in &queue.ready_tasks {
-            writeln!(
-                writer,
-                "    ready {}\tpriority={}",
-                display::task_label(&task.identifier, &task.title, 64),
+                "  › {}\tpriority={}",
+                compact_task_label(&task.identifier, &task.title, 64),
                 task.priority
             )?;
         }
-        for task in &queue.integrating_tasks {
+        if queue.ready_tasks.len() > NEXT_TASK_LIMIT {
             writeln!(
                 writer,
-                "    integrating {}\tpriority={}",
-                display::task_label(&task.identifier, &task.title, 64),
-                task.priority
+                "  … {} more Ready Tasks in {} (use tasker status)",
+                queue.ready_tasks.len() - NEXT_TASK_LIMIT,
+                queue.key
             )?;
         }
-        for retry in &queue.integration_retries {
-            writeln!(
-                writer,
-                "    integration retry {}\tattempt={}\tnext_retry_at={}\tretryable={}\treason={}",
-                display::task_label(&retry.task_identifier, &retry.task_title, 64),
-                retry.retry_attempt.unwrap_or_default(),
-                retry
-                    .next_retry_at
-                    .as_deref()
-                    .unwrap_or("operator intervention required"),
-                retry.retryable,
-                retry.reason.as_deref().unwrap_or("")
-            )?;
-        }
-        for (state, count) in &queue.state_counts {
-            writeln!(writer, "  {state}: {count}")?;
-        }
+    }
+    if next == 0 {
+        writeln!(writer, "  (none)")?;
     }
 
     writeln!(writer, "\nRecent Agent Runs:")?;
     if snapshot.recent_runs.is_empty() {
         writeln!(writer, "  (none)")?;
     }
-    for run in &snapshot.recent_runs {
+    for run in snapshot.recent_runs.iter().take(5) {
         let status = run.outcome.as_deref().unwrap_or("active");
         writeln!(
             writer,
-            "  {}\t{}\t{}\tlauncher={}\tworker={}\tcreated={}\tfinished={}",
+            "  {}\t{}\t{}\tfinished={}",
             run.queue_key,
-            display::task_label(&run.task_identifier, &run.task_title, 64),
+            compact_task_label(&run.task_identifier, &run.task_title, 64),
             status,
-            run.launcher_kind,
-            run.worker_id,
-            run.created_at,
             run.finished_at.as_deref().unwrap_or("-")
         )?;
         if let Some(reason) = &run.failure_reason {
@@ -709,12 +904,12 @@ mod tests {
         write_snapshot(&mut out, &snapshot).expect("write");
         let text = String::from_utf8(out).expect("utf8");
 
-        assert!(text.contains("Tasker terminal status monitor"));
+        assert!(text.contains("Tasker attention board"));
         assert!(text.contains("config: /repo/.tasker/config.toml"));
         assert!(text.contains("data: /repo/.tasker/data"));
         assert!(text.contains("database: /repo/.tasker/data/tasker.db"));
         assert!(text.contains("queue filter: TASK"));
-        assert!(text.contains("keys: q/esc quit, r refresh, Ctrl-C quit"));
+        assert!(text.contains("keys: q quit, r refresh; use tasker status for details"));
         assert!(text.contains("No Task Queues found"));
     }
 
@@ -752,6 +947,7 @@ mod tests {
                 }],
                 integrating_tasks: Vec::new(),
                 integration_retries: Vec::new(),
+                repo_operation_lock: None,
             }],
             recent_runs: vec![RecentRunSnapshot {
                 queue_key: "TASK".to_string(),
@@ -774,13 +970,13 @@ mod tests {
             .expect("draw");
         let rendered = format!("{:?}", terminal.backend().buffer());
 
-        assert!(rendered.contains("Tasker terminal status monitor"));
-        assert!(rendered.contains("config: /repo/.tasker/config.toml"));
-        assert!(rendered.contains("TASK"));
-        assert!(rendered.contains("ready:2"));
+        assert!(rendered.contains("Tasker"));
+        assert!(rendered.contains("attention board"));
+        assert!(rendered.contains("Needs Attention"));
+        assert!(rendered.contains("Next"));
         assert!(rendered.contains("Prepare monitor titles"));
-        assert!(rendered.contains("Recent Agent Runs"));
-        assert!(rendered.contains("Read-only"));
+        assert!(rendered.contains("Recent"));
+        assert!(rendered.contains("q quit"));
     }
 
     #[test]
@@ -802,6 +998,7 @@ mod tests {
                 ready_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
                 integration_retries: Vec::new(),
+                repo_operation_lock: None,
             }],
             recent_runs: Vec::new(),
         };
@@ -810,9 +1007,174 @@ mod tests {
         write_snapshot(CrLfWriter::new(&mut out), &snapshot).expect("write");
         let text = String::from_utf8(out).expect("utf8");
 
-        assert!(text.contains("Tasker terminal status monitor\r\n"));
-        assert!(text.contains("\r\nTask Queue: TASK\tTasker\r\n"));
+        assert!(text.contains("Tasker attention board\r\n"));
+        assert!(text.contains("\r\nNeeds Attention:\r\n"));
+        assert!(text.contains("\r\nRunning:\r\n"));
         assert!(!text.contains("\n  ready: 1\n"));
+    }
+
+    #[test]
+    fn attention_first_plain_output_orders_sections_and_limits_next_tasks() {
+        let ready_tasks = (1..=7)
+            .map(|index| tasker_db::TaskStatusSummary {
+                queue_key: "TASK".to_string(),
+                identifier: format!("TASK-{index}"),
+                title: format!("Ready task with a deliberately long title number {index}"),
+                state: "ready".to_string(),
+                priority: "normal".to_string(),
+            })
+            .collect();
+        let snapshot = MonitorSnapshot {
+            config_path: PathBuf::from("/repo/.tasker/config.toml"),
+            data_dir: PathBuf::from("/repo/.tasker/data"),
+            db_path: PathBuf::from("/repo/.tasker/data/tasker.db"),
+            queue_filter: Some("TASK".to_string()),
+            captured_at: "2026-05-09 00:00:00".to_string(),
+            queues: vec![QueueSnapshot {
+                key: "TASK".to_string(),
+                name: "Tasker".to_string(),
+                state_counts: vec![("ready".to_string(), 7)],
+                active_agent_runs: 0,
+                active_retry_holds: 1,
+                active_runs: Vec::new(),
+                retry_holds: vec![tasker_db::ActiveRetryHoldStatus {
+                    queue_key: "TASK".to_string(),
+                    task_identifier: "TASK-99".to_string(),
+                    hold_until: "2026-05-09 00:05:00".to_string(),
+                    reason: "agent failed".to_string(),
+                }],
+                ready_tasks,
+                integrating_tasks: Vec::new(),
+                integration_retries: Vec::new(),
+                repo_operation_lock: None,
+            }],
+            recent_runs: Vec::new(),
+        };
+        let mut out = Vec::new();
+
+        write_snapshot(&mut out, &snapshot).expect("write");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(text.find("Needs Attention:").unwrap() < text.find("Running:").unwrap());
+        assert!(text.find("Running:").unwrap() < text.find("Next:").unwrap());
+        assert!(text.contains("retry hold: TASK-99"));
+        assert!(text.contains("… 2 more Ready Tasks in TASK"));
+        assert!(!text.contains("Ready task with a deliberately long title number 6\t"));
+    }
+
+    #[test]
+    fn attention_texts_cover_stale_failed_retry_and_integrating_items() {
+        let snapshot = MonitorSnapshot {
+            config_path: PathBuf::from("/config.toml"),
+            data_dir: PathBuf::from("/data"),
+            db_path: PathBuf::from("/tasker.db"),
+            queue_filter: None,
+            captured_at: "2026-05-09 00:00:00".to_string(),
+            queues: vec![QueueSnapshot {
+                key: "TASK".to_string(),
+                name: "Tasker".to_string(),
+                state_counts: Vec::new(),
+                active_agent_runs: 1,
+                active_retry_holds: 1,
+                active_runs: vec![tasker_db::ActiveAgentRunStatus {
+                    queue_key: "TASK".to_string(),
+                    task_identifier: "TASK-1".to_string(),
+                    task_title: "Stale work".to_string(),
+                    task_state: "in_progress".to_string(),
+                    agent_run_id: "run-stale".to_string(),
+                    launcher_kind: "pi".to_string(),
+                    worker_id: "worker".to_string(),
+                    lease_expires_at: "2026-05-08 23:59:59".to_string(),
+                }],
+                retry_holds: vec![tasker_db::ActiveRetryHoldStatus {
+                    queue_key: "TASK".to_string(),
+                    task_identifier: "TASK-2".to_string(),
+                    hold_until: "2026-05-09 00:10:00".to_string(),
+                    reason: "retry later".to_string(),
+                }],
+                ready_tasks: Vec::new(),
+                integrating_tasks: vec![tasker_db::TaskStatusSummary {
+                    queue_key: "TASK".to_string(),
+                    identifier: "TASK-3".to_string(),
+                    title: "Waiting integration".to_string(),
+                    state: "integrating".to_string(),
+                    priority: "normal".to_string(),
+                }],
+                integration_retries: vec![tasker_db::IntegrationRetryStatus {
+                    queue_key: "TASK".to_string(),
+                    task_identifier: "TASK-4".to_string(),
+                    task_title: "Retry integration".to_string(),
+                    retryable: false,
+                    retry_attempt: Some(2),
+                    next_retry_at: None,
+                    reason: Some("operator needed".to_string()),
+                }],
+                repo_operation_lock: Some("TASK pid=123 operation=manual".to_string()),
+            }],
+            recent_runs: vec![RecentRunSnapshot {
+                queue_key: "TASK".to_string(),
+                task_identifier: "TASK-5".to_string(),
+                task_title: "Failed agent run".to_string(),
+                agent_run_id: "run-failed".to_string(),
+                launcher_kind: "pi".to_string(),
+                worker_id: "worker".to_string(),
+                outcome: Some("failed".to_string()),
+                failure_reason: Some("boom".to_string()),
+                created_at: "2026-05-09 00:00:00".to_string(),
+                finished_at: Some("2026-05-09 00:01:00".to_string()),
+            }],
+        };
+
+        let attention = attention_texts(&snapshot).join("\n");
+
+        assert!(attention.contains("repo lock:"));
+        assert!(attention.contains("stale run:"));
+        assert!(attention.contains("retry hold:"));
+        assert!(attention.contains("integrating:"));
+        assert!(attention.contains("integration:"));
+        assert!(attention.contains("failed run:"));
+    }
+
+    #[test]
+    fn healthy_active_runs_are_compact_and_not_attention() {
+        let snapshot = MonitorSnapshot {
+            config_path: PathBuf::from("/config.toml"),
+            data_dir: PathBuf::from("/data"),
+            db_path: PathBuf::from("/tasker.db"),
+            queue_filter: None,
+            captured_at: "2026-05-09 00:00:00".to_string(),
+            queues: vec![QueueSnapshot {
+                key: "TASK".to_string(),
+                name: "Tasker".to_string(),
+                state_counts: Vec::new(),
+                active_agent_runs: 1,
+                active_retry_holds: 0,
+                active_runs: vec![tasker_db::ActiveAgentRunStatus {
+                    queue_key: "TASK".to_string(),
+                    task_identifier: "TASK-1".to_string(),
+                    task_title: "Healthy active run with verbose title".to_string(),
+                    task_state: "in_progress".to_string(),
+                    agent_run_id: "1234567890abcdef".to_string(),
+                    launcher_kind: "pi".to_string(),
+                    worker_id: "worker".to_string(),
+                    lease_expires_at: "2026-05-09 00:01:00".to_string(),
+                }],
+                retry_holds: Vec::new(),
+                ready_tasks: Vec::new(),
+                integrating_tasks: Vec::new(),
+                integration_retries: Vec::new(),
+                repo_operation_lock: None,
+            }],
+            recent_runs: Vec::new(),
+        };
+        let mut out = Vec::new();
+
+        write_snapshot(&mut out, &snapshot).expect("write");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(attention_texts(&snapshot).is_empty());
+        assert!(text.contains("● TASK-1"));
+        assert!(text.contains("run=12345678"));
     }
 
     #[test]
