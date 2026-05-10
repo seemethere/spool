@@ -11,6 +11,7 @@ use tasker_config::{ensure_data_dir, PathOverrides, TaskerConfig, TaskerPaths};
 
 mod bootstrap;
 mod cleanup;
+mod monitor;
 mod output;
 mod supervisor;
 mod worker;
@@ -52,6 +53,21 @@ enum Command {
     },
     /// Show Tasker queue and Task State counts.
     Status,
+    /// Open a read-only terminal Task status monitor.
+    Monitor {
+        /// Optional Task Queue Key filter.
+        #[arg(long)]
+        queue: Option<String>,
+        /// Refresh interval in seconds.
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
+        refresh_seconds: u64,
+        /// Print one plain snapshot instead of using terminal control sequences.
+        #[arg(long)]
+        plain: bool,
+        /// Print one snapshot and exit.
+        #[arg(long)]
+        once: bool,
+    },
     /// Run a Worker Loop.
     Work {
         /// Task Queue Key to claim from.
@@ -414,6 +430,22 @@ async fn main() -> Result<()> {
         Some(Command::Queue { command }) => queue(&paths, db_path_overridden, command).await,
         Some(Command::Task { command }) => task(&paths, db_path_overridden, command).await,
         Some(Command::Status) => status(&paths, db_path_overridden).await,
+        Some(Command::Monitor {
+            queue,
+            refresh_seconds,
+            plain,
+            once,
+        }) => {
+            monitor(
+                &paths,
+                db_path_overridden,
+                queue,
+                refresh_seconds,
+                plain,
+                once,
+            )
+            .await
+        }
         Some(Command::Work {
             queue,
             once,
@@ -589,7 +621,7 @@ fn command_is_unsafe_mutation(command: &Option<Command>) -> bool {
         Some(Command::Run { command }) => matches!(command, RunCommand::Fail { .. }),
         Some(Command::Cleanup { command }) => cleanup_command_is_unsafe_mutation(command),
         Some(Command::Merge { command }) => matches!(command, MergeCommand::Done { .. }),
-        Some(Command::Status | Command::Version) | None => false,
+        Some(Command::Status | Command::Monitor { .. } | Command::Version) | None => false,
     }
 }
 
@@ -913,6 +945,34 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn monitor(
+    paths: &TaskerPaths,
+    db_path_overridden: bool,
+    queue: Option<String>,
+    refresh_seconds: u64,
+    plain: bool,
+    once: bool,
+) -> Result<()> {
+    let mut config = TaskerConfig::load_or_default(paths)?;
+    if db_path_overridden {
+        config.database.path = paths.db_path.clone();
+    }
+    let pool = tasker_db::connect(&config.database.path).await?;
+    tasker_db::run_migrations(&pool).await?;
+    monitor::run_monitor(
+        &pool,
+        monitor::MonitorOptions {
+            queue,
+            refresh_seconds,
+            plain,
+            once,
+            config_path: paths.config_path.clone(),
+            db_path: config.database.path,
+        },
+    )
+    .await
 }
 
 async fn work(paths: &TaskerPaths, db_path_overridden: bool, options: WorkOptions) -> Result<()> {

@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+crossterm = "0.28"
 tasker-config = { path = "../tasker-config" }
 tasker-db = { path = "../tasker-db" }
 tasker-server = { path = "../tasker-server" }
