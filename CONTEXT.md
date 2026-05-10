@@ -204,6 +204,10 @@ _Avoid_: Silent exception
 A lightweight metadata label used to categorize **Tasks** without changing scheduling behavior.
 _Avoid_: Linear label, scheduling rule
 
+**Task Conflict Hint**:
+A lightweight advisory path or documentation-area marker that says a **Task** is expected to touch that repository area, used to spot overlap among Ready or In Progress Tasks.
+_Avoid_: Blocking dependency, scheduler lock, merge-conflict guarantee
+
 **Task Link**:
 A typed reference attached to a **Task**, such as a worktree path, branch, diff, log, chat thread, or media artifact.
 _Avoid_: Built-in GitHub integration, pull-request-only model
@@ -435,6 +439,10 @@ _Avoid_: Separate progress comment
 - Substantive edits to **Acceptance Criteria** or **Validation Items** reset their status to pending.
 - A **Task** may have many **Task Tags**.
 - **Task Tags** do not affect v1 scheduling or eligibility.
+- A **Task** may have many **Task Conflict Hints**.
+- **Task Conflict Hints** are advisory and do not block claiming by default.
+- Operators use **Task Conflict Hints** during dogfooding to sequence or review overlapping Ready or In Progress Tasks more deliberately.
+- **Bootstrap Task Creation** may populate **Task Conflict Hints** from structured YAML front matter; Workpad Note Markdown remains narrative and is not authoritative for gates or scheduling.
 - A **Task** may have many **Task Links**.
 - A **Delivery Adapter** performs **Delivery Backend** operations outside Tasker.
 - Tasker stores **Delivery Records** and **Integration Outcomes**.

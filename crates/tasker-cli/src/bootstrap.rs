@@ -11,6 +11,8 @@ struct BootstrapFrontMatter {
     acceptance_criteria: Option<Vec<String>>,
     validation_items: Option<Vec<String>>,
     tags: Option<Vec<String>>,
+    #[serde(default, alias = "anticipated_touched_files", alias = "touched_files")]
+    conflict_hints: Option<Vec<String>>,
     review_required: Option<bool>,
 }
 
@@ -39,6 +41,7 @@ pub fn parse_bootstrap_task(
         acceptance_criteria: front_matter.acceptance_criteria.unwrap_or_default(),
         validation_items: front_matter.validation_items.unwrap_or_default(),
         tags: front_matter.tags.unwrap_or_default(),
+        conflict_hints: front_matter.conflict_hints.unwrap_or_default(),
     })
 }
 
@@ -73,6 +76,24 @@ mod tests {
         assert_eq!(parsed.priority, "normal");
         assert_eq!(parsed.state, "ready");
         assert_eq!(parsed.brief, "Brief");
+    }
+
+    #[test]
+    fn parser_reads_conflict_hints_aliases() {
+        let parsed = parse_bootstrap_task(
+            "TASK",
+            "inline",
+            "---\ntitle: Test\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\nanticipated_touched_files:\n  - AGENTS.md\n  - docs/PRE_DOGFOODING_LOOP.md\n---\nBrief\n",
+        )
+        .expect("parse");
+
+        assert_eq!(
+            parsed.conflict_hints,
+            vec![
+                "AGENTS.md".to_string(),
+                "docs/PRE_DOGFOODING_LOOP.md".to_string()
+            ]
+        );
     }
 
     #[test]

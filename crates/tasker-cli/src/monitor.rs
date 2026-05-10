@@ -355,6 +355,7 @@ mod tests {
                 acceptance_criteria: vec!["criterion".to_string()],
                 validation_items: vec!["validation".to_string()],
                 tags: Vec::new(),
+                conflict_hints: Vec::new(),
             },
             &tasker_db::Actor::operator("tester"),
         )

@@ -51,6 +51,26 @@ pub fn write_task_detail(mut writer: impl Write, detail: &tasker_db::TaskDetail)
             )?;
         }
     }
+    writeln!(writer, "\nTask Conflict Hints:")?;
+    if detail.conflict_hints.is_empty() {
+        writeln!(writer, "(none)")?;
+    } else {
+        for hint in &detail.conflict_hints {
+            writeln!(writer, "  {}. {}", hint.position, hint.target)?;
+        }
+    }
+    writeln!(writer, "\nPotential Overlaps:")?;
+    if detail.conflict_overlaps.is_empty() {
+        writeln!(writer, "(none)")?;
+    } else {
+        for overlap in &detail.conflict_overlaps {
+            writeln!(
+                writer,
+                "  {} -> {} [{}] {}",
+                overlap.target, overlap.task_identifier, overlap.state, overlap.title
+            )?;
+        }
+    }
     writeln!(writer, "\nWorkpad Note:")?;
     if let Some(note) = &detail.workpad_note {
         writeln!(writer, "{}", note.body)?;
@@ -369,6 +389,8 @@ mod tests {
                 tags: Vec::new(),
                 workpad_note: None,
                 task_links: Vec::new(),
+                conflict_hints: Vec::new(),
+                conflict_overlaps: Vec::new(),
             },
             launcher_session_data: Some(tasker_db::LauncherSessionData {
                 agent_run_id: "run-1".to_string(),
