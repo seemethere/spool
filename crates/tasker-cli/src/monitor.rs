@@ -9,8 +9,15 @@ use anyhow::{Context, Result};
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyModifiers},
-    execute,
-    terminal::{self, ClearType},
+    execute, terminal,
+};
+use ratatui::{
+    backend::{Backend, CrosstermBackend},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
+    text::Line,
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
+    Frame, Terminal,
 };
 use sqlx::SqlitePool;
 
@@ -76,29 +83,36 @@ pub async fn run_monitor(pool: &SqlitePool, options: MonitorOptions) -> Result<(
         let _ = terminal::disable_raw_mode();
         return Err(error).context("failed to enter terminal monitor");
     }
-    let result = run_terminal_loop(pool, &options, &mut stdout).await;
-    let cleanup = execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen)
-        .context("failed to leave terminal monitor")
-        .and_then(|_| terminal::disable_raw_mode().context("failed to disable terminal raw mode"));
-    result.and(cleanup)
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = match Terminal::new(backend) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            let _ = terminal::disable_raw_mode();
+            return Err(error).context("failed to initialize terminal monitor");
+        }
+    };
+    let result = run_terminal_loop(pool, &options, &mut terminal).await;
+    let show_cursor = terminal
+        .show_cursor()
+        .context("failed to show terminal cursor");
+    let leave_screen = execute!(terminal.backend_mut(), terminal::LeaveAlternateScreen)
+        .context("failed to leave terminal monitor");
+    let disable_raw = terminal::disable_raw_mode().context("failed to disable terminal raw mode");
+    result.and(show_cursor).and(leave_screen).and(disable_raw)
 }
 
-async fn run_terminal_loop(
+async fn run_terminal_loop<B: Backend>(
     pool: &SqlitePool,
     options: &MonitorOptions,
-    stdout: &mut io::Stdout,
+    terminal: &mut Terminal<B>,
 ) -> Result<()> {
     let refresh = Duration::from_secs(options.refresh_seconds.max(1));
     loop {
         let snapshot = load_snapshot(pool, options).await?;
-        execute!(
-            stdout,
-            cursor::MoveTo(0, 0),
-            terminal::Clear(ClearType::All)
-        )
-        .context("failed to redraw terminal monitor")?;
-        write_snapshot(CrLfWriter::new(&mut *stdout), &snapshot)?;
-        stdout.flush()?;
+        terminal
+            .draw(|frame| render_snapshot(frame, &snapshot))
+            .context("failed to redraw terminal monitor")?;
 
         let deadline = std::time::Instant::now() + refresh;
         loop {
@@ -123,16 +137,174 @@ async fn run_terminal_loop(
     }
 }
 
+fn render_snapshot(frame: &mut Frame<'_>, snapshot: &MonitorSnapshot) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Percentage(38),
+            Constraint::Percentage(34),
+            Constraint::Length(3),
+        ])
+        .split(frame.area());
+
+    render_header(frame, chunks[0], snapshot);
+    render_queues(frame, chunks[1], snapshot);
+    render_recent_runs(frame, chunks[2], snapshot);
+    render_footer(frame, chunks[3]);
+}
+
+fn render_header(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot) {
+    let queue = snapshot.queue_filter.as_deref().unwrap_or("all");
+    let lines = vec![
+        Line::from("Tasker terminal status monitor"),
+        Line::from(format!(
+            "captured at: {} | queue filter: {queue}",
+            snapshot.captured_at
+        )),
+        Line::from(format!("config: {}", snapshot.config_path.display())),
+        Line::from(format!("database: {}", snapshot.db_path.display())),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().title("Context").borders(Borders::ALL))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_queues(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot) {
+    if snapshot.queues.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No Task Queues found")
+                .block(Block::default().title("Task Queues").borders(Borders::ALL)),
+            area,
+        );
+        return;
+    }
+
+    let rows = snapshot.queues.iter().map(|queue| {
+        let state_counts = queue
+            .state_counts
+            .iter()
+            .map(|(state, count)| format!("{state}:{count}"))
+            .collect::<Vec<_>>()
+            .join("  ");
+        Row::new(vec![
+            Cell::from(queue.key.clone()),
+            Cell::from(queue.name.clone()),
+            Cell::from(state_counts),
+            Cell::from(queue.active_agent_runs.to_string()),
+            Cell::from(queue.active_retry_holds.to_string()),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(10),
+            Constraint::Length(22),
+            Constraint::Min(24),
+            Constraint::Length(11),
+            Constraint::Length(11),
+        ],
+    )
+    .header(
+        Row::new(["Queue", "Name", "Task States", "Agent Runs", "Retry Holds"])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(Block::default().title("Task Queues").borders(Borders::ALL));
+    frame.render_widget(table, area);
+}
+
+fn render_recent_runs(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot) {
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    let mut run_lines = Vec::new();
+    for queue in &snapshot.queues {
+        for run in &queue.active_runs {
+            run_lines.push(Line::from(format!(
+                "{} {} launcher={} worker={} lease={}",
+                run.task_identifier,
+                run.agent_run_id,
+                run.launcher_kind,
+                run.worker_id,
+                run.lease_expires_at
+            )));
+        }
+        for hold in &queue.retry_holds {
+            run_lines.push(Line::from(format!(
+                "{} retry hold until {} reason={}",
+                hold.task_identifier, hold.hold_until, hold.reason
+            )));
+        }
+    }
+    if run_lines.is_empty() {
+        run_lines.push(Line::from("No active Agent Runs or Retry Holds"));
+    }
+    frame.render_widget(
+        Paragraph::new(run_lines)
+            .block(Block::default().title("Active Work").borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
+        panes[0],
+    );
+
+    let recent_rows = snapshot.recent_runs.iter().map(|run| {
+        Row::new(vec![
+            Cell::from(run.queue_key.clone()),
+            Cell::from(run.task_identifier.clone()),
+            Cell::from(run.outcome.clone().unwrap_or_else(|| "active".to_string())),
+            Cell::from(run.launcher_kind.clone()),
+            Cell::from(run.worker_id.clone()),
+            Cell::from(run.finished_at.clone().unwrap_or_else(|| "-".to_string())),
+        ])
+    });
+    let table = Table::new(
+        recent_rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(14),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(14),
+            Constraint::Min(10),
+        ],
+    )
+    .header(
+        Row::new(["Queue", "Task", "Outcome", "Launcher", "Worker", "Finished"])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(
+        Block::default()
+            .title("Recent Agent Runs")
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(table, panes[1]);
+}
+
+fn render_footer(frame: &mut Frame<'_>, area: Rect) {
+    frame.render_widget(
+        Paragraph::new("Read-only. Keys: q/Esc/Ctrl-C quit, r refresh. Use --plain or --once for script-friendly snapshots.")
+            .block(Block::default().borders(Borders::ALL)),
+        area,
+    );
+}
+
+#[cfg(test)]
 struct CrLfWriter<W> {
     inner: W,
 }
 
+#[cfg(test)]
 impl<W> CrLfWriter<W> {
     fn new(inner: W) -> Self {
         Self { inner }
     }
 }
 
+#[cfg(test)]
 impl<W: Write> Write for CrLfWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         for byte in buf {
@@ -455,6 +627,50 @@ mod tests {
         write!(CrLfWriter::new(&mut out), "one\ntwo\n").expect("write");
 
         assert_eq!(String::from_utf8(out).expect("utf8"), "one\r\ntwo\r\n");
+    }
+
+    #[test]
+    fn ratatui_tui_render_includes_context_and_task_queue_status() {
+        let snapshot = MonitorSnapshot {
+            config_path: PathBuf::from("/repo/.tasker/config.toml"),
+            db_path: PathBuf::from("/repo/.tasker/data/tasker.db"),
+            queue_filter: Some("TASK".to_string()),
+            captured_at: "2026-05-09 00:00:00".to_string(),
+            queues: vec![QueueSnapshot {
+                key: "TASK".to_string(),
+                name: "Tasker".to_string(),
+                state_counts: vec![("ready".to_string(), 2), ("in_progress".to_string(), 1)],
+                active_agent_runs: 1,
+                active_retry_holds: 0,
+                active_runs: Vec::new(),
+                retry_holds: Vec::new(),
+            }],
+            recent_runs: vec![RecentRunSnapshot {
+                queue_key: "TASK".to_string(),
+                task_identifier: "TASK-46".to_string(),
+                agent_run_id: "run-1".to_string(),
+                launcher_kind: "pi".to_string(),
+                worker_id: "worker".to_string(),
+                outcome: Some("completed".to_string()),
+                failure_reason: None,
+                created_at: "2026-05-09 00:00:00".to_string(),
+                finished_at: Some("2026-05-09 00:01:00".to_string()),
+            }],
+        };
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| render_snapshot(frame, &snapshot))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("Tasker terminal status monitor"));
+        assert!(rendered.contains("config: /repo/.tasker/config.toml"));
+        assert!(rendered.contains("TASK"));
+        assert!(rendered.contains("ready:2"));
+        assert!(rendered.contains("Recent Agent Runs"));
+        assert!(rendered.contains("Read-only"));
     }
 
     #[test]
