@@ -1,6 +1,6 @@
 # Tasker monitor smoke checklist
 
-`tasker monitor` is a read-only terminal status monitor for operator observability. Interactive mode uses raw terminal mode plus the alternate screen; plain mode prints a normal snapshot without terminal control sequences.
+`tasker monitor` is a read-only terminal status monitor for operator observability. Interactive mode uses ratatui on top of raw terminal mode plus the alternate screen; plain mode prints a normal snapshot without terminal control sequences.
 
 ## Plain fallback
 
@@ -19,7 +19,7 @@ Equivalent installed-binary form:
 tasker monitor --queue TASKER --once --plain
 ```
 
-If stdout is not an interactive terminal or `TERM=dumb`, `tasker monitor` falls back to one plain snapshot and warns that stdout is not an interactive terminal.
+If stdout is not an interactive terminal or `TERM=dumb`, `tasker monitor` falls back to one plain snapshot and warns that stdout is not an interactive terminal. The ratatui path is intentionally read-only and focuses on Task Queues, Task State counts, active Agent Runs, Retry Holds, recent Agent Run outcomes, and active config/database context.
 
 ## Remote terminal and tmux smoke
 
@@ -37,4 +37,4 @@ Run this opt-in smoke from the operator environment Tasker is used in, especiall
 4. Press `r` to refresh, then `q`, `Esc`, or `Ctrl-C` to quit.
 5. If rendering is not trustworthy, rerun the documented plain fallback command above and capture the terminal type with `echo "$TERM"`.
 
-This smoke is not deterministic CI coverage; it validates raw-mode rendering in the real operator terminal. Deterministic coverage lives in the `tasker-cli` monitor tests, including raw-mode newline normalization.
+This smoke is not deterministic CI coverage; it validates ratatui/raw-mode rendering in the real operator terminal. Deterministic coverage lives in the `tasker-cli` monitor tests, including a ratatui `TestBackend` render check and raw-mode newline normalization for the plain renderer.
