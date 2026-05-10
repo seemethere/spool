@@ -1,4 +1,5 @@
-import type { Actor, CreateChildTaskInput, RequirementStatusInput, TaskerExtensionConfig } from "./types";
+import { appendFileSync } from "node:fs";
+import type { Actor, CreateChildTaskInput, RequirementStatusInput, TaskerExtensionConfig, WorkerStatusReportInput } from "./types";
 
 export class TaskerClient {
   private readonly apiUrl: string;
@@ -67,6 +68,22 @@ export class TaskerClient {
     }, signal);
   }
 
+  reportWorkerStatus(input: WorkerStatusReportInput, actor: Actor, workerStatusPath?: string): unknown {
+    const report = {
+      tasker_worker_status: true,
+      task_identifier: input.identifier,
+      agent_run_id: input.agent_run_id ?? null,
+      status: input.status,
+      message: input.message ?? null,
+      actor,
+      reported_at: new Date().toISOString(),
+    };
+    if (workerStatusPath) {
+      appendFileSync(workerStatusPath, `${JSON.stringify(report)}\n`);
+    }
+    return report;
+  }
+
   private async request(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<unknown> {
     const response = await fetch(`${this.apiUrl}${path}`, {
       method,
@@ -108,5 +125,6 @@ export function configFromEnv(env: Record<string, string | undefined> = process.
       display_name: env.TASKER_ACTOR_DISPLAY_NAME ?? actorId,
     },
     agentRunId: env.TASKER_AGENT_RUN_ID,
+    workerStatusPath: env.TASKER_WORKER_STATUS_PATH,
   };
 }

@@ -854,11 +854,14 @@ async fn supervise(
     .await?;
 
     println!(
-        "supervisor summary: started={} completed={} failed={} no_eligible={} stuck_runs={} timed_out={}",
+        "supervisor summary: started={} completed={} failed={} no_eligible={} completed_handoffs={} blocked_reports={} retryable_failures={} stuck_runs={} timed_out={}",
         outcome.started_workers,
         outcome.completed_workers,
         outcome.failed_workers,
         outcome.no_eligible_exits,
+        outcome.completed_handoffs,
+        outcome.blocked_reports,
+        outcome.retryable_failure_reports,
         outcome.stuck_runs.len(),
         outcome.timed_out
     );

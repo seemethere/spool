@@ -11,7 +11,8 @@ Set these environment variables before loading the extension:
 - `TASKER_ACTOR_KIND` (default: `worker_agent`)
 - `TASKER_ACTOR_ID` or `TASKER_ACTOR` (default: `pi-worker`)
 - `TASKER_ACTOR_DISPLAY_NAME` (default: actor id)
-- `TASKER_AGENT_RUN_ID` (optional; used by transition requests when a tool call does not supply one)
+- `TASKER_AGENT_RUN_ID` (optional; used by transition requests and worker status reports when a tool call does not supply one)
+- `TASKER_WORKER_STATUS_PATH` (optional; JSONL path used by `tasker supervise` for Worker Agent status reports)
 
 ## Tools
 
@@ -22,8 +23,9 @@ Set these environment variables before loading the extension:
 - `tasker_set_validation_item_status` accepts `pending`, `passed`, `failed`, or `waived`.
 - `tasker_create_child_task`
 - `tasker_request_transition` accepts the fixed v1 Task State values.
+- `tasker_report_worker_status` records supervisor-only status (`completion_intent`, `blocked`, or `retryable_failure`) without changing Tasker state.
 
-All mutations send explicit Tasker Actor attribution. The extension does not shell out to the Tasker CLI. Existing replace-style Workpad Note updates remain available for callers that need to rewrite the full note.
+All mutations send explicit Tasker Actor attribution. The extension does not shell out to the Tasker CLI. Existing replace-style Workpad Note updates remain available for callers that need to rewrite the full note. Worker status reports are a local supervisor contract, not authoritative Tasker state.
 
 ## Worker Loop usage
 

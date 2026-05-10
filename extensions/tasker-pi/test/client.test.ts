@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { TaskerClient, configFromEnv } from "../src/client";
 
 const originalFetch = globalThis.fetch;
@@ -99,6 +102,32 @@ describe("TaskerClient", () => {
       agent_run_id: "run-1",
     });
   });
+
+  it("writes supervisor-readable worker status reports", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tasker-status-"));
+    try {
+      const path = join(dir, "worker.jsonl");
+      const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+
+      const report = client.reportWorkerStatus(
+        { identifier: "TASK-1", status: "completion_intent", message: "handed off", agent_run_id: "run-1" },
+        actor,
+        path,
+      ) as any;
+
+      expect(report.tasker_worker_status).toBe(true);
+      const line = JSON.parse(readFileSync(path, "utf8"));
+      expect(line).toMatchObject({
+        tasker_worker_status: true,
+        task_identifier: "TASK-1",
+        agent_run_id: "run-1",
+        status: "completion_intent",
+        message: "handed off",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("configFromEnv", () => {
@@ -117,5 +146,14 @@ describe("configFromEnv", () => {
     expect(config.actor.kind).toBe("worker_agent");
     expect(config.actor.id).toBe("worker-1");
     expect(config.agentRunId).toBe("run-1");
+  });
+
+  it("captures the supervisor worker status path", () => {
+    const config = configFromEnv({
+      TASKER_API_TOKEN: "token",
+      TASKER_WORKER_STATUS_PATH: "/tmp/status.jsonl",
+    });
+
+    expect(config.workerStatusPath).toBe("/tmp/status.jsonl");
   });
 });

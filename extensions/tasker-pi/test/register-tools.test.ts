@@ -24,6 +24,7 @@ describe("registerTaskerExtension", () => {
       "tasker_append_workpad",
       "tasker_create_child_task",
       "tasker_get_task",
+      "tasker_report_worker_status",
       "tasker_request_transition",
       "tasker_set_acceptance_criterion_status",
       "tasker_set_validation_item_status",
@@ -57,5 +58,10 @@ describe("registerTaskerExtension", () => {
     expect(byName.tasker_request_transition.properties.to_state.anyOf.map((item: any) => item.const)).toContain(
       "integrating",
     );
+    expect(byName.tasker_report_worker_status.properties.status.anyOf.map((item: any) => item.const)).toEqual([
+      "completion_intent",
+      "blocked",
+      "retryable_failure",
+    ]);
   });
 });

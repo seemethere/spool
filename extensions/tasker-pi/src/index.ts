@@ -57,6 +57,17 @@ const TransitionParams = Type.Object({
   to_state: TaskState,
   agent_run_id: Type.Optional(Type.String()),
 });
+const WorkerStatus = Type.Union([
+  Type.Literal("completion_intent"),
+  Type.Literal("blocked"),
+  Type.Literal("retryable_failure"),
+]);
+const WorkerStatusParams = Type.Object({
+  identifier: Identifier,
+  status: WorkerStatus,
+  message: Type.Optional(Type.String()),
+  agent_run_id: Type.Optional(Type.String()),
+});
 
 function asToolResult(details: unknown): TaskerToolResult {
   return {
@@ -144,6 +155,22 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
           config.actor,
           params.agent_run_id ?? config.agentRunId,
           signal,
+        ),
+      );
+    },
+  });
+
+  pi.registerTool({
+    name: "tasker_report_worker_status",
+    label: "Tasker: Report Worker Status",
+    description: "Report completion intent, blocked state, or retryable failure to the Worker Loop supervisor without changing Tasker state.",
+    parameters: WorkerStatusParams,
+    async execute(_id, params) {
+      return asToolResult(
+        client.reportWorkerStatus(
+          { ...params, agent_run_id: params.agent_run_id ?? config.agentRunId },
+          config.actor,
+          config.workerStatusPath,
         ),
       );
     },

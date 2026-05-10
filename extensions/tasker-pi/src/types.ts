@@ -9,6 +9,7 @@ export interface TaskerExtensionConfig {
   apiToken: string;
   actor: Actor;
   agentRunId?: string;
+  workerStatusPath?: string;
 }
 
 export interface TaskerToolResult {
@@ -50,4 +51,13 @@ export interface CreateChildTaskInput {
   tags?: string[];
   review_required?: boolean;
   blocks_parent?: boolean;
+}
+
+export type WorkerStatus = "completion_intent" | "blocked" | "retryable_failure";
+
+export interface WorkerStatusReportInput {
+  identifier: string;
+  status: WorkerStatus;
+  message?: string;
+  agent_run_id?: string;
 }
