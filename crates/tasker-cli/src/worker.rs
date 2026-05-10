@@ -73,28 +73,29 @@ pub async fn run_worker_once(
         });
     };
 
-    let worktree_path = match prepare_local_worktree(pool, &claimed.task, &actor).await {
-        Ok(path) => path,
-        Err(error) => {
-            let failure_reason = format!("Local Worktree setup failed after claim: {error:#}");
-            let finished = tasker_db::finish_run(
-                pool,
-                &claimed.run.id,
-                &tasker_db::FinishRunInput {
-                    outcome: "failed".to_string(),
-                    failure_reason: Some(failure_reason),
-                    retry_hold_seconds: request.retry_hold_seconds,
-                },
-                &actor,
-            )
-            .await?;
-            return Ok(WorkOnceOutcome::Finished {
-                task_identifier: claimed.task.task.identifier,
-                run_id: finished.id,
-                outcome: finished.outcome.unwrap_or_else(|| "unknown".to_string()),
-            });
-        }
-    };
+    let prepared_worktree =
+        match prepare_local_worktree(pool, &claimed.task, &actor, &request.data_dir).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let failure_reason = format!("Local Worktree setup failed after claim: {error:#}");
+                let finished = tasker_db::finish_run(
+                    pool,
+                    &claimed.run.id,
+                    &tasker_db::FinishRunInput {
+                        outcome: "failed".to_string(),
+                        failure_reason: Some(failure_reason),
+                        retry_hold_seconds: request.retry_hold_seconds,
+                    },
+                    &actor,
+                )
+                .await?;
+                return Ok(WorkOnceOutcome::Finished {
+                    task_identifier: claimed.task.task.identifier,
+                    run_id: finished.id,
+                    outcome: finished.outcome.unwrap_or_else(|| "unknown".to_string()),
+                });
+            }
+        };
     tasker_db::heartbeat_run(pool, &claimed.run.id, request.lease_seconds, &actor).await?;
     let transcript_dir = request.data_dir.join("runs").join(&claimed.run.id);
     fs::create_dir_all(&transcript_dir).with_context(|| {
@@ -112,7 +113,7 @@ pub async fn run_worker_once(
             &request,
             &claimed,
             &actor,
-            &worktree_path,
+            &prepared_worktree,
             &transcript_dir,
         )
         .await?
@@ -204,29 +205,40 @@ async fn run_pi_launcher(
     request: &WorkOnceRequest,
     claimed: &tasker_db::ClaimedRun,
     actor: &tasker_db::Actor,
-    worktree_path: &Path,
+    prepared_worktree: &PreparedLocalWorktree,
     transcript_dir: &Path,
 ) -> Result<LauncherResult> {
     let transcript_path = transcript_dir.join("pi.jsonl");
     let prompt = build_worker_prompt(
         &claimed.task,
         &claimed.run,
-        worktree_path,
+        &prepared_worktree.path,
+        &prepared_worktree.shared_cargo_target_dir,
         request.worker_prompt.as_deref(),
     )?;
+    fs::create_dir_all(&prepared_worktree.shared_cargo_target_dir).with_context(|| {
+        format!(
+            "failed to create shared Cargo target directory {}",
+            prepared_worktree.shared_cargo_target_dir.display()
+        )
+    })?;
     let mut command = Command::new(&request.pi_bin);
     command.arg("--mode").arg("rpc");
     if let Some(extension) = &request.pi_extension {
         command.arg("--extension").arg(extension);
     }
     let mut child = match command
-        .current_dir(worktree_path)
+        .current_dir(&prepared_worktree.path)
         .env("TASKER_API_URL", &request.api_url)
         .env("TASKER_API_TOKEN", &request.api_token)
         .env("TASKER_ACTOR_KIND", "worker_agent")
         .env("TASKER_ACTOR_ID", &actor.id)
         .env("TASKER_ACTOR_DISPLAY_NAME", &actor.display_name)
         .env("TASKER_AGENT_RUN_ID", &claimed.run.id)
+        .env(
+            "CARGO_TARGET_DIR",
+            &prepared_worktree.shared_cargo_target_dir,
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -500,6 +512,7 @@ fn build_worker_prompt(
     task: &tasker_db::TaskDetail,
     run: &tasker_db::AgentRun,
     worktree_path: &Path,
+    shared_cargo_target_dir: &Path,
     prompt_path: Option<&Path>,
 ) -> Result<String> {
     let base = if let Some(path) = prompt_path {
@@ -509,12 +522,13 @@ fn build_worker_prompt(
         "You are a Tasker Worker Agent running unattended. Do not ask questions or open interactive UI. Use the Tasker Pi Extension tools to read and update Tasker state, Workpad Notes, requirements, child tasks, and transitions.".to_string()
     };
     Ok(format!(
-        "{base}\n\nTask Identifier: {}\nTask Title: {}\nTask State: {}\nAgent Run ID: {}\nLocal Worktree: {}\nUse Tasker Pi Extension tools for Tasker mutations. When finished, update criteria/validation/workpad and request the appropriate Task State Transition.\n",
+        "{base}\n\nTask Identifier: {}\nTask Title: {}\nTask State: {}\nAgent Run ID: {}\nLocal Worktree: {}\nShared Cargo Target Directory: {}\nCargo commands inherit CARGO_TARGET_DIR so Rust build artifacts are shared across Worker Agent Local Worktrees for this Managed Source Repository. This Tasker-managed directory is safe to delete when reclaiming space.\nUse Tasker Pi Extension tools for Tasker mutations. When finished, update criteria/validation/workpad and request the appropriate Task State Transition.\n",
         task.task.identifier,
         task.task.title,
         task.task.state,
         run.id,
-        worktree_path.display()
+        worktree_path.display(),
+        shared_cargo_target_dir.display()
     ))
 }
 
@@ -555,11 +569,18 @@ fn scan_pi_rpc_stdout(output: &str) -> PiRpcEventScan {
     scan
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedLocalWorktree {
+    path: PathBuf,
+    shared_cargo_target_dir: PathBuf,
+}
+
 async fn prepare_local_worktree(
     pool: &SqlitePool,
     task: &tasker_db::TaskDetail,
     actor: &tasker_db::Actor,
-) -> Result<PathBuf> {
+    data_dir: &Path,
+) -> Result<PreparedLocalWorktree> {
     let queue = tasker_db::get_task_queue(pool, &task.task.task_queue_key)
         .await?
         .with_context(|| format!("Task Queue {} not found", task.task.task_queue_key))?;
@@ -599,7 +620,13 @@ async fn prepare_local_worktree(
         actor,
     )
     .await?;
-    Ok(worktree_path)
+    Ok(PreparedLocalWorktree {
+        path: worktree_path,
+        shared_cargo_target_dir: shared_cargo_target_dir(
+            data_dir,
+            Path::new(&queue.managed_source_repository),
+        )?,
+    })
 }
 
 async fn upsert_task_link_with_lock_retry(
@@ -632,6 +659,49 @@ fn is_transient_sqlite_lock(error: &anyhow::Error) -> bool {
             || message.contains("code: 5")
             || message.contains("code: 6")
     })
+}
+
+fn shared_cargo_target_dir(data_dir: &Path, managed_source_repository: &Path) -> Result<PathBuf> {
+    let canonical_repo = managed_source_repository.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize Managed Source Repository {}",
+            managed_source_repository.display()
+        )
+    })?;
+    let repo_name = canonical_repo
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_path_component)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "repository".to_string());
+    let hash = fnv1a64(canonical_repo.to_string_lossy().as_bytes());
+    Ok(data_dir
+        .join("cargo-target")
+        .join(format!("{repo_name}-{hash:016x}")))
+}
+
+fn sanitize_path_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn setup_local_worktree(
@@ -943,9 +1013,13 @@ mod tests {
         tasker_db::run_migrations(&pool).await.expect("migrate");
         seed_ready_task(&pool, &repo, &worktrees).await;
         let pi_bin = temp.path().join("fake-pi");
+        let cargo_target_log = temp.path().join("cargo-target-dir.txt");
         write_executable(
             &pi_bin,
-            "#!/bin/sh\ntest \"$1 $2 $3 $4\" = \"--mode rpc --extension extensions/tasker-pi/src/index.ts\" || exit 7\ntest -n \"$TASKER_AGENT_RUN_ID\" || exit 8\nread line\necho '{\"type\":\"agent_end\"}'\n",
+            &format!(
+                "#!/bin/sh\ntest \"$1 $2 $3 $4\" = \"--mode rpc --extension extensions/tasker-pi/src/index.ts\" || exit 7\ntest -n \"$TASKER_AGENT_RUN_ID\" || exit 8\ntest -n \"$CARGO_TARGET_DIR\" || exit 9\nprintf '%s' \"$CARGO_TARGET_DIR\" > {}\nread line\necho '{{\"type\":\"agent_end\"}}'\n",
+                cargo_target_log.display()
+            ),
         );
 
         let outcome = run_worker_once(
@@ -983,6 +1057,14 @@ mod tests {
         let session = detail.launcher_session_data.expect("session");
         assert_eq!(session.launcher_kind, "pi");
         assert!(Path::new(&session.transcript_path.expect("transcript")).is_file());
+        let expected_cargo_target_dir =
+            shared_cargo_target_dir(&temp.path().join("data"), &repo).expect("shared target dir");
+        assert_eq!(
+            fs::read_to_string(cargo_target_log).expect("cargo target log"),
+            expected_cargo_target_dir.display().to_string()
+        );
+        assert!(expected_cargo_target_dir.is_dir());
+        assert!(!worktrees.join("TASK-1/target").exists());
     }
 
     #[cfg(unix)]
@@ -1348,6 +1430,26 @@ mod tests {
         .expect_err("option-like branch fails");
 
         assert!(error.to_string().contains("non-option Git branch"));
+    }
+
+    #[test]
+    fn shared_cargo_target_dir_is_outside_worktrees_and_stable_for_repo() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        init_git_repo(&repo);
+        let data_dir = temp.path().join("data");
+
+        let first = shared_cargo_target_dir(&data_dir, &repo).expect("first target dir");
+        let second = shared_cargo_target_dir(&data_dir, &repo).expect("second target dir");
+
+        assert_eq!(first, second);
+        assert!(first.starts_with(data_dir.join("cargo-target")));
+        assert!(!first.starts_with(temp.path().join("worktrees/TASK-1")));
+        assert!(first
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("file name")
+            .starts_with("repo-"));
     }
 
     #[test]

@@ -33,7 +33,7 @@ cargo run -p tasker-cli -- \
   --max-run-seconds 1800
 ```
 
-The Worker Loop claims one Task, prepares a Local Worktree, starts `pi --mode rpc`, and exports Tasker extension environment variables including `TASKER_API_URL`, `TASKER_API_TOKEN`, and `TASKER_AGENT_RUN_ID`.
+The Worker Loop claims one Task, prepares a Local Worktree, starts `pi --mode rpc`, and exports Tasker extension environment variables including `TASKER_API_URL`, `TASKER_API_TOKEN`, and `TASKER_AGENT_RUN_ID`. The Pi Launcher also intentionally sets `CARGO_TARGET_DIR` for the Worker Agent process to `.tasker/data/cargo-target/<repo-name>-<path-hash>/`, a Tasker-managed shared build directory keyed by the Managed Source Repository path. This overrides any caller-provided `CARGO_TARGET_DIR` so dogfood Worker Agent worktrees do not each accumulate their own `target/` tree; operators may delete the shared directory when reclaiming space.
 
 ## Inspect results
 
