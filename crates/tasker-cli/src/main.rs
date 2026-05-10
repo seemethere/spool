@@ -424,6 +424,7 @@ async fn main() -> Result<()> {
     let paths = cli.paths()?;
     let db_path_overridden = cli.db_path.is_some();
     guard_project_config(&cli, &paths, db_path_overridden)?;
+    print_active_tasker_context_for_mutation(&cli.command, &paths, db_path_overridden)?;
 
     match cli.command {
         Some(Command::Init) => init(&paths, db_path_overridden).await,
@@ -623,6 +624,107 @@ fn command_is_unsafe_mutation(command: &Option<Command>) -> bool {
         Some(Command::Merge { command }) => matches!(command, MergeCommand::Done { .. }),
         Some(Command::Status | Command::Monitor { .. } | Command::Version) | None => false,
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ActiveTaskerContext {
+    config_path: PathBuf,
+    data_dir: PathBuf,
+    database_path: PathBuf,
+    queue_key: Option<String>,
+}
+
+fn active_tasker_context(
+    command: &Option<Command>,
+    paths: &TaskerPaths,
+    db_path_overridden: bool,
+) -> Result<ActiveTaskerContext> {
+    let mut config = TaskerConfig::load_or_default(paths)?;
+    if db_path_overridden {
+        config.database.path = paths.db_path.clone();
+    }
+
+    Ok(ActiveTaskerContext {
+        config_path: paths.config_path.clone(),
+        data_dir: paths.data_dir.clone(),
+        database_path: config.database.path,
+        queue_key: command_queue_key(command),
+    })
+}
+
+fn command_queue_key(command: &Option<Command>) -> Option<String> {
+    match command {
+        Some(Command::Queue { command }) => match command {
+            QueueCommand::Create { key, .. } | QueueCommand::Update { key, .. } => {
+                Some(key.clone())
+            }
+            QueueCommand::Show { .. } | QueueCommand::Audit { .. } | QueueCommand::List => None,
+        },
+        Some(Command::Task { command }) => match command {
+            TaskCommand::Create { queue, .. } => Some(queue.clone()),
+            TaskCommand::Retry { identifier, .. }
+            | TaskCommand::Transition { identifier, .. }
+            | TaskCommand::Audit { identifier } => queue_key_from_task_identifier(identifier),
+            TaskCommand::Criterion { command } | TaskCommand::Validation { command } => {
+                requirement_command_queue_key(command)
+            }
+            TaskCommand::Workpad { command } => workpad_command_queue_key(command),
+            TaskCommand::Show { .. } => None,
+        },
+        Some(Command::Work { queue, .. } | Command::Supervise { queue, .. }) => Some(queue.clone()),
+        Some(Command::Merge { command }) => match command {
+            MergeCommand::Inspect { .. } => None,
+            MergeCommand::Done { identifier, .. } => queue_key_from_task_identifier(identifier),
+        },
+        Some(Command::Init | Command::Run { .. } | Command::Serve { .. })
+        | Some(Command::Status | Command::Version)
+        | None => None,
+    }
+}
+
+fn requirement_command_queue_key(command: &RequirementCommand) -> Option<String> {
+    match command {
+        RequirementCommand::Set { identifier, .. } => queue_key_from_task_identifier(identifier),
+    }
+}
+
+fn workpad_command_queue_key(command: &WorkpadCommand) -> Option<String> {
+    match command {
+        WorkpadCommand::Set { identifier, .. } => queue_key_from_task_identifier(identifier),
+    }
+}
+
+fn queue_key_from_task_identifier(identifier: &str) -> Option<String> {
+    identifier
+        .split_once('-')
+        .and_then(|(queue_key, _)| (!queue_key.is_empty()).then(|| queue_key.to_string()))
+}
+
+fn render_active_tasker_context(context: &ActiveTaskerContext) -> String {
+    let mut output = format!(
+        "active Tasker context:\n  config: {}\n  data: {}\n  database: {}",
+        context.config_path.display(),
+        context.data_dir.display(),
+        context.database_path.display()
+    );
+    if let Some(queue_key) = &context.queue_key {
+        output.push_str(&format!("\n  Task Queue Key: {queue_key}"));
+    }
+    output
+}
+
+fn print_active_tasker_context_for_mutation(
+    command: &Option<Command>,
+    paths: &TaskerPaths,
+    db_path_overridden: bool,
+) -> Result<()> {
+    if !command_is_unsafe_mutation(command) {
+        return Ok(());
+    }
+
+    let context = active_tasker_context(command, paths, db_path_overridden)?;
+    eprintln!("{}", render_active_tasker_context(&context));
+    Ok(())
 }
 
 async fn init(paths: &TaskerPaths, db_path_overridden: bool) -> Result<()> {
@@ -1718,6 +1820,57 @@ mod tests {
 
         guard_project_config_from(&cli, &paths, false, &nested)
             .expect("read-only command should warn but continue");
+    }
+
+    #[test]
+    fn active_context_for_task_creation_renders_paths_and_queue_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = TaskerPaths::resolve(temp.path(), PathOverrides::default());
+        let configured_db = temp.path().join("project/tasker.db");
+        write_config(&paths.config_path, &configured_db);
+        let command = Some(Command::Task {
+            command: TaskCommand::Create {
+                bootstrap: true,
+                queue: "TASK".to_string(),
+                file: temp.path().join("task.md"),
+                actor: "tester".to_string(),
+            },
+        });
+
+        let context = active_tasker_context(&command, &paths, false).expect("active context");
+        let rendered = render_active_tasker_context(&context);
+
+        assert!(rendered.contains(&format!("config: {}", paths.config_path.display())));
+        assert!(rendered.contains(&format!("data: {}", paths.data_dir.display())));
+        assert!(rendered.contains(&format!("database: {}", configured_db.display())));
+        assert!(rendered.contains("Task Queue Key: TASK"));
+    }
+
+    #[test]
+    fn active_context_for_supervisor_renders_queue_key_and_db_override() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let override_db = temp.path().join("override/tasker.db");
+        let paths = TaskerPaths::resolve(
+            temp.path(),
+            PathOverrides {
+                db_path: Some(override_db.clone()),
+                ..PathOverrides::default()
+            },
+        );
+        let command = Some(Command::Supervise {
+            queue: "DOG".to_string(),
+            concurrency: 2,
+            timeout_seconds: 30,
+            poll_seconds: 1,
+            launcher: "fake".to_string(),
+            worker_command: None,
+        });
+
+        let context = active_tasker_context(&command, &paths, true).expect("active context");
+        let rendered = render_active_tasker_context(&context);
+
+        assert!(rendered.contains(&format!("database: {}", override_db.display())));
+        assert!(rendered.contains("Task Queue Key: DOG"));
     }
 
     fn write_config(config_path: &Path, db_path: &Path) {
