@@ -123,6 +123,9 @@ enum Command {
         worker_prompt: Option<PathBuf>,
     },
     /// Supervise tasker work --once workers.
+    #[command(
+        after_long_help = "Supervisor progress logs are intentionally compact for unattended batches. Use `tasker status` or `tasker monitor` when you want human-readable Task titles and richer context."
+    )]
     Supervise {
         /// Task Queue Key to supervise.
         #[arg(long)]
@@ -2594,6 +2597,20 @@ mod tests {
         assert!(help.contains("Remote terminals and tmux should render normally"));
         assert!(help.contains("TERM=dumb"));
         assert!(help.contains("tasker monitor --queue TASKER --once --plain"));
+    }
+
+    #[test]
+    fn supervise_help_points_title_seekers_to_status_and_monitor() {
+        let mut command = Cli::command();
+        let supervise = command
+            .find_subcommand_mut("supervise")
+            .expect("supervise subcommand");
+        let help = supervise.render_long_help().to_string();
+
+        assert!(help.contains("Supervisor progress logs are intentionally compact"));
+        assert!(help.contains("tasker status"));
+        assert!(help.contains("tasker monitor"));
+        assert!(help.contains("Task titles"));
     }
 
     #[test]

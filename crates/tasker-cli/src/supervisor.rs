@@ -581,13 +581,7 @@ async fn print_progress(pool: &SqlitePool, queue: &str) -> Result<()> {
     let active_runs = tasker_db::active_agent_runs_for_status(pool).await?;
     let holds = tasker_db::active_retry_holds_for_status(pool).await?;
     for run in active_runs.iter().filter(|run| run.queue_key == queue) {
-        println!(
-            "active Agent Run {} Task {} worker={} lease_expires_at={}",
-            run.agent_run_id,
-            display::task_label(&run.task_identifier, &run.task_title, 64),
-            run.worker_id,
-            run.lease_expires_at
-        );
+        println!("{}", active_run_progress_message(run));
     }
     for hold in holds.iter().filter(|hold| hold.queue_key == queue) {
         println!(
@@ -688,6 +682,13 @@ async fn active_runs_for_worker(
         .into_iter()
         .filter(|run| run.queue_key == queue && run.worker_id == worker_id)
         .collect())
+}
+
+fn active_run_progress_message(run: &tasker_db::ActiveAgentRunStatus) -> String {
+    format!(
+        "active Agent Run {} Task {} worker={} lease_expires_at={}",
+        run.agent_run_id, run.task_identifier, run.worker_id, run.lease_expires_at
+    )
 }
 
 fn concise_tail(text: &str) -> String {
@@ -954,6 +955,26 @@ mod tests {
         let _lock = SupervisorLock::acquire("TASK", lock_dir).expect("recovered lock");
         let recovered = fs::read_to_string(lock_path).expect("lock contents");
         assert!(recovered.contains(&format!("\"pid\": {}", std::process::id())));
+    }
+
+    #[test]
+    fn supervisor_active_run_progress_message_stays_compact_without_task_title() {
+        let message = active_run_progress_message(&tasker_db::ActiveAgentRunStatus {
+            queue_key: "TASK".to_string(),
+            task_identifier: "TASK-1".to_string(),
+            task_title: "Verbose human-readable title".to_string(),
+            task_state: "in_progress".to_string(),
+            agent_run_id: "run-1".to_string(),
+            launcher_kind: "pi".to_string(),
+            worker_id: "worker-1".to_string(),
+            lease_expires_at: "2026-05-09 12:00:00".to_string(),
+        });
+
+        assert_eq!(
+            message,
+            "active Agent Run run-1 Task TASK-1 worker=worker-1 lease_expires_at=2026-05-09 12:00:00"
+        );
+        assert!(!message.contains("Verbose human-readable title"));
     }
 
     #[test]
