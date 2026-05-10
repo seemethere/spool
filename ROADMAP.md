@@ -51,12 +51,17 @@ Once this milestone works, create real dogfood tasks for later milestones.
 - CLI-first cleanup for dogfood storage artifacts
 - Improved `tasker status`
 - Manual dogfood merge documentation before automatic Integrating
+- First Agent-Gated Integrating slice:
+  - runner-side Local Worktree Delivery adapter for already-Integrating Tasks
+  - default Squash Merge into Main Branch
+  - Integration Outcome recording and Done/Rework/retry state handling
+  - cleanup of Local Worktree and Task Branch after success
 - Opt-in real pi smoke documentation
 - Tests with temp SQLite DBs, temp Git repos, fake launchers, and fake delivery outcomes
 
 ## Full v1 after dogfooding
 
-- Agent-Gated Integrating with squash merge
+- Complete Agent-Gated Integrating polish beyond the first dogfood slice
 - Review sessions
 - Metrics export
 - Richer transcript export/pruning policies
