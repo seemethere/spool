@@ -105,8 +105,16 @@ pub async fn run_worker_once(
         )
     })?;
 
-    let launcher_result = if request.launcher == "fake" {
-        run_fake_launcher(pool, &request, &claimed, &actor, &transcript_dir).await?
+    let mut launcher_result = if request.launcher == "fake" {
+        run_fake_launcher(
+            pool,
+            &request,
+            &claimed,
+            &actor,
+            &prepared_worktree,
+            &transcript_dir,
+        )
+        .await?
     } else {
         run_pi_launcher(
             pool,
@@ -118,6 +126,32 @@ pub async fn run_worker_once(
         )
         .await?
     };
+
+    if launcher_result.outcome == "completed" {
+        tasker_db::heartbeat_run(pool, &claimed.run.id, request.lease_seconds, &actor).await?;
+        if let Err(error) = run_agent_gated_integration_if_ready(
+            pool,
+            &claimed.task.task.identifier,
+            &claimed.run.id,
+            &actor,
+        )
+        .await
+        {
+            launcher_result.outcome = "failed".to_string();
+            launcher_result.failure_reason = Some(format!(
+                "Agent-Gated Integration failed unexpectedly after launcher completion: {error:#}"
+            ));
+            launcher_result.session_data.final_status = Some("failed".to_string());
+            launcher_result.session_data.raw_json = Some(
+                serde_json::json!({
+                    "launcher": request.launcher,
+                    "final_status": "failed",
+                    "agent_gated_integration_error": error.to_string(),
+                })
+                .to_string(),
+            );
+        }
+    }
 
     tasker_db::upsert_launcher_session_data(
         pool,
@@ -156,6 +190,7 @@ async fn run_fake_launcher(
     request: &WorkOnceRequest,
     claimed: &tasker_db::ClaimedRun,
     actor: &tasker_db::Actor,
+    prepared_worktree: &PreparedLocalWorktree,
     transcript_dir: &Path,
 ) -> Result<LauncherResult> {
     let fake_note = fake_workpad_note(
@@ -164,6 +199,9 @@ async fn run_fake_launcher(
         &request.fake_outcome,
     );
     tasker_db::update_workpad_note(pool, &claimed.task.task.identifier, &fake_note, actor).await?;
+    if request.fake_outcome.starts_with("integrating-") {
+        prepare_fake_integrating_task(pool, request, claimed, actor, prepared_worktree).await?;
+    }
     let transcript_path = transcript_dir.join("fake.jsonl");
     fs::write(
         &transcript_path,
@@ -184,7 +222,11 @@ async fn run_fake_launcher(
         )
     })?;
     Ok(LauncherResult {
-        outcome: request.fake_outcome.clone(),
+        outcome: if request.fake_outcome.starts_with("integrating-") {
+            "completed".to_string()
+        } else {
+            request.fake_outcome.clone()
+        },
         failure_reason: None,
         session_data: tasker_db::UpsertLauncherSessionData {
             launcher_kind: "fake".to_string(),
@@ -850,6 +892,555 @@ fn git_output(repo: &Path, args: &[&str], action: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+async fn prepare_fake_integrating_task(
+    pool: &SqlitePool,
+    request: &WorkOnceRequest,
+    claimed: &tasker_db::ClaimedRun,
+    actor: &tasker_db::Actor,
+    prepared_worktree: &PreparedLocalWorktree,
+) -> Result<()> {
+    match request.fake_outcome.as_str() {
+        "integrating-success" => {
+            fs::write(
+                prepared_worktree.path.join("fake-agent-work.txt"),
+                "fake agent work\n",
+            )
+            .context("failed to write fake agent work")?;
+            run_git(
+                &prepared_worktree.path,
+                &["add", "fake-agent-work.txt"],
+                "stage fake agent work",
+            )?;
+            run_git(
+                &prepared_worktree.path,
+                &["commit", "-m", "fake agent work"],
+                "commit fake agent work",
+            )?;
+        }
+        "integrating-work-change-failure" => {
+            fs::write(
+                prepared_worktree.path.join("dirty-fake-agent-work.txt"),
+                "uncommitted fake work\n",
+            )
+            .context("failed to write dirty fake agent work")?;
+        }
+        "integrating-operational-failure" => {
+            let queue = tasker_db::get_task_queue(pool, &claimed.task.task.task_queue_key)
+                .await?
+                .with_context(|| {
+                    format!("Task Queue {} not found", claimed.task.task.task_queue_key)
+                })?;
+            fs::write(
+                Path::new(&queue.managed_source_repository).join("dirty-managed-source.txt"),
+                "unexpected managed source change\n",
+            )
+            .context("failed to dirty Managed Source Repository")?;
+        }
+        other => anyhow::bail!("unsupported fake integrating outcome {other}"),
+    }
+
+    for criterion in &claimed.task.acceptance_criteria {
+        tasker_db::update_acceptance_criterion_status(
+            pool,
+            &claimed.task.task.identifier,
+            criterion.position,
+            &tasker_db::UpdateRequirementStatus {
+                status: "satisfied".to_string(),
+                waiver_reason: None,
+                validated_base_commit: None,
+            },
+            actor,
+        )
+        .await?;
+    }
+    let queue = tasker_db::get_task_queue(pool, &claimed.task.task.task_queue_key)
+        .await?
+        .with_context(|| format!("Task Queue {} not found", claimed.task.task.task_queue_key))?;
+    let current_main = git_output(
+        Path::new(&queue.managed_source_repository),
+        &["rev-parse", &queue.main_branch],
+        "read Main Branch commit",
+    )?
+    .trim()
+    .to_string();
+    for validation in &claimed.task.validation_items {
+        tasker_db::update_validation_item_status(
+            pool,
+            &claimed.task.task.identifier,
+            validation.position,
+            &tasker_db::UpdateRequirementStatus {
+                status: "passed".to_string(),
+                waiver_reason: None,
+                validated_base_commit: Some(current_main.clone()),
+            },
+            actor,
+        )
+        .await?;
+    }
+    tasker_db::transition_task_state(
+        pool,
+        &claimed.task.task.identifier,
+        &tasker_db::TransitionTaskState {
+            to_state: "integrating".to_string(),
+            agent_run_id: Some(claimed.run.id.clone()),
+        },
+        actor,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn run_agent_gated_integration_if_ready(
+    pool: &SqlitePool,
+    task_identifier: &str,
+    agent_run_id: &str,
+    worker_actor: &tasker_db::Actor,
+) -> Result<Option<LocalIntegrationResult>> {
+    let detail = tasker_db::get_task_detail(pool, task_identifier)
+        .await?
+        .with_context(|| format!("Task {task_identifier} not found"))?;
+    if detail.task.state != "integrating" || detail.task.review_required {
+        return Ok(None);
+    }
+    let adapter_actor = tasker_db::Actor {
+        kind: "operator".to_string(),
+        id: format!("{}-local-delivery-adapter", worker_actor.id),
+        display_name: format!("{} Local Delivery Adapter", worker_actor.display_name),
+    };
+    integrate_local_worktree_for_run(pool, task_identifier, Some(agent_run_id), &adapter_actor)
+        .await
+        .map(Some)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalIntegrationResult {
+    pub summary: String,
+}
+
+pub async fn integrate_local_worktree_for_run(
+    pool: &SqlitePool,
+    identifier: &str,
+    agent_run_id: Option<&str>,
+    actor: &tasker_db::Actor,
+) -> Result<LocalIntegrationResult> {
+    let detail = tasker_db::get_task_detail(pool, identifier)
+        .await?
+        .with_context(|| format!("Task {identifier} not found"))?;
+    if detail.task.state != "integrating" {
+        anyhow::bail!(
+            "Local Worktree integration requires Task State integrating; current state is {}",
+            detail.task.state
+        );
+    }
+    let queue = tasker_db::get_task_queue(pool, &detail.task.task_queue_key)
+        .await?
+        .with_context(|| format!("Task Queue {} not found", detail.task.task_queue_key))?;
+    let task_branch = required_task_link(&detail, "task_branch")?;
+    let local_worktree = required_task_link(&detail, "local_worktree")?;
+
+    let mut adapter = LocalWorktreeIntegrationAdapter {
+        pool,
+        task: &detail,
+        queue: &queue,
+        actor,
+        agent_run_id,
+        repo: Path::new(&queue.managed_source_repository),
+        worktree: Path::new(&local_worktree),
+        task_branch: &task_branch,
+    };
+    adapter.integrate().await
+}
+
+fn required_task_link(detail: &tasker_db::TaskDetail, kind: &str) -> Result<String> {
+    detail
+        .task_links
+        .iter()
+        .find(|link| link.kind == kind)
+        .map(|link| link.target.clone())
+        .with_context(|| {
+            format!(
+                "Task {} is missing {kind} Task Link",
+                detail.task.identifier
+            )
+        })
+}
+
+struct LocalWorktreeIntegrationAdapter<'a> {
+    pool: &'a SqlitePool,
+    task: &'a tasker_db::TaskDetail,
+    queue: &'a tasker_db::TaskQueue,
+    actor: &'a tasker_db::Actor,
+    agent_run_id: Option<&'a str>,
+    repo: &'a Path,
+    worktree: &'a Path,
+    task_branch: &'a str,
+}
+
+impl<'a> LocalWorktreeIntegrationAdapter<'a> {
+    async fn integrate(&mut self) -> Result<LocalIntegrationResult> {
+        if let Err(error) = self.validate_operational_safety() {
+            self.record_outcome("operational_failure", None, None, Some(error.to_string()))
+                .await?;
+            return Ok(LocalIntegrationResult {
+                summary: format!(
+                    "operational Delivery Failure for Task {}; left in Integrating: {error:#}",
+                    self.task.task.identifier
+                ),
+            });
+        }
+        if let Err(error) = self.validate_work_change_safety() {
+            self.record_outcome("work_change_failure", None, None, Some(error.to_string()))
+                .await?;
+            self.transition("rework").await?;
+            return Ok(LocalIntegrationResult {
+                summary: format!(
+                    "work-change Delivery Failure for Task {}; moved to Rework: {error:#}",
+                    self.task.task.identifier
+                ),
+            });
+        }
+
+        let pre_merge_head = git_output(
+            self.repo,
+            &["rev-parse", &self.queue.main_branch],
+            "read Main Branch commit",
+        )?
+        .trim()
+        .to_string();
+        if git_status(
+            self.repo,
+            &[
+                "diff",
+                "--quiet",
+                &format!("{}..{}", self.queue.main_branch, self.task_branch),
+                "--",
+            ],
+        )?
+        .success()
+        {
+            self.record_outcome("no_changes", None, Some(pre_merge_head.clone()), None)
+                .await?;
+            self.transition("done").await?;
+            let cleanup = self.cleanup_after_success();
+            let mut summary = format!(
+                "No-Change Integration recorded for Task {}; moved to Done",
+                self.task.task.identifier
+            );
+            if let Err(error) = cleanup {
+                summary.push_str(&format!("; cleanup needs operator repair: {error:#}"));
+            }
+            return Ok(LocalIntegrationResult { summary });
+        }
+
+        if let Err(error) = run_git(
+            self.repo,
+            &["merge", "--squash", "--no-commit", self.task_branch],
+            "Squash Merge",
+        ) {
+            let _ = self.rollback_to(&pre_merge_head);
+            self.record_outcome(
+                "work_change_failure",
+                None,
+                Some(pre_merge_head.clone()),
+                Some(format!("Squash Merge failed: {error:#}")),
+            )
+            .await?;
+            self.transition("rework").await?;
+            return Ok(LocalIntegrationResult {
+                summary: format!(
+                    "work-change Delivery Failure for Task {}; moved to Rework: Squash Merge failed: {error:#}",
+                    self.task.task.identifier
+                ),
+            });
+        }
+
+        let message = final_commit_message(self.task, self.agent_run_id);
+        if let Err(error) = run_git(self.repo, &["commit", "-m", &message], "Final Commit") {
+            let _ = self.rollback_to(&pre_merge_head);
+            self.record_outcome(
+                "work_change_failure",
+                None,
+                Some(pre_merge_head.clone()),
+                Some(format!("Final Commit failed: {error:#}")),
+            )
+            .await?;
+            self.transition("rework").await?;
+            return Ok(LocalIntegrationResult {
+                summary: format!(
+                    "work-change Delivery Failure for Task {}; moved to Rework: Final Commit failed: {error:#}",
+                    self.task.task.identifier
+                ),
+            });
+        }
+
+        let final_commit = git_output(self.repo, &["rev-parse", "HEAD"], "read Final Commit")?
+            .trim()
+            .to_string();
+        self.record_outcome(
+            "success",
+            Some(final_commit.clone()),
+            Some(pre_merge_head),
+            None,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "Final Commit {final_commit} was created but Tasker could not record the successful Integration Outcome; operator repair required"
+            )
+        })?;
+        self.transition("done").await.with_context(|| {
+            format!(
+                "Final Commit {final_commit} was created but Tasker could not move the Task to Done; operator repair required"
+            )
+        })?;
+        let cleanup = self.cleanup_after_success();
+        let mut summary = format!(
+            "Integrated Task {} as Final Commit {}; moved to Done",
+            self.task.task.identifier, final_commit
+        );
+        if let Err(error) = cleanup {
+            summary.push_str(&format!("; cleanup needs operator repair: {error:#}"));
+        }
+        Ok(LocalIntegrationResult { summary })
+    }
+
+    fn validate_operational_safety(&self) -> Result<()> {
+        run_git(
+            self.repo,
+            &["rev-parse", "--show-toplevel"],
+            "validate Managed Source Repository",
+        )?;
+        run_git(
+            self.worktree,
+            &["rev-parse", "--is-inside-work-tree"],
+            "validate Local Worktree",
+        )?;
+        ensure_no_git_lock(self.repo)?;
+        ensure_no_git_lock(self.worktree)?;
+        let branch = git_output(
+            self.repo,
+            &["branch", "--show-current"],
+            "read Managed Source Repository branch",
+        )?;
+        if branch.trim() != self.queue.main_branch {
+            anyhow::bail!(
+                "Managed Source Repository is on branch {}, expected Main Branch {}",
+                branch.trim(),
+                self.queue.main_branch
+            );
+        }
+        ensure_clean_git(self.repo, "Managed Source Repository")?;
+        let source_common_dir = git_common_dir(self.repo)?;
+        let worktree_common_dir = git_common_dir(self.worktree)?;
+        if source_common_dir != worktree_common_dir {
+            anyhow::bail!(
+                "Local Worktree is not attached to the configured Managed Source Repository"
+            );
+        }
+        if !git_status(
+            self.repo,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", self.task_branch),
+            ],
+        )?
+        .success()
+        {
+            anyhow::bail!("Task Branch {} does not exist", self.task_branch);
+        }
+        Ok(())
+    }
+
+    fn validate_work_change_safety(&self) -> Result<()> {
+        ensure_clean_git(self.worktree, "Local Worktree")?;
+        let worktree_branch = git_output(
+            self.worktree,
+            &["branch", "--show-current"],
+            "read Local Worktree branch",
+        )?;
+        if worktree_branch.trim() != self.task_branch {
+            anyhow::bail!(
+                "Local Worktree is on branch {}, expected Task Branch {}",
+                worktree_branch.trim(),
+                self.task_branch
+            );
+        }
+        let current_main = git_output(
+            self.repo,
+            &["rev-parse", &self.queue.main_branch],
+            "read Main Branch commit",
+        )?
+        .trim()
+        .to_string();
+        if !git_status(
+            self.repo,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &self.queue.main_branch,
+                self.task_branch,
+            ],
+        )?
+        .success()
+            && self.task.task.validated_base_commit.as_deref() != Some(current_main.as_str())
+        {
+            anyhow::bail!(
+                "Task Branch {} does not include current Main Branch {} and Validated Base Commit {} is stale or missing (current Main Branch is {})",
+                self.task_branch,
+                self.queue.main_branch,
+                self.task
+                    .task
+                    .validated_base_commit
+                    .as_deref()
+                    .unwrap_or("not recorded"),
+                current_main
+            );
+        }
+        Ok(())
+    }
+
+    async fn record_outcome(
+        &self,
+        kind: &str,
+        final_commit: Option<String>,
+        pre_merge_head: Option<String>,
+        message: Option<String>,
+    ) -> Result<()> {
+        tasker_db::record_integration_outcome(
+            self.pool,
+            &tasker_db::RecordIntegrationOutcomeInput {
+                task_identifier: self.task.task.identifier.clone(),
+                agent_run_id: self.agent_run_id.map(ToString::to_string),
+                outcome_kind: kind.to_string(),
+                final_commit,
+                pre_merge_head,
+                message,
+            },
+            self.actor,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn transition(&self, to_state: &str) -> Result<()> {
+        tasker_db::transition_task_state(
+            self.pool,
+            &self.task.task.identifier,
+            &tasker_db::TransitionTaskState {
+                to_state: to_state.to_string(),
+                agent_run_id: None,
+            },
+            self.actor,
+        )
+        .await?;
+        Ok(())
+    }
+
+    fn rollback_to(&self, pre_merge_head: &str) -> Result<()> {
+        let branch = git_output(
+            self.repo,
+            &["branch", "--show-current"],
+            "read Managed Source Repository branch",
+        )?;
+        if branch.trim() != self.queue.main_branch {
+            anyhow::bail!(
+                "refusing rollback because Managed Source Repository is no longer on Main Branch"
+            );
+        }
+        run_git(
+            self.repo,
+            &["reset", "--hard", pre_merge_head],
+            "roll back Main Branch",
+        )
+    }
+
+    fn cleanup_after_success(&self) -> Result<()> {
+        if self.queue.done_worktree_retention {
+            return Ok(());
+        }
+        if self.worktree.exists() {
+            let worktree = self.worktree.display().to_string();
+            run_git(
+                self.repo,
+                &["worktree", "remove", "--force", &worktree],
+                "remove Local Worktree",
+            )?;
+        }
+        if git_status(
+            self.repo,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", self.task_branch),
+            ],
+        )?
+        .success()
+        {
+            run_git(
+                self.repo,
+                &["branch", "-D", self.task_branch],
+                "delete Task Branch",
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn final_commit_message(detail: &tasker_db::TaskDetail, agent_run_id: Option<&str>) -> String {
+    let mut message = format!(
+        "{}: {}\n\nTask: {}",
+        detail.task.identifier, detail.task.title, detail.task.identifier
+    );
+    if let Some(run_id) = agent_run_id {
+        message.push_str(&format!("\nAgent Run: {run_id}"));
+    }
+    message
+}
+
+fn ensure_clean_git(repo: &Path, label: &str) -> Result<()> {
+    let status = git_output(repo, &["status", "--porcelain"], "check Git cleanliness")?;
+    if !status.trim().is_empty() {
+        anyhow::bail!("{label} has uncommitted changes");
+    }
+    Ok(())
+}
+
+fn ensure_no_git_lock(repo: &Path) -> Result<()> {
+    let common_dir = git_common_dir(repo)?;
+    if common_dir.join("index.lock").exists() {
+        anyhow::bail!(
+            "Git lock exists at {}",
+            common_dir.join("index.lock").display()
+        );
+    }
+    let git_dir = git_output(repo, &["rev-parse", "--git-dir"], "read Git dir")?;
+    let git_dir = PathBuf::from(git_dir.trim());
+    let git_dir = if git_dir.is_absolute() {
+        git_dir
+    } else {
+        repo.join(git_dir)
+    };
+    if git_dir.join("index.lock").exists() {
+        anyhow::bail!(
+            "Git lock exists at {}",
+            git_dir.join("index.lock").display()
+        );
+    }
+    Ok(())
+}
+
+fn git_status(repo: &Path, args: &[&str]) -> Result<std::process::ExitStatus> {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to run git {:?} in {}", args, repo.display()))
+}
+
 fn fake_workpad_note(task_identifier: &str, run_id: &str, outcome: &str) -> String {
     format!(
         "Fake Agent Launcher processed Task {task_identifier} in Agent Run {run_id}.\nOutcome: {outcome}\n"
@@ -950,6 +1541,166 @@ mod tests {
             .any(|link| link.kind == "task_branch" && link.target == "tasker/TASK-1"));
         let runs_dir = temp.path().join("data/runs");
         assert!(runs_dir.is_dir());
+    }
+
+    #[tokio::test]
+    async fn fake_worker_auto_integrates_successful_agent_gated_task() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let worktrees = temp.path().join("worktrees");
+        init_git_repo(&repo);
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        seed_ready_task(&pool, &repo, &worktrees).await;
+
+        let outcome = run_worker_once(
+            &pool,
+            WorkOnceRequest {
+                queue: "TASK".to_string(),
+                launcher: "fake".to_string(),
+                actor: "worker".to_string(),
+                fake_outcome: "integrating-success".to_string(),
+                lease_seconds: 90,
+                retry_hold_seconds: None,
+                max_run_seconds: None,
+                data_dir: temp.path().join("data"),
+                api_url: "http://127.0.0.1:4317".to_string(),
+                api_token: "token".to_string(),
+                pi_bin: "pi".to_string(),
+                pi_extension: None,
+                worker_prompt: None,
+            },
+        )
+        .await
+        .expect("run worker");
+
+        let WorkOnceOutcome::Finished {
+            run_id, outcome, ..
+        } = outcome
+        else {
+            panic!("finished")
+        };
+        assert_eq!(outcome, "completed");
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("load task")
+            .expect("task");
+        assert_eq!(detail.task.state, "done");
+        assert!(!worktrees.join("TASK-1").exists());
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'success' AND agent_run_id = ?",
+        )
+        .bind(&run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count outcomes");
+        assert_eq!(count, 1);
+        let log =
+            git_output(&repo, &["log", "-1", "--pretty=%B"], "read final commit").expect("git log");
+        assert!(log.contains("TASK-1: Test work"));
+        assert!(log.contains(&format!("Agent Run: {run_id}")));
+    }
+
+    #[tokio::test]
+    async fn fake_worker_auto_integration_work_change_failure_moves_to_rework() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let worktrees = temp.path().join("worktrees");
+        init_git_repo(&repo);
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        seed_ready_task(&pool, &repo, &worktrees).await;
+
+        let outcome = run_worker_once(
+            &pool,
+            WorkOnceRequest {
+                queue: "TASK".to_string(),
+                launcher: "fake".to_string(),
+                actor: "worker".to_string(),
+                fake_outcome: "integrating-work-change-failure".to_string(),
+                lease_seconds: 90,
+                retry_hold_seconds: None,
+                max_run_seconds: None,
+                data_dir: temp.path().join("data"),
+                api_url: "http://127.0.0.1:4317".to_string(),
+                api_token: "token".to_string(),
+                pi_bin: "pi".to_string(),
+                pi_extension: None,
+                worker_prompt: None,
+            },
+        )
+        .await
+        .expect("run worker");
+
+        let WorkOnceOutcome::Finished { outcome, .. } = outcome else {
+            panic!("finished")
+        };
+        assert_eq!(outcome, "completed");
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("load task")
+            .expect("task");
+        assert_eq!(detail.task.state, "rework");
+        assert!(worktrees.join("TASK-1").exists());
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'work_change_failure'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count outcomes");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn fake_worker_auto_integration_operational_failure_stays_integrating() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let worktrees = temp.path().join("worktrees");
+        init_git_repo(&repo);
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        seed_ready_task(&pool, &repo, &worktrees).await;
+
+        let outcome = run_worker_once(
+            &pool,
+            WorkOnceRequest {
+                queue: "TASK".to_string(),
+                launcher: "fake".to_string(),
+                actor: "worker".to_string(),
+                fake_outcome: "integrating-operational-failure".to_string(),
+                lease_seconds: 90,
+                retry_hold_seconds: None,
+                max_run_seconds: None,
+                data_dir: temp.path().join("data"),
+                api_url: "http://127.0.0.1:4317".to_string(),
+                api_token: "token".to_string(),
+                pi_bin: "pi".to_string(),
+                pi_extension: None,
+                worker_prompt: None,
+            },
+        )
+        .await
+        .expect("run worker");
+
+        let WorkOnceOutcome::Finished { outcome, .. } = outcome else {
+            panic!("finished")
+        };
+        assert_eq!(outcome, "completed");
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("load task")
+            .expect("task");
+        assert_eq!(detail.task.state, "integrating");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'operational_failure'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count outcomes");
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]
