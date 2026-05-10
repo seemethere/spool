@@ -69,6 +69,24 @@ Temporary dogfooding escape hatches are allowed only when clearly marked:
 
 These do not replace the target model.
 
+## Project dogfooding command safety
+
+Project dogfooding commands must use the project Tasker database, not the default user Tasker database. Prefer the repo-local `bin/tasker-local` wrapper once it exists; otherwise run Tasker CLI commands from the Managed Source Repository root and pass the project config explicitly:
+
+```bash
+cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data <tasker-args>
+```
+
+Do not run bare `tasker task create`, `tasker status`, `tasker work`, or `tasker supervise` from this repository. Bare commands can read or mutate the wrong Task Backend.
+
+Before any Tasker mutation for project dogfooding, run this preflight and confirm it prints `key: TASKER`:
+
+```bash
+cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data queue show TASKER
+```
+
+Only continue with project dogfooding mutations when the preflight shows the `TASKER` Task Queue from the project database.
+
 ## Architectural rules
 
 - Tasker records delivery configuration and outcomes; Delivery Adapters perform filesystem/Git operations outside Tasker.
