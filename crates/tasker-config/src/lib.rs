@@ -50,12 +50,19 @@ impl TaskerPaths {
 
     pub fn resolve(home: impl Into<PathBuf>, overrides: PathOverrides) -> Self {
         let home = home.into();
-        let data_dir = overrides
-            .data_dir
-            .unwrap_or_else(|| home.join(".local/share/tasker"));
         let config_path = overrides
             .config_path
             .unwrap_or_else(|| home.join(".config/tasker/config.toml"));
+        let data_dir = overrides.data_dir.unwrap_or_else(|| {
+            if is_repository_local_config(&config_path) {
+                config_path
+                    .parent()
+                    .map(|parent| parent.join("data"))
+                    .unwrap_or_else(|| home.join(".local/share/tasker"))
+            } else {
+                home.join(".local/share/tasker")
+            }
+        });
         let db_path = overrides
             .db_path
             .unwrap_or_else(|| data_dir.join("tasker.db"));
@@ -128,6 +135,15 @@ impl TaskerConfig {
     }
 }
 
+fn is_repository_local_config(config_path: &std::path::Path) -> bool {
+    config_path.file_name().and_then(|name| name.to_str()) == Some("config.toml")
+        && config_path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some(".tasker")
+}
+
 pub fn ensure_data_dir(paths: &TaskerPaths) -> Result<()> {
     fs::create_dir_all(&paths.data_dir)
         .with_context(|| format!("failed to create {}", paths.data_dir.display()))
@@ -152,6 +168,36 @@ mod tests {
         assert_eq!(
             paths.db_path,
             PathBuf::from("/tmp/home/.local/share/tasker/tasker.db")
+        );
+    }
+
+    #[test]
+    fn explicit_repository_local_config_uses_sibling_data_dir() {
+        let paths = TaskerPaths::resolve(
+            "/tmp/home",
+            PathOverrides {
+                config_path: Some(PathBuf::from("/repo/.tasker/config.toml")),
+                ..PathOverrides::default()
+            },
+        );
+
+        assert_eq!(paths.data_dir, PathBuf::from("/repo/.tasker/data"));
+        assert_eq!(paths.db_path, PathBuf::from("/repo/.tasker/data/tasker.db"));
+    }
+
+    #[test]
+    fn explicit_non_project_config_keeps_default_xdg_data_dir() {
+        let paths = TaskerPaths::resolve(
+            "/tmp/home",
+            PathOverrides {
+                config_path: Some(PathBuf::from("/tmp/custom-config.toml")),
+                ..PathOverrides::default()
+            },
+        );
+
+        assert_eq!(
+            paths.data_dir,
+            PathBuf::from("/tmp/home/.local/share/tasker")
         );
     }
 

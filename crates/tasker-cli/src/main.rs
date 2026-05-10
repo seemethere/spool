@@ -1259,6 +1259,7 @@ async fn monitor(
             plain,
             once,
             config_path: paths.config_path.clone(),
+            data_dir: paths.data_dir.clone(),
             db_path: config.database.path,
         },
     )
@@ -2528,7 +2529,8 @@ mod tests {
     }
 
     #[test]
-    fn supervise_default_worker_command_forwards_only_explicit_config_path() {
+    fn supervise_default_worker_command_forwards_project_config_and_child_infers_project_data_dir()
+    {
         let temp = tempfile::tempdir().expect("tempdir");
         let config_path = temp.path().join("repo/.tasker/config.toml");
         let configured_db = temp.path().join("repo/.tasker/data/project.db");
@@ -2576,6 +2578,7 @@ mod tests {
         );
         assert!(!command.contains(&"--data-dir".to_string()));
         assert!(!command.contains(&"--db-path".to_string()));
+        assert_eq!(paths.data_dir, temp.path().join("repo/.tasker/data"));
         assert_eq!(
             resolved_database_path(&paths, false).expect("database path"),
             configured_db
