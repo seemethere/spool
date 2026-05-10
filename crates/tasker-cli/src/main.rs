@@ -2,6 +2,7 @@ use std::{
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
 };
 
 use anyhow::{Context, Result};
@@ -999,6 +1000,8 @@ fn print_manual_merge_inspection(
         }
     );
     println!();
+    print_local_worktree_git_inspection(local_worktree, task_branch, &queue.main_branch);
+    println!();
     println!("Latest Agent Run:");
     if let Some(run) = latest_run {
         println!("  id: {}", run.run.id);
@@ -1047,6 +1050,11 @@ fn print_manual_merge_inspection(
         );
     }
     println!();
+    println!("Suggested validation commands:");
+    println!("  cargo test");
+    println!("  cargo clippy --all-targets --all-features -- -D warnings");
+    println!("  if TypeScript extension files changed: (cd extensions/tasker-pi && bun test && bun run build)");
+    println!();
     println!("Operator-side checklist:");
     println!("  1. Inspect Tasker state, latest Agent Run, Run Transcript, and Workpad Note.");
     println!("  2. From the Local Worktree, verify a clean working tree and focused Task Commits.");
@@ -1056,6 +1064,98 @@ fn print_manual_merge_inspection(
         "  5. After the manual merge, run: tasker merge done {} --manual",
         detail.task.identifier
     );
+}
+
+fn print_local_worktree_git_inspection(
+    local_worktree: Option<&str>,
+    task_branch: Option<&str>,
+    main_branch: &str,
+) {
+    println!("Local Worktree Git inspection (read-only):");
+    println!("  Git mutations: none; commands below are inspection-only");
+    let Some(local_worktree) = local_worktree else {
+        println!("  clean: unknown (missing Local Worktree Task Link)");
+        println!("  diff from Main Branch: unavailable");
+        return;
+    };
+
+    let worktree = Path::new(local_worktree);
+    if !worktree.exists() {
+        println!("  clean: unknown (Local Worktree path does not exist)");
+        println!("  diff from Main Branch: unavailable");
+        return;
+    }
+
+    match git_output(worktree, &["status", "--porcelain"]) {
+        Ok(status) if status.trim().is_empty() => println!("  clean: yes"),
+        Ok(status) => {
+            println!("  clean: no");
+            for line in status.lines() {
+                println!("    {line}");
+            }
+        }
+        Err(error) => println!("  clean: unknown ({error})"),
+    }
+
+    match git_output(worktree, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Ok(branch) => {
+            let branch = branch.trim();
+            println!("  checked-out branch: {branch}");
+            if let Some(expected) = task_branch {
+                if branch != expected {
+                    println!("  warning: checked-out branch differs from Task Branch {expected}");
+                }
+            }
+        }
+        Err(error) => println!("  checked-out branch: unknown ({error})"),
+    }
+
+    let comparison = format!("{main_branch}...HEAD");
+    match git_output(worktree, &["diff", "--stat", &comparison]) {
+        Ok(stat) if stat.trim().is_empty() => {
+            println!("  diff from Main Branch ({comparison}): no file changes")
+        }
+        Ok(stat) => {
+            println!("  diff from Main Branch ({comparison}):");
+            for line in stat.lines() {
+                println!("    {line}");
+            }
+        }
+        Err(error) => println!("  diff from Main Branch ({comparison}): unavailable ({error})"),
+    }
+
+    let commits = format!("{main_branch}..HEAD");
+    match git_output(worktree, &["log", "--oneline", &commits]) {
+        Ok(log) if log.trim().is_empty() => {
+            println!("  Task Commits since Main Branch ({commits}): none")
+        }
+        Ok(log) => {
+            println!("  Task Commits since Main Branch ({commits}):");
+            for line in log.lines() {
+                println!("    {line}");
+            }
+        }
+        Err(error) => {
+            println!("  Task Commits since Main Branch ({commits}): unavailable ({error})")
+        }
+    }
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run git {:?} in {}", args, repo.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 async fn serve(
@@ -1528,6 +1628,33 @@ Implement Bootstrap Task Creation.
             args,
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn merge_inspection_git_commands_report_cleanliness_and_main_diff() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        init_git_repo(&repo);
+        git(&repo, &["checkout", "-b", "tasker/TASK-1"]);
+        fs::write(repo.join("feature.txt"), "feature\n").expect("feature");
+        git(&repo, &["add", "feature.txt"]);
+        git(&repo, &["commit", "-m", "add feature"]);
+
+        assert!(git_output(&repo, &["status", "--porcelain"])
+            .expect("status")
+            .trim()
+            .is_empty());
+        assert!(git_output(&repo, &["diff", "--stat", "main...HEAD"])
+            .expect("diff stat")
+            .contains("feature.txt"));
+        assert!(git_output(&repo, &["log", "--oneline", "main..HEAD"])
+            .expect("log")
+            .contains("add feature"));
+
+        fs::write(repo.join("scratch.txt"), "scratch\n").expect("scratch");
+        assert!(git_output(&repo, &["status", "--porcelain"])
+            .expect("dirty status")
+            .contains("scratch.txt"));
     }
 
     #[test]

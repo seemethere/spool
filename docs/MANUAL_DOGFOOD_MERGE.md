@@ -22,13 +22,13 @@ Do not batch-merge several **Task Branches** without separately inspecting their
 
 ## Inspect the Task and Agent Run
 
-The temporary CLI helper prints a Manual Dogfood Merge inspection plan without running Git commands:
+The temporary CLI helper prints a Manual Dogfood Merge inspection plan and runs only read-only Git inspection commands from the **Local Worktree**:
 
 ```bash
 cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data merge inspect <task-identifier>
 ```
 
-It summarizes the **Local Worktree**, **Task Branch**, latest **Agent Run**, **Run Transcript**, **Launcher Session Data**, and **Workpad Note** presence. For deeper inspection, use the underlying Tasker reads:
+It summarizes the **Local Worktree**, **Task Branch**, whether the worktree is clean, how the **Task Branch** differs from the **Main Branch**, suggested validation commands, latest **Agent Run**, **Run Transcript**, **Launcher Session Data**, and **Workpad Note** presence. It does not mutate Git state, and any later refresh or merge remains an operator-side action outside the **Tasker Service**. For deeper inspection, use the underlying Tasker reads:
 
 ```bash
 cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data task show <task-identifier>
@@ -43,6 +43,7 @@ Check:
 - **Run Transcript** path and failure reason, if any
 - **Launcher Session Data** captured for the run
 - **Workpad Note** handoff, evidence, and follow-up notes
+- Read-only Git inspection output: clean/dirty status, diff stats from **Main Branch**, and **Task Commits** since **Main Branch**
 
 If more than one **Agent Run** exists, prefer the latest completed run for handoff evidence, but scan earlier failed or expired runs for unresolved warnings.
 
