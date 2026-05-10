@@ -593,6 +593,17 @@ pub struct FinishRunInput {
     pub retry_hold_seconds: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorFailRunInput {
+    pub failure_reason: String,
+    pub retry_hold_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetryTaskInput {
+    pub reason: String,
+}
+
 pub async fn create_task(
     pool: &SqlitePool,
     input: &CreateTask,
@@ -1823,6 +1834,203 @@ pub async fn finish_run(
     Ok(run)
 }
 
+pub async fn operator_fail_run(
+    pool: &SqlitePool,
+    run_id: &str,
+    input: &OperatorFailRunInput,
+    actor: &Actor,
+) -> Result<AgentRun> {
+    validate_operator_actor(actor)?;
+    ensure_not_blank("failure reason", &input.failure_reason)?;
+    if let Some(seconds) = input.retry_hold_seconds {
+        validate_positive_seconds("retry_hold_seconds", seconds)?;
+    }
+
+    let mut tx = pool.begin().await.context("failed to begin transaction")?;
+    let run = sqlx::query_as::<_, AgentRun>(
+        r#"
+        UPDATE agent_runs
+        SET outcome = 'failed', failure_reason = ?, finished_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND outcome IS NULL
+        RETURNING id, task_id, task_queue_id, worker_actor_kind, worker_actor_id,
+                  worker_actor_display_name, worker_id, launcher_kind, lease_expires_at,
+                  last_heartbeat_at, outcome, failure_reason, created_at, finished_at
+        "#,
+    )
+    .bind(input.failure_reason.trim())
+    .bind(run_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("failed to fail Agent Run")?
+    .with_context(|| format!("active Agent Run {run_id} not found"))?;
+
+    let seconds = input.retry_hold_seconds.unwrap_or(60);
+    sqlx::query(
+        r#"
+        INSERT INTO task_retry_holds (task_id, agent_run_id, hold_until, reason)
+        VALUES (?, ?, datetime('now', '+' || ? || ' seconds'), ?)
+        ON CONFLICT(task_id) DO UPDATE SET
+            agent_run_id = excluded.agent_run_id,
+            hold_until = excluded.hold_until,
+            reason = excluded.reason,
+            created_at = CURRENT_TIMESTAMP
+        "#,
+    )
+    .bind(&run.task_id)
+    .bind(&run.id)
+    .bind(seconds)
+    .bind(input.failure_reason.trim())
+    .execute(&mut *tx)
+    .await
+    .context("failed to create Retry Hold")?;
+
+    append_audit_event_in_tx(
+        &mut tx,
+        actor,
+        "task.retry_hold_created",
+        "task",
+        &run.task_id,
+        serde_json::json!({
+            "agent_run_id": run.id,
+            "hold_seconds": seconds,
+            "reason": input.failure_reason.trim(),
+        }),
+    )
+    .await?;
+    append_audit_event_in_tx(
+        &mut tx,
+        actor,
+        "agent_run.operator_failed",
+        "agent_run",
+        &run.id,
+        serde_json::json!({
+            "reason": input.failure_reason.trim(),
+            "retry_hold_seconds": seconds,
+        }),
+    )
+    .await?;
+
+    tx.commit().await.context("failed to commit transaction")?;
+    Ok(run)
+}
+
+pub async fn retry_task(
+    pool: &SqlitePool,
+    identifier: &str,
+    input: &RetryTaskInput,
+    actor: &Actor,
+) -> Result<TaskDetail> {
+    validate_operator_actor(actor)?;
+    ensure_not_blank("retry reason", &input.reason)?;
+
+    let mut tx = pool.begin().await.context("failed to begin transaction")?;
+    expire_stale_agent_runs(&mut tx).await?;
+
+    let task = sqlx::query_as::<_, Task>(
+        r#"
+        SELECT tasks.id, tasks.task_queue_id, task_queues.key AS task_queue_key,
+               tasks.identifier, tasks.sequence, tasks.title, tasks.brief, tasks.priority,
+               tasks.state, tasks.review_required, tasks.created_at, tasks.updated_at
+        FROM tasks
+        JOIN task_queues ON task_queues.id = tasks.task_queue_id
+        WHERE tasks.identifier = ?
+        "#,
+    )
+    .bind(identifier)
+    .fetch_optional(&mut *tx)
+    .await
+    .with_context(|| format!("failed to load Task {identifier}"))?
+    .with_context(|| format!("Task {identifier} not found"))?;
+
+    if !matches!(
+        task.state.as_str(),
+        "in_progress" | "rework" | "integrating" | "canceled"
+    ) {
+        anyhow::bail!(
+            "Retry recovery requires Task State in_progress, rework, integrating, or canceled; current state is {}",
+            task.state
+        );
+    }
+    ensure_ready_requirements_exist(&mut tx, &task.id).await?;
+
+    let active_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*) FROM agent_runs
+        WHERE task_id = ? AND outcome IS NULL AND lease_expires_at > CURRENT_TIMESTAMP
+        "#,
+    )
+    .bind(&task.id)
+    .fetch_one(&mut *tx)
+    .await
+    .context("failed to count active Agent Runs")?;
+    if active_count > 0 {
+        anyhow::bail!("cannot retry Task while it has active Agent Runs");
+    }
+
+    let previous_run_outcome: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT outcome FROM agent_runs
+        WHERE task_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(&task.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("failed to load latest Agent Run outcome")?;
+
+    let deleted_holds = sqlx::query("DELETE FROM task_retry_holds WHERE task_id = ?")
+        .bind(&task.id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to clear Retry Hold")?;
+    if deleted_holds.rows_affected() > 0 {
+        append_audit_event_in_tx(
+            &mut tx,
+            actor,
+            "task.retry_hold_cleared",
+            "task",
+            &task.id,
+            serde_json::json!({ "identifier": identifier, "reason": "operator retry" }),
+        )
+        .await?;
+    }
+
+    let update = sqlx::query(
+        "UPDATE tasks SET state = 'ready', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?",
+    )
+    .bind(&task.id)
+    .bind(&task.state)
+    .execute(&mut *tx)
+    .await
+    .context("failed to move Task to Ready for retry")?;
+    if update.rows_affected() != 1 {
+        anyhow::bail!("Task State changed while attempting retry recovery");
+    }
+
+    append_audit_event_in_tx(
+        &mut tx,
+        actor,
+        "task.retry_requested",
+        "task",
+        &task.id,
+        serde_json::json!({
+            "identifier": identifier,
+            "from": task.state,
+            "to": "ready",
+            "reason": input.reason.trim(),
+            "latest_agent_run_outcome": previous_run_outcome,
+        }),
+    )
+    .await?;
+
+    tx.commit().await.context("failed to commit transaction")?;
+    get_task_detail(pool, identifier)
+        .await?
+        .with_context(|| format!("retried Task {identifier} was not found"))
+}
+
 pub async fn get_agent_run(pool: &SqlitePool, run_id: &str) -> Result<Option<AgentRun>> {
     let select_run_sql = agent_run_select_sql("WHERE id = ?");
     sqlx::query_as::<_, AgentRun>(&select_run_sql)
@@ -2307,6 +2515,14 @@ fn validate_worker_actor(actor: &Actor) -> Result<()> {
     validate_actor(actor)?;
     if actor.kind != "worker_agent" {
         anyhow::bail!("Agent Run mutations require a Worker Agent actor");
+    }
+    Ok(())
+}
+
+fn validate_operator_actor(actor: &Actor) -> Result<()> {
+    validate_actor(actor)?;
+    if actor.kind != "operator" {
+        anyhow::bail!("recovery commands require an Operator actor");
     }
     Ok(())
 }
@@ -3700,6 +3916,178 @@ mod tests {
             .await
             .expect("claim")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn operator_fail_run_records_retry_hold_and_audit_events() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Run"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
+        let claimed = claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim")
+            .expect("claimed task");
+
+        let failed = operator_fail_run(
+            &pool,
+            &claimed.run.id,
+            &OperatorFailRunInput {
+                failure_reason: "SQLite database is locked".to_string(),
+                retry_hold_seconds: Some(120),
+            },
+            &Actor::operator("operator"),
+        )
+        .await
+        .expect("operator fail run");
+
+        assert_eq!(failed.outcome.as_deref(), Some("failed"));
+        assert_eq!(
+            failed.failure_reason.as_deref(),
+            Some("SQLite database is locked")
+        );
+        assert!(claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim")
+            .is_none());
+        let events = list_audit_events(&pool).await.expect("events");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "agent_run.operator_failed"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "task.retry_hold_created"));
+    }
+
+    #[tokio::test]
+    async fn retry_task_moves_resolved_failed_task_to_ready_and_clears_hold() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Run"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
+        let claimed = claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim")
+            .expect("claimed task");
+        finish_run(
+            &pool,
+            &claimed.run.id,
+            &FinishRunInput {
+                outcome: "failed".to_string(),
+                failure_reason: Some("fake failure".to_string()),
+                retry_hold_seconds: Some(60),
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("finish failed");
+
+        let retried = retry_task(
+            &pool,
+            "TASK-1",
+            &RetryTaskInput {
+                reason: "operator retry after fixing local lock".to_string(),
+            },
+            &Actor::operator("operator"),
+        )
+        .await
+        .expect("retry task");
+
+        assert_eq!(retried.task.state, "ready");
+        let reclaimed = claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim")
+            .expect("reclaimed task");
+        assert_eq!(reclaimed.task.task.identifier, "TASK-1");
+        let events = list_audit_events(&pool).await.expect("events");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "task.retry_requested"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "task.retry_hold_cleared"));
+    }
+
+    #[tokio::test]
+    async fn retry_task_resolves_expired_stuck_run_but_rejects_live_run() {
+        let (_temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Run"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
+        let claimed = claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim")
+            .expect("claimed task");
+
+        let live_error = retry_task(
+            &pool,
+            "TASK-1",
+            &RetryTaskInput {
+                reason: "too soon".to_string(),
+            },
+            &Actor::operator("operator"),
+        )
+        .await
+        .expect_err("live run blocks retry");
+        assert!(live_error.to_string().contains("active Agent Runs"));
+
+        sqlx::query(
+            "UPDATE agent_runs SET lease_expires_at = datetime('now', '-1 second') WHERE id = ?",
+        )
+        .bind(&claimed.run.id)
+        .execute(&pool)
+        .await
+        .expect("backdate lease");
+
+        let retried = retry_task(
+            &pool,
+            "TASK-1",
+            &RetryTaskInput {
+                reason: "lease expired".to_string(),
+            },
+            &Actor::operator("operator"),
+        )
+        .await
+        .expect("retry expired task");
+        assert_eq!(retried.task.state, "ready");
+        let run = get_agent_run(&pool, &claimed.run.id)
+            .await
+            .expect("run")
+            .expect("exists");
+        assert_eq!(run.outcome.as_deref(), Some("expired"));
     }
 
     #[tokio::test]
