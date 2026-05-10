@@ -127,6 +127,9 @@ enum Command {
         /// Worker command prefix for tests/debugging; --actor is appended automatically.
         #[arg(long, value_delimiter = ' ')]
         worker_command: Option<Vec<String>>,
+        /// Intentionally bypass the per-Task Queue supervisor lock.
+        #[arg(long)]
+        allow_overlap: bool,
     },
     /// Inspect Agent Runs.
     Run {
@@ -411,6 +414,7 @@ struct SuperviseOptions {
     poll_seconds: u64,
     launcher: String,
     worker_command: Option<Vec<String>>,
+    allow_overlap: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -494,6 +498,7 @@ async fn main() -> Result<()> {
             poll_seconds,
             launcher,
             worker_command,
+            allow_overlap,
         }) => {
             supervise(
                 &paths,
@@ -510,6 +515,7 @@ async fn main() -> Result<()> {
                     poll_seconds,
                     launcher,
                     worker_command,
+                    allow_overlap,
                 },
             )
             .await
@@ -1216,6 +1222,8 @@ async fn supervise(
             timeout_seconds: options.timeout_seconds,
             poll_seconds: options.poll_seconds,
             worker_command: command,
+            lock_dir: paths.data_dir.join("supervisors"),
+            allow_overlap: options.allow_overlap,
         },
     )
     .await?;
@@ -1956,6 +1964,7 @@ mod tests {
                 poll_seconds: 5,
                 launcher: "pi".to_string(),
                 worker_command: None,
+                allow_overlap: false,
             },
         );
 
@@ -1997,6 +2006,7 @@ mod tests {
                 poll_seconds: 5,
                 launcher: "fake".to_string(),
                 worker_command: None,
+                allow_overlap: false,
             },
         );
 
@@ -2079,6 +2089,7 @@ mod tests {
             poll_seconds: 1,
             launcher: "fake".to_string(),
             worker_command: None,
+            allow_overlap: false,
         });
 
         let context = active_tasker_context(&command, &paths, true).expect("active context");

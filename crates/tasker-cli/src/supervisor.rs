@@ -2,13 +2,13 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::Read,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 use tokio::time::sleep;
 
@@ -19,6 +19,8 @@ pub struct SupervisorOptions {
     pub timeout_seconds: u64,
     pub poll_seconds: u64,
     pub worker_command: Vec<String>,
+    pub lock_dir: PathBuf,
+    pub allow_overlap: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +77,19 @@ pub async fn supervise_batch(
         !options.worker_command.is_empty(),
         "worker command must not be empty"
     );
+
+    let _lock_guard = if options.allow_overlap {
+        eprintln!(
+            "warning: --allow-overlap set; not taking supervisor lock for Task Queue {}",
+            options.queue
+        );
+        None
+    } else {
+        Some(SupervisorLock::acquire(
+            &options.queue,
+            options.lock_dir.clone(),
+        )?)
+    };
 
     let deadline = Instant::now() + Duration::from_secs(options.timeout_seconds);
     let status_dir = supervisor_status_dir()?;
@@ -297,6 +312,139 @@ impl SupervisorReports {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SupervisorLockFile {
+    tasker_supervisor_lock: bool,
+    queue: String,
+    pid: u32,
+    started_at_unix_ms: u128,
+}
+
+#[derive(Debug)]
+struct SupervisorLock {
+    path: PathBuf,
+    contents: String,
+}
+
+impl SupervisorLock {
+    fn acquire(queue: &str, lock_dir: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&lock_dir).with_context(|| {
+            format!(
+                "failed to create supervisor lock directory {}",
+                lock_dir.display()
+            )
+        })?;
+        let path = lock_dir.join(format!("{}.lock", lock_file_queue_slug(queue)));
+        loop {
+            let contents = supervisor_lock_contents(queue)?;
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    file.write_all(contents.as_bytes()).with_context(|| {
+                        format!("failed to write supervisor lock {}", path.display())
+                    })?;
+                    return Ok(Self { path, contents });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if remove_stale_supervisor_lock(queue, &path)? {
+                        continue;
+                    }
+                    anyhow::bail!(active_supervisor_lock_message(queue, &path));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to create supervisor lock {}", path.display())
+                    });
+                }
+            }
+        }
+    }
+}
+
+impl Drop for SupervisorLock {
+    fn drop(&mut self) {
+        let Ok(existing) = fs::read_to_string(&self.path) else {
+            return;
+        };
+        if existing == self.contents {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn supervisor_lock_contents(queue: &str) -> Result<String> {
+    let started_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    serde_json::to_string_pretty(&SupervisorLockFile {
+        tasker_supervisor_lock: true,
+        queue: queue.to_string(),
+        pid: std::process::id(),
+        started_at_unix_ms,
+    })
+    .context("failed to serialize supervisor lock")
+}
+
+fn remove_stale_supervisor_lock(queue: &str, path: &Path) -> Result<bool> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read supervisor lock {}", path.display()))?;
+    let lock = serde_json::from_str::<SupervisorLockFile>(&text).ok();
+    let Some(lock) = lock else {
+        return Ok(false);
+    };
+    if lock.queue != queue || is_process_alive(lock.pid) {
+        return Ok(false);
+    }
+    fs::remove_file(path)
+        .with_context(|| format!("failed to remove stale supervisor lock {}", path.display()))?;
+    eprintln!(
+        "removed stale supervisor lock for Task Queue {} at {} from exited pid {}",
+        queue,
+        path.display(),
+        lock.pid
+    );
+    Ok(true)
+}
+
+fn active_supervisor_lock_message(queue: &str, path: &Path) -> String {
+    format!(
+        "another active supervisor appears to hold Task Queue {queue}; refusing to start overlapping Worker Loop claims. Lock file: {}. Inspect the existing supervisor process and Tasker state with `ps -p <pid>` and `tasker status --queue {queue}`. If the supervisor crashed and the lock is stale, rerun after the process exits; Tasker removes stale locks automatically when the recorded pid is gone. To clear corrupted stale state, delete the lock file manually. Use --allow-overlap only for intentional recovery.",
+        path.display()
+    )
+}
+
+fn lock_file_queue_slug(queue: &str) -> String {
+    let mut slug = String::new();
+    for byte in queue.as_bytes() {
+        let ch = *byte as char;
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            slug.push(ch);
+        } else {
+            slug.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    slug
+}
+
+fn is_process_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn supervisor_status_dir() -> Result<PathBuf> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -457,6 +605,8 @@ mod tests {
                 timeout_seconds: 2,
                 poll_seconds: 1,
                 worker_command: vec![script.display().to_string()],
+                lock_dir: temp.path().join("supervisors"),
+                allow_overlap: false,
             },
         )
         .await
@@ -488,6 +638,8 @@ mod tests {
                 timeout_seconds: 2,
                 poll_seconds: 1,
                 worker_command: vec![script.display().to_string()],
+                lock_dir: temp.path().join("supervisors"),
+                allow_overlap: false,
             },
         )
         .await
@@ -515,6 +667,8 @@ mod tests {
                 timeout_seconds: 2,
                 poll_seconds: 1,
                 worker_command: vec![script.display().to_string()],
+                lock_dir: temp.path().join("supervisors"),
+                allow_overlap: false,
             },
         )
         .await
@@ -523,6 +677,61 @@ mod tests {
         assert_eq!(outcome.failed_workers, 1);
         assert_eq!(outcome.stuck_runs.len(), 1);
         assert_eq!(outcome.stuck_runs[0].agent_run_id, "run-1");
+    }
+
+    #[test]
+    fn supervisor_lock_refuses_same_queue_overlap() {
+        let temp = TempDir::new().expect("tempdir");
+        let lock_dir = temp.path().join("supervisors");
+        let _first = SupervisorLock::acquire("TASK", lock_dir.clone()).expect("first lock");
+
+        let error = SupervisorLock::acquire("TASK", lock_dir).expect_err("second lock fails");
+
+        let message = error.to_string();
+        assert!(message.contains("another active supervisor"));
+        assert!(message.contains("tasker status --queue TASK"));
+        assert!(message.contains("--allow-overlap"));
+    }
+
+    #[test]
+    fn supervisor_lock_allows_different_queues() {
+        let temp = TempDir::new().expect("tempdir");
+        let lock_dir = temp.path().join("supervisors");
+        let _task = SupervisorLock::acquire("TASK", lock_dir.clone()).expect("TASK lock");
+        let _other = SupervisorLock::acquire("OTHER", lock_dir).expect("OTHER lock");
+    }
+
+    #[test]
+    fn supervisor_lock_slug_is_collision_resistant() {
+        assert_eq!(lock_file_queue_slug("TASK"), "TASK");
+        assert_eq!(lock_file_queue_slug("TASK A"), "TASK%20A");
+        assert_ne!(
+            lock_file_queue_slug("TASK A"),
+            lock_file_queue_slug("TASK_A")
+        );
+    }
+
+    #[test]
+    fn supervisor_lock_recovers_stale_pid() {
+        let temp = TempDir::new().expect("tempdir");
+        let lock_dir = temp.path().join("supervisors");
+        fs::create_dir_all(&lock_dir).expect("lock dir");
+        let lock_path = lock_dir.join("TASK.lock");
+        let stale = SupervisorLockFile {
+            tasker_supervisor_lock: true,
+            queue: "TASK".to_string(),
+            pid: u32::MAX,
+            started_at_unix_ms: 1,
+        };
+        fs::write(
+            &lock_path,
+            serde_json::to_string_pretty(&stale).expect("stale json"),
+        )
+        .expect("stale lock");
+
+        let _lock = SupervisorLock::acquire("TASK", lock_dir).expect("recovered lock");
+        let recovered = fs::read_to_string(lock_path).expect("lock contents");
+        assert!(recovered.contains(&format!("\"pid\": {}", std::process::id())));
     }
 
     async fn empty_pool(path: &std::path::Path) -> SqlitePool {
