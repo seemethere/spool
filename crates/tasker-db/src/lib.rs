@@ -1,4 +1,4 @@
-use std::{future::Future, path::Path};
+use std::{fs, future::Future, path::Path};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -668,6 +668,27 @@ pub struct LauncherSessionData {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct AgentRunMetrics {
+    pub agent_run_id: String,
+    pub duration_ms: Option<i64>,
+    pub launcher_kind: String,
+    pub final_status: Option<String>,
+    pub exit_code: Option<i64>,
+    pub timed_out: Option<i64>,
+    pub unattended_question_detected: Option<i64>,
+    pub blocking_ui_detected: Option<i64>,
+    pub transcript_path: Option<String>,
+    pub transcript_byte_size: Option<i64>,
+    pub transcript_jsonl_event_count: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub warnings_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpsertLauncherSessionData {
     pub launcher_kind: String,
@@ -686,6 +707,7 @@ pub struct AgentRunDetail {
     pub run: AgentRun,
     pub task: TaskDetail,
     pub launcher_session_data: Option<LauncherSessionData>,
+    pub metrics: Option<AgentRunMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2219,6 +2241,7 @@ pub async fn finish_run(
     )
     .await?;
     tx.commit().await.context("failed to commit transaction")?;
+    refresh_agent_run_metrics(pool, &run.id).await?;
     Ok(run)
 }
 
@@ -2299,6 +2322,7 @@ pub async fn operator_fail_run(
     .await?;
 
     tx.commit().await.context("failed to commit transaction")?;
+    refresh_agent_run_metrics(pool, &run.id).await?;
     Ok(run)
 }
 
@@ -2574,6 +2598,7 @@ pub async fn upsert_launcher_session_data(
     )
     .await?;
     tx.commit().await.context("failed to commit transaction")?;
+    refresh_agent_run_metrics(pool, agent_run_id).await?;
     get_launcher_session_data(pool, agent_run_id)
         .await?
         .with_context(|| format!("Launcher Session Data for Agent Run {agent_run_id} not found"))
@@ -2595,6 +2620,274 @@ pub async fn get_launcher_session_data(
     .fetch_optional(pool)
     .await
     .with_context(|| format!("failed to load Launcher Session Data for Agent Run {agent_run_id}"))
+}
+
+pub async fn get_agent_run_metrics(
+    pool: &SqlitePool,
+    agent_run_id: &str,
+) -> Result<Option<AgentRunMetrics>> {
+    sqlx::query_as::<_, AgentRunMetrics>(
+        r#"
+        SELECT agent_run_id, duration_ms, launcher_kind, final_status, exit_code, timed_out,
+               unattended_question_detected, blocking_ui_detected, transcript_path,
+               transcript_byte_size, transcript_jsonl_event_count, input_tokens, output_tokens,
+               total_tokens, warnings_json, created_at, updated_at
+        FROM agent_run_metrics
+        WHERE agent_run_id = ?
+        "#,
+    )
+    .bind(agent_run_id)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| format!("failed to load Agent Run metrics for Agent Run {agent_run_id}"))
+}
+
+pub async fn refresh_agent_run_metrics(
+    pool: &SqlitePool,
+    agent_run_id: &str,
+) -> Result<Option<AgentRunMetrics>> {
+    let Some(run) = get_agent_run(pool, agent_run_id).await? else {
+        anyhow::bail!("Agent Run {agent_run_id} not found");
+    };
+    if run.outcome.is_none() {
+        return Ok(None);
+    }
+    let session = get_launcher_session_data(pool, agent_run_id).await?;
+    let mut summary = AgentRunMetricsSummary::default();
+    if let Some(session) = &session {
+        summary.launcher_kind = session.launcher_kind.clone();
+        summary.final_status = session.final_status.clone().or_else(|| run.outcome.clone());
+        summary.transcript_path = session.transcript_path.clone();
+        summary.observe_launcher_raw_json(session.raw_json.as_deref());
+        if let Some(path) = &session.transcript_path {
+            summary.observe_transcript(Path::new(path));
+        }
+    } else {
+        summary.launcher_kind = run.launcher_kind.clone();
+        summary.final_status = run.outcome.clone();
+        summary
+            .warnings
+            .push("Launcher Session Data not recorded".to_string());
+    }
+    let warnings_json = serde_json::to_string(&summary.warnings)
+        .context("failed to serialize Agent Run metrics warnings")?;
+    sqlx::query(
+        r#"
+        INSERT INTO agent_run_metrics (
+            agent_run_id, duration_ms, launcher_kind, final_status, exit_code, timed_out,
+            unattended_question_detected, blocking_ui_detected, transcript_path,
+            transcript_byte_size, transcript_jsonl_event_count, input_tokens, output_tokens,
+            total_tokens, warnings_json
+        )
+        SELECT
+            agent_runs.id,
+            CAST((julianday(agent_runs.finished_at) - julianday(agent_runs.created_at)) * 86400000 AS INTEGER),
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        FROM agent_runs
+        WHERE agent_runs.id = ? AND agent_runs.outcome IS NOT NULL
+        ON CONFLICT(agent_run_id) DO UPDATE SET
+            duration_ms = excluded.duration_ms,
+            launcher_kind = excluded.launcher_kind,
+            final_status = excluded.final_status,
+            exit_code = excluded.exit_code,
+            timed_out = excluded.timed_out,
+            unattended_question_detected = excluded.unattended_question_detected,
+            blocking_ui_detected = excluded.blocking_ui_detected,
+            transcript_path = excluded.transcript_path,
+            transcript_byte_size = excluded.transcript_byte_size,
+            transcript_jsonl_event_count = excluded.transcript_jsonl_event_count,
+            input_tokens = excluded.input_tokens,
+            output_tokens = excluded.output_tokens,
+            total_tokens = excluded.total_tokens,
+            warnings_json = excluded.warnings_json,
+            updated_at = CURRENT_TIMESTAMP
+        "#,
+    )
+    .bind(&summary.launcher_kind)
+    .bind(&summary.final_status)
+    .bind(summary.exit_code)
+    .bind(summary.timed_out.map(bool_to_i64))
+    .bind(summary.unattended_question_detected.map(bool_to_i64))
+    .bind(summary.blocking_ui_detected.map(bool_to_i64))
+    .bind(&summary.transcript_path)
+    .bind(summary.transcript_byte_size)
+    .bind(summary.transcript_jsonl_event_count)
+    .bind(summary.input_tokens)
+    .bind(summary.output_tokens)
+    .bind(summary.total_tokens)
+    .bind(warnings_json)
+    .bind(agent_run_id)
+    .execute(pool)
+    .await
+    .with_context(|| format!("failed to persist Agent Run metrics for Agent Run {agent_run_id}"))?;
+    get_agent_run_metrics(pool, agent_run_id).await
+}
+
+#[derive(Debug, Default)]
+struct AgentRunMetricsSummary {
+    launcher_kind: String,
+    final_status: Option<String>,
+    exit_code: Option<i64>,
+    timed_out: Option<bool>,
+    unattended_question_detected: Option<bool>,
+    blocking_ui_detected: Option<bool>,
+    transcript_path: Option<String>,
+    transcript_byte_size: Option<i64>,
+    transcript_jsonl_event_count: Option<i64>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    warnings: Vec<String>,
+}
+
+impl AgentRunMetricsSummary {
+    fn observe_launcher_raw_json(&mut self, raw_json: Option<&str>) {
+        let Some(raw_json) = raw_json else { return };
+        match serde_json::from_str::<serde_json::Value>(raw_json) {
+            Ok(value) => {
+                self.exit_code = self.exit_code.or_else(|| json_i64(&value, &["exit_code"]));
+                self.timed_out = self.timed_out.or_else(|| json_bool(&value, &["timed_out"]));
+                self.unattended_question_detected = self
+                    .unattended_question_detected
+                    .or_else(|| json_bool(&value, &["unattended_question_detected"]));
+                self.input_tokens = self.input_tokens.or_else(|| {
+                    first_json_i64(
+                        &value,
+                        &[
+                            &["input_tokens"],
+                            &["usage", "input_tokens"],
+                            &["usage", "prompt_tokens"],
+                        ],
+                    )
+                });
+                self.output_tokens = self.output_tokens.or_else(|| {
+                    first_json_i64(
+                        &value,
+                        &[
+                            &["output_tokens"],
+                            &["usage", "output_tokens"],
+                            &["usage", "completion_tokens"],
+                        ],
+                    )
+                });
+                self.total_tokens = self.total_tokens.or_else(|| {
+                    first_json_i64(&value, &[&["total_tokens"], &["usage", "total_tokens"]])
+                });
+            }
+            Err(error) => self.warnings.push(format!(
+                "ignored malformed Launcher Session Data raw JSON: {error}"
+            )),
+        }
+    }
+
+    fn observe_transcript(&mut self, path: &Path) {
+        match fs::metadata(path) {
+            Ok(metadata) => self.transcript_byte_size = Some(metadata.len() as i64),
+            Err(error) => {
+                self.warnings.push(format!(
+                    "could not stat Run Transcript {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) => {
+                self.warnings.push(format!(
+                    "could not read Run Transcript {}: {error}",
+                    path.display()
+                ));
+                return;
+            }
+        };
+        for (index, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<serde_json::Value>(trimmed) {
+                Ok(value) => {
+                    self.transcript_jsonl_event_count =
+                        Some(self.transcript_jsonl_event_count.unwrap_or(0) + 1);
+                    self.observe_transcript_record(&value);
+                }
+                Err(error) => self.warnings.push(format!(
+                    "ignored malformed Run Transcript line {}: {error}",
+                    index + 1
+                )),
+            }
+        }
+    }
+
+    fn observe_transcript_record(&mut self, value: &serde_json::Value) {
+        self.observe_event(value);
+        self.exit_code = self.exit_code.or_else(|| json_i64(value, &["status"]));
+        self.timed_out = self.timed_out.or_else(|| json_bool(value, &["timed_out"]));
+        self.unattended_question_detected = self
+            .unattended_question_detected
+            .or_else(|| json_bool(value, &["unattended_question_detected"]));
+        for field in ["stdout", "stderr"] {
+            if let Some(text) = value.get(field).and_then(|value| value.as_str()) {
+                for (index, line) in text.lines().enumerate() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || !trimmed.starts_with('{') {
+                        continue;
+                    }
+                    match serde_json::from_str::<serde_json::Value>(trimmed) {
+                        Ok(value) => self.observe_event(&value),
+                        Err(error) => self.warnings.push(format!(
+                            "ignored malformed JSON event in {field} line {}: {error}",
+                            index + 1
+                        )),
+                    }
+                }
+            }
+        }
+    }
+
+    fn observe_event(&mut self, value: &serde_json::Value) {
+        if value.get("type").and_then(|value| value.as_str()) == Some("extension_ui_request") {
+            let method = value
+                .get("method")
+                .or_else(|| value.get("method_name"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            if method != "notify" {
+                self.blocking_ui_detected = Some(true);
+            }
+        }
+        if value.get("event").and_then(|value| value.as_str()) == Some("question") {
+            self.unattended_question_detected = Some(true);
+        }
+    }
+}
+
+fn bool_to_i64(value: bool) -> i64 {
+    if value {
+        1
+    } else {
+        0
+    }
+}
+
+fn json_i64(value: &serde_json::Value, path: &[&str]) -> Option<i64> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    current.as_i64()
+}
+
+fn json_bool(value: &serde_json::Value, path: &[&str]) -> Option<bool> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    current.as_bool()
+}
+
+fn first_json_i64(value: &serde_json::Value, paths: &[&[&str]]) -> Option<i64> {
+    paths.iter().find_map(|path| json_i64(value, path))
 }
 
 pub async fn get_agent_run_detail(
@@ -2640,10 +2933,12 @@ async fn agent_run_detail_for_run(pool: &SqlitePool, run: AgentRun) -> Result<Ag
         .await?
         .with_context(|| format!("Task {identifier} for Agent Run {} not found", run.id))?;
     let launcher_session_data = get_launcher_session_data(pool, &run.id).await?;
+    let metrics = get_agent_run_metrics(pool, &run.id).await?;
     Ok(AgentRunDetail {
         run,
         task,
         launcher_session_data,
+        metrics,
     })
 }
 
@@ -2706,6 +3001,31 @@ async fn expire_stale_agent_runs(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -
             serde_json::json!({ "reason": "Claim Lease expired" }),
         )
         .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO agent_run_metrics (
+                agent_run_id, duration_ms, launcher_kind, final_status, warnings_json
+            )
+            SELECT
+                id,
+                CAST((julianday(finished_at) - julianday(created_at)) * 86400000 AS INTEGER),
+                launcher_kind,
+                outcome,
+                '["Launcher Session Data not recorded"]'
+            FROM agent_runs
+            WHERE id = ?
+            ON CONFLICT(agent_run_id) DO UPDATE SET
+                duration_ms = excluded.duration_ms,
+                launcher_kind = excluded.launcher_kind,
+                final_status = excluded.final_status,
+                warnings_json = excluded.warnings_json,
+                updated_at = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(&run.id)
+        .execute(&mut **tx)
+        .await
+        .context("failed to persist expired Agent Run metrics")?;
     }
 
     Ok(())
@@ -4892,6 +5212,282 @@ mod tests {
                 .as_deref(),
             Some("/tmp/transcript.jsonl")
         );
+    }
+
+    #[tokio::test]
+    async fn persists_agent_run_metrics_for_fake_launcher_outcome() {
+        let (temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Run"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
+        let claimed = claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim")
+            .expect("claimed task");
+        let transcript_path = temp.path().join("fake.jsonl");
+        fs::write(
+            &transcript_path,
+            serde_json::json!({"launcher":"fake","agent_run_id":claimed.run.id}).to_string() + "\n",
+        )
+        .expect("write transcript");
+        upsert_launcher_session_data(
+            &pool,
+            &claimed.run.id,
+            &UpsertLauncherSessionData {
+                launcher_kind: "fake".to_string(),
+                session_id: Some(claimed.run.id.clone()),
+                model: None,
+                provider: None,
+                started_at: Some(claimed.run.created_at.clone()),
+                finished_at: None,
+                final_status: Some("completed".to_string()),
+                transcript_path: Some(transcript_path.display().to_string()),
+                raw_json: Some(
+                    r#"{"usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}}"#
+                        .to_string(),
+                ),
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("upsert session");
+        finish_run(
+            &pool,
+            &claimed.run.id,
+            &FinishRunInput {
+                outcome: "completed".to_string(),
+                failure_reason: None,
+                retry_hold_seconds: None,
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("finish run");
+
+        let metrics = get_agent_run_metrics(&pool, &claimed.run.id)
+            .await
+            .expect("metrics")
+            .expect("metrics recorded");
+        assert_eq!(metrics.launcher_kind, "fake");
+        assert_eq!(metrics.final_status.as_deref(), Some("completed"));
+        assert_eq!(metrics.transcript_jsonl_event_count, Some(1));
+        assert!(metrics.transcript_byte_size.unwrap_or_default() > 0);
+        assert_eq!(metrics.input_tokens, Some(11));
+        assert_eq!(metrics.output_tokens, Some(7));
+        assert_eq!(metrics.total_tokens, Some(18));
+    }
+
+    #[tokio::test]
+    async fn persists_agent_run_metrics_for_pi_launcher_outcome() {
+        let (temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Run"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
+        let pi_claim = ClaimNextInput {
+            launcher_kind: "pi".to_string(),
+            ..sample_claim("TASK")
+        };
+        let claimed = claim_next(&pool, &pi_claim, &worker_actor())
+            .await
+            .expect("claim")
+            .expect("claimed task");
+        let transcript_path = temp.path().join("pi.jsonl");
+        fs::write(
+            &transcript_path,
+            serde_json::json!({
+                "launcher":"pi",
+                "status":0,
+                "stdout":"{\"type\":\"agent_end\"}\n",
+                "stderr":"",
+                "unattended_question_detected":false,
+                "timed_out":false
+            })
+            .to_string()
+                + "\n",
+        )
+        .expect("write transcript");
+        upsert_launcher_session_data(
+            &pool,
+            &claimed.run.id,
+            &UpsertLauncherSessionData {
+                launcher_kind: "pi".to_string(),
+                session_id: Some(claimed.run.id.clone()),
+                model: None,
+                provider: None,
+                started_at: Some(claimed.run.created_at.clone()),
+                finished_at: None,
+                final_status: Some("completed".to_string()),
+                transcript_path: Some(transcript_path.display().to_string()),
+                raw_json: Some(
+                    r#"{"exit_code":0,"timed_out":false,"unattended_question_detected":false}"#
+                        .to_string(),
+                ),
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("upsert session");
+        finish_run(
+            &pool,
+            &claimed.run.id,
+            &FinishRunInput {
+                outcome: "completed".to_string(),
+                failure_reason: None,
+                retry_hold_seconds: None,
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("finish run");
+
+        let metrics = get_agent_run_metrics(&pool, &claimed.run.id)
+            .await
+            .expect("metrics")
+            .expect("metrics recorded");
+        assert_eq!(metrics.launcher_kind, "pi");
+        assert_eq!(metrics.exit_code, Some(0));
+        assert_eq!(metrics.timed_out, Some(0));
+        assert_eq!(metrics.unattended_question_detected, Some(0));
+        assert_eq!(metrics.transcript_jsonl_event_count, Some(1));
+    }
+
+    #[tokio::test]
+    async fn agent_run_metrics_warn_for_missing_and_malformed_transcripts() {
+        let (temp, pool) = migrated_pool().await;
+        create_task_queue(
+            &pool,
+            &sample_queue("TASK", "Tasker"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create queue");
+        create_task(
+            &pool,
+            &sample_task("TASK", "Run"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
+        let claimed = claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim")
+            .expect("claimed task");
+        let missing_path = temp.path().join("missing.jsonl");
+        upsert_launcher_session_data(
+            &pool,
+            &claimed.run.id,
+            &UpsertLauncherSessionData {
+                launcher_kind: "fake".to_string(),
+                session_id: Some(claimed.run.id.clone()),
+                model: None,
+                provider: None,
+                started_at: Some(claimed.run.created_at.clone()),
+                finished_at: None,
+                final_status: Some("failed".to_string()),
+                transcript_path: Some(missing_path.display().to_string()),
+                raw_json: Some("not-json".to_string()),
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("upsert session");
+        finish_run(
+            &pool,
+            &claimed.run.id,
+            &FinishRunInput {
+                outcome: "failed".to_string(),
+                failure_reason: Some("failed".to_string()),
+                retry_hold_seconds: Some(60),
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("finish run");
+        let missing_metrics = get_agent_run_metrics(&pool, &claimed.run.id)
+            .await
+            .expect("metrics")
+            .expect("metrics recorded");
+        assert!(missing_metrics
+            .warnings_json
+            .contains("could not read Run Transcript"));
+        assert!(missing_metrics
+            .warnings_json
+            .contains("ignored malformed Launcher Session Data raw JSON"));
+
+        create_task(
+            &pool,
+            &sample_task("TASK", "Run 2"),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task 2");
+        let claimed = claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+            .await
+            .expect("claim 2")
+            .expect("claimed task 2");
+        let malformed_path = temp.path().join("malformed.jsonl");
+        fs::write(&malformed_path, "not json\n{\"launcher\":\"fake\"}\n")
+            .expect("write malformed transcript");
+        upsert_launcher_session_data(
+            &pool,
+            &claimed.run.id,
+            &UpsertLauncherSessionData {
+                launcher_kind: "fake".to_string(),
+                session_id: Some(claimed.run.id.clone()),
+                model: None,
+                provider: None,
+                started_at: Some(claimed.run.created_at.clone()),
+                finished_at: None,
+                final_status: Some("completed".to_string()),
+                transcript_path: Some(malformed_path.display().to_string()),
+                raw_json: Some("{}".to_string()),
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("upsert session 2");
+        finish_run(
+            &pool,
+            &claimed.run.id,
+            &FinishRunInput {
+                outcome: "completed".to_string(),
+                failure_reason: None,
+                retry_hold_seconds: None,
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("finish run 2");
+        let malformed_metrics = get_agent_run_metrics(&pool, &claimed.run.id)
+            .await
+            .expect("metrics 2")
+            .expect("metrics recorded 2");
+        assert_eq!(malformed_metrics.transcript_jsonl_event_count, Some(1));
+        assert!(malformed_metrics
+            .warnings_json
+            .contains("ignored malformed Run Transcript line 1"));
     }
 
     #[tokio::test]

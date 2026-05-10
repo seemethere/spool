@@ -342,6 +342,67 @@ pub fn write_run_detail(mut writer: impl Write, detail: &tasker_db::AgentRunDeta
     } else {
         writeln!(writer, "  (none)")?;
     }
+    writeln!(writer, "\nNormalized Agent Run Metrics:")?;
+    if let Some(metrics) = &detail.metrics {
+        if let Some(duration_ms) = metrics.duration_ms {
+            writeln!(writer, "  duration: {duration_ms} ms")?;
+        }
+        writeln!(writer, "  launcher kind: {}", metrics.launcher_kind)?;
+        writeln!(
+            writer,
+            "  final status: {}",
+            metrics.final_status.as_deref().unwrap_or("not recorded")
+        )?;
+        if let Some(exit_code) = metrics.exit_code {
+            writeln!(writer, "  exit code: {exit_code}")?;
+        }
+        if let Some(timed_out) = metrics.timed_out {
+            writeln!(writer, "  timed out: {}", timed_out != 0)?;
+        }
+        if let Some(question) = metrics.unattended_question_detected {
+            writeln!(writer, "  unattended question detected: {}", question != 0)?;
+        }
+        if let Some(blocking_ui) = metrics.blocking_ui_detected {
+            writeln!(writer, "  blocking UI detected: {}", blocking_ui != 0)?;
+        }
+        if let Some(path) = &metrics.transcript_path {
+            writeln!(writer, "  transcript path: {path}")?;
+        }
+        if let Some(bytes) = metrics.transcript_byte_size {
+            writeln!(writer, "  transcript byte size: {bytes}")?;
+        }
+        if let Some(count) = metrics.transcript_jsonl_event_count {
+            writeln!(writer, "  JSONL event count: {count}")?;
+        }
+        if metrics.input_tokens.is_some()
+            || metrics.output_tokens.is_some()
+            || metrics.total_tokens.is_some()
+        {
+            writeln!(
+                writer,
+                "  tokens: input={} output={} total={}",
+                metrics
+                    .input_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                metrics
+                    .output_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                metrics
+                    .total_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            )?;
+        }
+        if let Ok(warnings) = serde_json::from_str::<Vec<String>>(&metrics.warnings_json) {
+            for warning in warnings {
+                writeln!(writer, "  warning: {warning}")?;
+            }
+        }
+    } else {
+        writeln!(writer, "  (not recorded)")?;
+    }
     Ok(())
 }
 
@@ -416,6 +477,7 @@ mod tests {
                 created_at: "now".to_string(),
                 updated_at: "now".to_string(),
             }),
+            metrics: None,
         }
     }
 
