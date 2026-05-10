@@ -1925,20 +1925,47 @@ pub async fn get_agent_run_detail(
     let Some(run) = get_agent_run(pool, run_id).await? else {
         return Ok(None);
     };
+    agent_run_detail_for_run(pool, run).await.map(Some)
+}
+
+pub async fn get_latest_agent_run_detail_for_task(
+    pool: &SqlitePool,
+    identifier: &str,
+) -> Result<Option<AgentRunDetail>> {
+    let select_run_sql = agent_run_select_sql(
+        r#"
+        JOIN tasks ON tasks.id = agent_runs.task_id
+        WHERE tasks.identifier = ?
+        ORDER BY agent_runs.created_at DESC, agent_runs.id DESC
+        LIMIT 1
+        "#,
+    );
+    let Some(run) = sqlx::query_as::<_, AgentRun>(&select_run_sql)
+        .bind(identifier)
+        .fetch_optional(pool)
+        .await
+        .with_context(|| format!("failed to load latest Agent Run for Task {identifier}"))?
+    else {
+        return Ok(None);
+    };
+    agent_run_detail_for_run(pool, run).await.map(Some)
+}
+
+async fn agent_run_detail_for_run(pool: &SqlitePool, run: AgentRun) -> Result<AgentRunDetail> {
     let identifier: String = sqlx::query_scalar("SELECT identifier FROM tasks WHERE id = ?")
         .bind(&run.task_id)
         .fetch_one(pool)
         .await
-        .with_context(|| format!("failed to load Task for Agent Run {run_id}"))?;
+        .with_context(|| format!("failed to load Task for Agent Run {}", run.id))?;
     let task = get_task_detail(pool, &identifier)
         .await?
-        .with_context(|| format!("Task {identifier} for Agent Run {run_id} not found"))?;
-    let launcher_session_data = get_launcher_session_data(pool, run_id).await?;
-    Ok(Some(AgentRunDetail {
+        .with_context(|| format!("Task {identifier} for Agent Run {} not found", run.id))?;
+    let launcher_session_data = get_launcher_session_data(pool, &run.id).await?;
+    Ok(AgentRunDetail {
         run,
         task,
         launcher_session_data,
-    }))
+    })
 }
 
 async fn expire_stale_agent_runs(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<()> {
@@ -2036,7 +2063,7 @@ async fn append_audit_event_in_tx(
 
 fn agent_run_select_sql(where_clause: &str) -> String {
     format!(
-        "SELECT id, task_id, task_queue_id, worker_actor_kind, worker_actor_id, worker_actor_display_name, worker_id, launcher_kind, lease_expires_at, last_heartbeat_at, outcome, failure_reason, created_at, finished_at FROM agent_runs {where_clause}"
+        "SELECT agent_runs.id, agent_runs.task_id, agent_runs.task_queue_id, agent_runs.worker_actor_kind, agent_runs.worker_actor_id, agent_runs.worker_actor_display_name, agent_runs.worker_id, agent_runs.launcher_kind, agent_runs.lease_expires_at, agent_runs.last_heartbeat_at, agent_runs.outcome, agent_runs.failure_reason, agent_runs.created_at, agent_runs.finished_at FROM agent_runs {where_clause}"
     )
 }
 
