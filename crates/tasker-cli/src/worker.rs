@@ -628,7 +628,7 @@ fn build_worker_prompt(
         "You are a Tasker Worker Agent running unattended. Do not ask questions or open interactive UI. Use the Tasker Pi Extension tools to read and update Tasker state, Workpad Notes, requirements, child tasks, and transitions. At run start, prefer the Tasker Pi Extension task context bundle tool before broad file/context discovery or repeated CLI status/show reads.".to_string()
     };
     Ok(format!(
-        "{base}\n\nTask Identifier: {}\nTask Title: {}\nTask State: {}\nAgent Run ID: {}\nLocal Worktree: {}\nShared Cargo Target Directory: {}\nCargo commands inherit CARGO_TARGET_DIR so Rust build artifacts are shared across Worker Agent Local Worktrees for this Managed Source Repository. This Tasker-managed directory is safe to delete when reclaiming space.\nUse Tasker Pi Extension tools for Tasker mutations. When finished, update criteria/validation/workpad and request the appropriate Task State Transition.\n",
+        "{base}\n\nTask Identifier: {}\nTask Title: {}\nTask State: {}\nAgent Run ID: {}\nLocal Worktree: {}\nShared Cargo Target Directory: {}\nCargo commands inherit CARGO_TARGET_DIR so Rust build artifacts are shared across Worker Agent Local Worktrees for this Managed Source Repository. This Tasker-managed directory is safe to delete when reclaiming space.\nBefore requesting Integrating, commit intended changes as Task Commits on the Task Branch and verify the Local Worktree is clean with git status.\nUse Tasker Pi Extension tools for Tasker mutations. When finished, update criteria/validation/workpad and request the appropriate Task State Transition.\n",
         task.task.identifier,
         task.task.title,
         task.task.state,

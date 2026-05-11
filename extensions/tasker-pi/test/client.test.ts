@@ -136,12 +136,12 @@ describe("TaskerClient", () => {
   it("requests transitions with an agent run id", async () => {
     const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
 
-    await client.requestTransition("TASK-1", "integrating", actor, "run-1");
+    await client.requestTransition("TASK-1", "done", actor, "run-1");
 
     expect(requests[0].url).toBe("http://tasker.test/tasks/TASK-1/transition");
     expect(JSON.parse(requests[0].init.body as string)).toEqual({
       actor,
-      to_state: "integrating",
+      to_state: "done",
       agent_run_id: "run-1",
     });
   });

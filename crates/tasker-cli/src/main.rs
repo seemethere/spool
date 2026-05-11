@@ -1177,18 +1177,27 @@ async fn task(paths: &TaskerPaths, db_path_overridden: bool, command: TaskComman
             actor,
             agent_run_id,
         } => {
+            let to_state = bootstrap::normalize_label(&to);
+            let actor = tasker_db::Actor {
+                kind: actor_kind,
+                id: actor.clone(),
+                display_name: actor,
+            };
+            if to_state == "integrating" {
+                if let Some(warning) =
+                    preflight_integrating_transition(&pool, &identifier, &actor).await?
+                {
+                    eprintln!("warning: {warning}");
+                }
+            }
             let detail = tasker_db::transition_task_state(
                 &pool,
                 &identifier,
                 &tasker_db::TransitionTaskState {
-                    to_state: bootstrap::normalize_label(&to),
+                    to_state,
                     agent_run_id,
                 },
-                &tasker_db::Actor {
-                    kind: actor_kind,
-                    id: actor.clone(),
-                    display_name: actor,
-                },
+                &actor,
             )
             .await?;
             println!(
@@ -2321,6 +2330,162 @@ fn required_task_link(detail: &tasker_db::TaskDetail, kind: &str) -> Result<Stri
                 detail.task.identifier
             )
         })
+}
+
+async fn preflight_integrating_transition(
+    pool: &sqlx::SqlitePool,
+    identifier: &str,
+    actor: &tasker_db::Actor,
+) -> Result<Option<String>> {
+    let detail = tasker_db::get_task_detail(pool, identifier)
+        .await?
+        .with_context(|| format!("Task {identifier} not found"))?;
+    let queue = tasker_db::get_task_queue(pool, &detail.task.task_queue_key)
+        .await?
+        .with_context(|| format!("Task Queue {} not found", detail.task.task_queue_key))?;
+    if queue.delivery_backend != "local_worktree" {
+        return Ok(None);
+    }
+
+    let inspection = inspect_pre_integrating_local_worktree(&detail);
+    if actor.kind == "worker_agent" {
+        inspection.reject_if_not_ready()?;
+        Ok(None)
+    } else {
+        Ok(inspection.operator_warning())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PreIntegratingLocalWorktreeInspection {
+    identifier: String,
+    local_worktree: Option<String>,
+    task_branch: Option<String>,
+    checked_out_branch: Option<String>,
+    status_summary: Option<String>,
+    issue: Option<String>,
+}
+
+impl PreIntegratingLocalWorktreeInspection {
+    fn reject_if_not_ready(&self) -> Result<()> {
+        if let Some(issue) = &self.issue {
+            anyhow::bail!("{}", self.guidance(issue));
+        }
+        Ok(())
+    }
+
+    fn operator_warning(&self) -> Option<String> {
+        self.issue.as_ref().map(|issue| {
+            format!(
+                "{}; operator transition may continue for repair flexibility, but Worker Agents must commit intended changes on the Task Branch and verify a clean Local Worktree before requesting Integrating",
+                self.guidance(issue)
+            )
+        })
+    }
+
+    fn guidance(&self, issue: &str) -> String {
+        format!(
+            "Local Worktree pre-Integrating check failed for Task {}: {issue}. Local Worktree: {}; Task Branch: {}; git status summary: {}. Commit intended changes on the Task Branch, verify the Local Worktree is clean, then request Integrating again.",
+            self.identifier,
+            self.local_worktree.as_deref().unwrap_or("missing Local Worktree Task Link"),
+            self.task_branch.as_deref().unwrap_or("missing Task Branch Task Link"),
+            self.status_summary.as_deref().unwrap_or("unavailable"),
+        )
+    }
+}
+
+fn inspect_pre_integrating_local_worktree(
+    detail: &tasker_db::TaskDetail,
+) -> PreIntegratingLocalWorktreeInspection {
+    let local_worktree = detail
+        .task_links
+        .iter()
+        .find(|link| link.kind == "local_worktree")
+        .map(|link| link.target.clone());
+    let task_branch = detail
+        .task_links
+        .iter()
+        .find(|link| link.kind == "task_branch")
+        .map(|link| link.target.clone());
+
+    let mut inspection = PreIntegratingLocalWorktreeInspection {
+        identifier: detail.task.identifier.clone(),
+        local_worktree,
+        task_branch,
+        checked_out_branch: None,
+        status_summary: None,
+        issue: None,
+    };
+
+    let Some(local_worktree) = inspection.local_worktree.as_deref() else {
+        inspection.issue = Some("missing Local Worktree Task Link".to_string());
+        return inspection;
+    };
+    if inspection.task_branch.is_none() {
+        inspection.issue = Some("missing Task Branch Task Link".to_string());
+        return inspection;
+    }
+
+    let worktree = Path::new(local_worktree);
+    if !worktree.exists() {
+        inspection.issue = Some("Local Worktree path does not exist".to_string());
+        return inspection;
+    }
+
+    match git_output(worktree, &["status", "--porcelain"]) {
+        Ok(status) => {
+            inspection.status_summary = Some(condense_git_status_summary(&status));
+            if !status.trim().is_empty() {
+                inspection.issue = Some("Local Worktree has uncommitted changes".to_string());
+            }
+        }
+        Err(error) => {
+            inspection.issue = Some(format!(
+                "could not inspect Local Worktree git status: {error:#}"
+            ));
+            return inspection;
+        }
+    }
+
+    match git_output(worktree, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Ok(branch) => {
+            let branch = branch.trim().to_string();
+            inspection.checked_out_branch = Some(branch.clone());
+            if let Some(expected) = inspection.task_branch.as_deref() {
+                if branch != expected {
+                    inspection.issue = Some(format!(
+                        "Local Worktree is on branch {branch}, expected Task Branch {expected}"
+                    ));
+                }
+            }
+        }
+        Err(error) => {
+            inspection.issue = Some(format!(
+                "could not inspect Local Worktree branch: {error:#}"
+            ));
+        }
+    }
+
+    inspection
+}
+
+fn condense_git_status_summary(status: &str) -> String {
+    let mut lines = status.lines();
+    let shown = lines
+        .by_ref()
+        .take(12)
+        .map(str::trim_end)
+        .collect::<Vec<_>>();
+    if shown.is_empty() {
+        "clean".to_string()
+    } else {
+        let remaining = lines.count();
+        let mut summary = shown.join("; ");
+        if remaining > 0 {
+            summary.push_str(&format!("; ... and {remaining} more"));
+        }
+        summary
+    }
 }
 
 struct LocalWorktreeIntegrationAdapter<'a> {
@@ -4445,6 +4610,274 @@ Implement Bootstrap Task Creation.
             .expect("task")
             .expect("task");
         assert_eq!(detail.task.state, "rework");
+    }
+
+    #[tokio::test]
+    async fn worker_integrating_transition_rejects_dirty_local_worktree_without_state_change() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = TaskerPaths::resolve(temp.path().join("home"), PathOverrides::default());
+        let (pool, worktree, run_id) =
+            seed_in_progress_local_task(&paths, temp.path(), true, true).await;
+
+        let error = task(
+            &paths,
+            false,
+            TaskCommand::Transition {
+                identifier: "TASK-1".to_string(),
+                to: "integrating".to_string(),
+                actor_kind: "worker_agent".to_string(),
+                actor: "worker".to_string(),
+                agent_run_id: Some(run_id),
+            },
+        )
+        .await
+        .expect_err("dirty Local Worktree should be rejected before Integrating");
+        let message = error.to_string();
+        assert!(message.contains("Local Worktree pre-Integrating check failed"));
+        assert!(message.contains(&worktree.display().to_string()));
+        assert!(message.contains("tasker/TASK-1"));
+        assert!(message.contains("git status summary"));
+        assert!(message.contains("scratch.txt"));
+        assert!(!message.contains("dirty contents"));
+        assert!(message.contains("Commit intended changes on the Task Branch"));
+
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("get task")
+            .expect("task");
+        assert_eq!(detail.task.state, "in_progress");
+        let outcomes: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM integration_outcomes")
+            .fetch_one(&pool)
+            .await
+            .expect("outcomes");
+        assert_eq!(outcomes.0, 0);
+    }
+
+    #[tokio::test]
+    async fn worker_integrating_transition_allows_clean_local_worktree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = TaskerPaths::resolve(temp.path().join("home"), PathOverrides::default());
+        let (pool, _worktree, run_id) =
+            seed_in_progress_local_task(&paths, temp.path(), true, false).await;
+
+        task(
+            &paths,
+            false,
+            TaskCommand::Transition {
+                identifier: "TASK-1".to_string(),
+                to: "integrating".to_string(),
+                actor_kind: "worker_agent".to_string(),
+                actor: "worker".to_string(),
+                agent_run_id: Some(run_id),
+            },
+        )
+        .await
+        .expect("clean Local Worktree should allow Integrating");
+
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("get task")
+            .expect("task");
+        assert_eq!(detail.task.state, "integrating");
+    }
+
+    #[tokio::test]
+    async fn operator_integrating_transition_allows_dirty_local_worktree_for_repair_flexibility() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = TaskerPaths::resolve(temp.path().join("home"), PathOverrides::default());
+        let (pool, _worktree, _run_id) =
+            seed_in_progress_local_task(&paths, temp.path(), true, true).await;
+
+        task(
+            &paths,
+            false,
+            TaskCommand::Transition {
+                identifier: "TASK-1".to_string(),
+                to: "integrating".to_string(),
+                actor_kind: "operator".to_string(),
+                actor: "operator".to_string(),
+                agent_run_id: None,
+            },
+        )
+        .await
+        .expect("operator repair transition should keep flexibility");
+
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("get task")
+            .expect("task");
+        assert_eq!(detail.task.state, "integrating");
+    }
+
+    #[tokio::test]
+    async fn worker_integrating_transition_rejects_missing_local_worktree_links_with_guidance() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = TaskerPaths::resolve(temp.path().join("home"), PathOverrides::default());
+        let (pool, _worktree, run_id) =
+            seed_in_progress_local_task(&paths, temp.path(), false, false).await;
+
+        let error = task(
+            &paths,
+            false,
+            TaskCommand::Transition {
+                identifier: "TASK-1".to_string(),
+                to: "integrating".to_string(),
+                actor_kind: "worker_agent".to_string(),
+                actor: "worker".to_string(),
+                agent_run_id: Some(run_id),
+            },
+        )
+        .await
+        .expect_err("missing Local Worktree links should be rejected");
+        let message = error.to_string();
+        assert!(message.contains("missing Local Worktree Task Link"));
+        assert!(message.contains("missing Task Branch Task Link"));
+        assert!(message.contains("Commit intended changes on the Task Branch"));
+
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("get task")
+            .expect("task");
+        assert_eq!(detail.task.state, "in_progress");
+    }
+
+    async fn seed_in_progress_local_task(
+        paths: &TaskerPaths,
+        root: &Path,
+        with_links: bool,
+        dirty: bool,
+    ) -> (sqlx::SqlitePool, PathBuf, String) {
+        init(paths, false).await.expect("init");
+        let pool = open_pool(paths, false).await.expect("pool");
+        let repo = root.join("repo");
+        let worktrees = root.join("worktrees");
+        let worktree = worktrees.join("TASK-1");
+        init_git_repo(&repo);
+        tasker_db::create_task_queue(
+            &pool,
+            &tasker_db::CreateTaskQueue {
+                key: "TASK".to_string(),
+                name: "Tasker".to_string(),
+                managed_source_repository: repo.display().to_string(),
+                main_branch: "main".to_string(),
+                worktree_root: worktrees.display().to_string(),
+                branch_template: "tasker/{task_identifier}".to_string(),
+                done_worktree_retention: false,
+                queue_concurrency_limit: None,
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("queue");
+        tasker_db::create_task(
+            &pool,
+            &tasker_db::CreateTask {
+                queue_key: "TASK".to_string(),
+                title: "Preflight me".to_string(),
+                brief: "Brief".to_string(),
+                priority: "normal".to_string(),
+                state: "ready".to_string(),
+                review_required: false,
+                acceptance_criteria: vec!["accepted".to_string()],
+                validation_items: vec!["validated".to_string()],
+                tags: vec![],
+                conflict_hints: vec![],
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("task");
+        git(&repo, &["branch", "tasker/TASK-1", "main"]);
+        fs::create_dir_all(&worktrees).expect("worktrees");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                worktree.to_str().expect("utf8"),
+                "tasker/TASK-1",
+            ],
+        );
+        fs::write(worktree.join("feature.txt"), "feature\n").expect("feature");
+        git(&worktree, &["add", "feature.txt"]);
+        git(&worktree, &["commit", "-m", "add feature"]);
+        let actor = tasker_db::Actor::operator("tester");
+        if with_links {
+            tasker_db::upsert_task_link(
+                &pool,
+                "TASK-1",
+                &tasker_db::UpsertTaskLink {
+                    kind: "local_worktree".to_string(),
+                    target: worktree.display().to_string(),
+                    label: Some("Local Worktree".to_string()),
+                    is_primary: true,
+                },
+                &actor,
+            )
+            .await
+            .expect("worktree link");
+            tasker_db::upsert_task_link(
+                &pool,
+                "TASK-1",
+                &tasker_db::UpsertTaskLink {
+                    kind: "task_branch".to_string(),
+                    target: "tasker/TASK-1".to_string(),
+                    label: Some("Task Branch".to_string()),
+                    is_primary: false,
+                },
+                &actor,
+            )
+            .await
+            .expect("branch link");
+        }
+        tasker_db::update_acceptance_criterion_status(
+            &pool,
+            "TASK-1",
+            1,
+            &tasker_db::UpdateRequirementStatus {
+                status: "satisfied".to_string(),
+                waiver_reason: None,
+                validated_base_commit: None,
+            },
+            &actor,
+        )
+        .await
+        .expect("criterion");
+        tasker_db::update_validation_item_status(
+            &pool,
+            "TASK-1",
+            1,
+            &tasker_db::UpdateRequirementStatus {
+                status: "passed".to_string(),
+                waiver_reason: None,
+                validated_base_commit: None,
+            },
+            &actor,
+        )
+        .await
+        .expect("validation");
+        let worker = tasker_db::Actor {
+            kind: "worker_agent".to_string(),
+            id: "worker".to_string(),
+            display_name: "worker".to_string(),
+        };
+        let claimed = tasker_db::claim_next(
+            &pool,
+            &tasker_db::ClaimNextInput {
+                queue_key: "TASK".to_string(),
+                worker_id: "worker-1".to_string(),
+                launcher_kind: "pi".to_string(),
+                lease_seconds: 300,
+            },
+            &worker,
+        )
+        .await
+        .expect("claim")
+        .expect("claimed");
+        if dirty {
+            fs::write(worktree.join("scratch.txt"), "dirty contents\n").expect("scratch");
+        }
+        (pool, worktree, claimed.run.id)
     }
 
     async fn seed_integrating_local_task(

@@ -1,4 +1,5 @@
-import { appendFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { appendFileSync, existsSync } from "node:fs";
 import type { Actor, CreateChildTaskInput, RequirementStatusInput, TaskerExtensionConfig, WorkerStatusReportInput } from "./types";
 
 export class TaskerClient {
@@ -71,12 +72,23 @@ export class TaskerClient {
     }, signal);
   }
 
-  requestTransition(identifier: string, toState: string, actor: Actor, agentRunId?: string, signal?: AbortSignal): Promise<unknown> {
-    return this.request("POST", `/tasks/${encodeURIComponent(identifier)}/transition`, {
+  async requestTransition(identifier: string, toState: string, actor: Actor, agentRunId?: string, signal?: AbortSignal): Promise<unknown> {
+    let preflightWarning: string | undefined;
+    if (toState === "integrating") {
+      const task = await this.getTask(identifier, signal);
+      const inspection = inspectPreIntegratingLocalWorktree(task, identifier);
+      if (actor.kind === "worker_agent") {
+        inspection.rejectIfNotReady();
+      } else {
+        preflightWarning = inspection.operatorWarning();
+      }
+    }
+    const detail = await this.request("POST", `/tasks/${encodeURIComponent(identifier)}/transition`, {
       actor,
       to_state: toState,
       agent_run_id: agentRunId ?? null,
     }, signal);
+    return preflightWarning === undefined ? detail : { detail, preflight_warning: preflightWarning };
   }
 
   reportWorkerStatus(input: WorkerStatusReportInput, actor: Actor, workerStatusPath?: string): unknown {
@@ -112,6 +124,86 @@ export class TaskerClient {
     if (response.status === 204) return null;
     return response.json();
   }
+}
+
+interface PreIntegratingInspection {
+  identifier: string;
+  localWorktree?: string;
+  taskBranch?: string;
+  statusSummary?: string;
+  issue?: string;
+  rejectIfNotReady(): void;
+  operatorWarning(): string | undefined;
+}
+
+function inspectPreIntegratingLocalWorktree(task: unknown, identifier: string): PreIntegratingInspection {
+  const localWorktree = taskLink(task, "local_worktree");
+  const taskBranch = taskLink(task, "task_branch");
+  const inspection: PreIntegratingInspection = {
+    identifier,
+    localWorktree,
+    taskBranch,
+    rejectIfNotReady() {
+      if (this.issue) throw new Error(preIntegratingGuidance(this, this.issue));
+    },
+    operatorWarning() {
+      return this.issue === undefined
+        ? undefined
+        : `${preIntegratingGuidance(this, this.issue)}; operator transition may continue for repair flexibility, but Worker Agents must commit intended changes on the Task Branch and verify a clean Local Worktree before requesting Integrating`;
+    },
+  };
+  if (!localWorktree) {
+    inspection.issue = "missing Local Worktree Task Link";
+    return inspection;
+  }
+  if (!taskBranch) {
+    inspection.issue = "missing Task Branch Task Link";
+    return inspection;
+  }
+  if (!existsSync(localWorktree)) {
+    inspection.issue = "Local Worktree path does not exist";
+    return inspection;
+  }
+  try {
+    const status = gitOutput(localWorktree, ["status", "--porcelain"]);
+    inspection.statusSummary = condenseGitStatusSummary(status);
+    if (status.trim().length > 0) inspection.issue = "Local Worktree has uncommitted changes";
+  } catch (error) {
+    inspection.issue = `could not inspect Local Worktree git status: ${error instanceof Error ? error.message : String(error)}`;
+    return inspection;
+  }
+  try {
+    const branch = gitOutput(localWorktree, ["rev-parse", "--abbrev-ref", "HEAD"]).trim();
+    if (branch !== taskBranch) inspection.issue = `Local Worktree is on branch ${branch}, expected Task Branch ${taskBranch}`;
+  } catch (error) {
+    inspection.issue = `could not inspect Local Worktree branch: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  return inspection;
+}
+
+function taskLink(task: unknown, kind: string): string | undefined {
+  if (!task || typeof task !== "object" || !("task_links" in task)) return undefined;
+  const links = (task as { task_links?: unknown }).task_links;
+  if (!Array.isArray(links)) return undefined;
+  const link = links.find((candidate) => candidate && typeof candidate === "object" && (candidate as { kind?: unknown }).kind === kind);
+  const target = link && typeof link === "object" ? (link as { target?: unknown }).target : undefined;
+  return typeof target === "string" ? target : undefined;
+}
+
+function preIntegratingGuidance(inspection: PreIntegratingInspection, issue: string): string {
+  return `Local Worktree pre-Integrating check failed for Task ${inspection.identifier}: ${issue}. Local Worktree: ${inspection.localWorktree ?? "missing Local Worktree Task Link"}; Task Branch: ${inspection.taskBranch ?? "missing Task Branch Task Link"}; git status summary: ${inspection.statusSummary ?? "unavailable"}. Commit intended changes on the Task Branch, verify the Local Worktree is clean, then request Integrating again.`;
+}
+
+function condenseGitStatusSummary(status: string): string {
+  const lines = status.split(/\r?\n/).filter((line) => line.length > 0);
+  if (lines.length === 0) return "clean";
+  const shown = lines.slice(0, 12).map((line) => line.trimEnd()).join("; ");
+  const remaining = lines.length - 12;
+  return remaining > 0 ? `${shown}; ... and ${remaining} more` : shown;
+}
+
+function gitOutput(cwd: string, args: string[]): string {
+  return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 }
 
 function workpadBody(task: unknown): string {
