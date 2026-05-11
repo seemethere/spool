@@ -17,9 +17,9 @@ pub(crate) async fn work(
     let api_url = options
         .api_url
         .unwrap_or_else(|| format!("http://{}", config.service.bind_addr));
-    let outcome = worker::run_worker_once(
+    let outcome = tasker_runner::worker::run_worker_once(
         &pool,
-        worker::WorkOnceRequest {
+        tasker_runner::worker::WorkOnceRequest {
             queue: options.queue,
             launcher: options.launcher,
             actor: options.actor,
@@ -38,18 +38,18 @@ pub(crate) async fn work(
     .await?;
 
     match outcome {
-        worker::WorkOnceOutcome::NoEligibleTask { queue } => {
+        tasker_runner::worker::WorkOnceOutcome::NoEligibleTask { queue } => {
             println!("no eligible Tasks found for Task Queue {queue}");
         }
-        worker::WorkOnceOutcome::PreflightFailed { queue, message } => {
+        tasker_runner::worker::WorkOnceOutcome::PreflightFailed { queue, message } => {
             println!("Task Queue {queue} failed Worker Loop preflight; no Task was claimed and no Agent Run was created");
             println!("{message}");
         }
-        worker::WorkOnceOutcome::RepoOperationLocked { queue, message } => {
+        tasker_runner::worker::WorkOnceOutcome::RepoOperationLocked { queue, message } => {
             println!("Task Queue {queue} is blocked by a Managed Source Repository operation lock; no Task was claimed and no Agent Run was created");
             println!("{message}");
         }
-        worker::WorkOnceOutcome::Finished {
+        tasker_runner::worker::WorkOnceOutcome::Finished {
             task_identifier,
             run_id,
             outcome,

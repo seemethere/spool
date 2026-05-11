@@ -28,7 +28,6 @@ mod task_cmd;
 mod telemetry;
 mod telemetry_cmd;
 mod work_cmd;
-mod worker;
 
 use cleanup_cmd::cleanup;
 use db_cmd::{db, init};

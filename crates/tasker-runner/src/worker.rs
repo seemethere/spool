@@ -51,12 +51,7 @@ pub async fn run_worker_once(
     pool: &SqlitePool,
     request: WorkOnceRequest,
 ) -> Result<WorkOnceOutcome> {
-    if request.launcher != "fake" && request.launcher != "pi" {
-        bail!(
-            "unsupported Agent Launcher {}; expected fake or pi",
-            request.launcher
-        );
-    }
+    let launcher_kind = LauncherKind::parse(&request.launcher)?;
 
     let data_dir =
         absolute_path(&request.data_dir).context("failed to resolve Tasker data directory")?;
@@ -84,7 +79,7 @@ pub async fn run_worker_once(
         &tasker_db::ClaimNextInput {
             queue_key: request.queue.clone(),
             worker_id: request.actor.clone(),
-            launcher_kind: request.launcher.clone(),
+            launcher_kind: launcher_kind.as_str().to_string(),
             lease_seconds: request.lease_seconds,
         },
         &actor,
@@ -131,27 +126,18 @@ pub async fn run_worker_once(
         )
     })?;
 
-    let mut launcher_result = if request.launcher == "fake" {
-        run_fake_launcher(
+    let mut launcher_result = run_agent_launcher(
+        launcher_kind,
+        LauncherContext {
             pool,
-            &request,
-            &claimed,
-            &actor,
-            &prepared_worktree,
-            &transcript_dir,
-        )
-        .await?
-    } else {
-        run_pi_launcher(
-            pool,
-            &request,
-            &claimed,
-            &actor,
-            &prepared_worktree,
-            &transcript_dir,
-        )
-        .await?
-    };
+            request: &request,
+            claimed: &claimed,
+            actor: &actor,
+            prepared_worktree: &prepared_worktree,
+            transcript_dir: &transcript_dir,
+        },
+    )
+    .await?;
 
     if launcher_result.outcome == "completed" {
         tasker_db::heartbeat_run(pool, &claimed.run.id, request.lease_seconds, &actor).await?;
@@ -207,6 +193,83 @@ pub async fn run_worker_once(
         run_id: finished.id,
         outcome: finished.outcome.unwrap_or_else(|| "unknown".to_string()),
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LauncherKind {
+    Fake,
+    Pi,
+}
+
+impl LauncherKind {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "fake" => Ok(Self::Fake),
+            "pi" => Ok(Self::Pi),
+            other => bail!("unsupported Agent Launcher {other}; expected fake or pi"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fake => "fake",
+            Self::Pi => "pi",
+        }
+    }
+}
+
+struct LauncherContext<'a> {
+    pool: &'a SqlitePool,
+    request: &'a WorkOnceRequest,
+    claimed: &'a tasker_db::ClaimedRun,
+    actor: &'a tasker_db::Actor,
+    prepared_worktree: &'a PreparedLocalWorktree,
+    transcript_dir: &'a Path,
+}
+
+trait AgentLauncher {
+    async fn launch(&self, context: LauncherContext<'_>) -> Result<LauncherResult>;
+}
+
+struct FakeLauncher;
+struct PiLauncher;
+
+impl AgentLauncher for FakeLauncher {
+    async fn launch(&self, context: LauncherContext<'_>) -> Result<LauncherResult> {
+        run_fake_launcher(
+            context.pool,
+            context.request,
+            context.claimed,
+            context.actor,
+            context.prepared_worktree,
+            context.transcript_dir,
+        )
+        .await
+    }
+}
+
+impl AgentLauncher for PiLauncher {
+    async fn launch(&self, context: LauncherContext<'_>) -> Result<LauncherResult> {
+        run_pi_launcher(
+            context.pool,
+            context.request,
+            context.claimed,
+            context.actor,
+            context.prepared_worktree,
+            context.transcript_dir,
+        )
+        .await
+    }
+}
+
+async fn run_agent_launcher(
+    launcher_kind: LauncherKind,
+    context: LauncherContext<'_>,
+) -> Result<LauncherResult> {
+    match launcher_kind {
+        LauncherKind::Fake => FakeLauncher.launch(context).await,
+        LauncherKind::Pi => PiLauncher.launch(context).await,
+    }
 }
 
 struct LauncherResult {
@@ -691,8 +754,8 @@ pub async fn preflight_worker_claim(
         .await
         .context("Worker Loop preflight failed: migration compatibility check failed")?;
 
-    if let Some(active) = tasker_runner::repo_lock::active_lock(data_dir, queue_key)? {
-        bail!(tasker_runner::repo_lock::blocked_message(&active));
+    if let Some(active) = crate::repo_lock::active_lock(data_dir, queue_key)? {
+        bail!(crate::repo_lock::blocked_message(&active));
     }
 
     let queue = tasker_db::get_task_queue(pool, queue_key)
@@ -1178,7 +1241,7 @@ async fn run_agent_gated_integration_if_ready(
     .map(Some)
 }
 
-pub use tasker_runner::local_worktree_delivery::{
+pub use crate::local_worktree_delivery::{
     integrate_local_worktree_for_run, LocalIntegrationResult,
 };
 
@@ -1491,7 +1554,7 @@ mod tests {
         let log =
             git_output(&repo, &["log", "-1", "--pretty=%B"], "read final commit").expect("git log");
         assert!(log.contains("TASK-1: Test work"));
-        assert!(log.contains(&format!("Agent Run: {run_id}")));
+        assert!(log.contains(&format!("Tasker-Agent-Run: {run_id}")));
     }
 
     #[tokio::test]
@@ -1823,7 +1886,7 @@ mod tests {
         let pool = tasker_db::connect(&db_path).await.expect("connect");
         tasker_db::run_migrations(&pool).await.expect("migrate");
         seed_ready_task(&pool, &repo, &worktrees).await;
-        let _lock = tasker_runner::repo_lock::acquire_manual(
+        let _lock = crate::repo_lock::acquire_manual(
             &data_dir,
             "TASK",
             "manual_integration",

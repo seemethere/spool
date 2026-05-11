@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 use tokio::time::sleep;
 
-use crate::{display, worker};
+use crate::display;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupervisorOptions {
@@ -145,8 +145,12 @@ pub async fn supervise_batch(
         let target_starts = worker_start_target(&options, &outcome, &active, &unblock);
         let mut preflight_ready = true;
         if active.len() < options.concurrency && outcome.started_workers < target_starts {
-            if let Err(error) =
-                worker::preflight_worker_claim(pool, &options.queue, &options.data_dir).await
+            if let Err(error) = tasker_runner::worker::preflight_worker_claim(
+                pool,
+                &options.queue,
+                &options.data_dir,
+            )
+            .await
             {
                 preflight_ready = false;
                 let message = format!("{error:#}");
@@ -618,7 +622,7 @@ async fn retry_due_integrations(
             retry.retry_attempt.unwrap_or_default(),
             retry.next_retry_at.as_deref().unwrap_or("due")
         );
-        let outcome = worker::integrate_local_worktree_for_run(
+        let outcome = tasker_runner::worker::integrate_local_worktree_for_run(
             pool,
             &retry.task_identifier,
             None,
