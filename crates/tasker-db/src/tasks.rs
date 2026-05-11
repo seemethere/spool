@@ -644,6 +644,15 @@ pub async fn get_task_context_bundle(
     .context("failed to load latest Integration Outcome for Task context bundle")?;
 
     Ok(Some(TaskContextBundle {
+        advisory_hints: TaskContextAdvisoryHints {
+            note: "Task Conflict Hints and likely files/paths are advisory scheduling/review/context planning aids only; they do not block claims and are not authoritative gates. Structured Acceptance Criteria and Validation Items remain authoritative for completion gates.".to_string(),
+            task_conflict_hints: task.conflict_hints.clone(),
+            likely_files_or_paths: task
+                .conflict_hints
+                .iter()
+                .map(|hint| hint.target.clone())
+                .collect(),
+        },
         task,
         queue: TaskContextQueue {
             key: queue.key,

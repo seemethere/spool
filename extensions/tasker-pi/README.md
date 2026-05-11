@@ -17,7 +17,7 @@ Set these environment variables before loading the extension:
 ## Tools
 
 - `tasker_get_task`
-- `tasker_get_task_context_bundle` fetches the preferred run-start bundle for Worker Agents: Task Brief, structured requirements, Workpad Note, Task Links, Task Conflict Hints, Task Queue key/config, Local Worktree and Task Branch links, recent Agent Runs, and latest failure/integration summaries. Use this before broad repository discovery instead of repeated `task show`, status, queue, or run lookups.
+- `tasker_get_task_context_bundle` fetches the preferred run-start bundle for Worker Agents: Task Brief, structured requirements, Workpad Note, Task Links, Task Conflict Hints, likely files/path guidance, Task Queue key/config, Local Worktree and Task Branch links, recent Agent Runs, and latest failure/integration summaries. Use this before broad repository discovery instead of repeated `task show`, status, queue, or run lookups; hints are advisory context-planning aids, not authoritative scheduling or completion gates.
 - `tasker_update_workpad` replaces the Task's singleton Workpad Note body.
 - `tasker_append_workpad` fetches the current Workpad Note and appends Markdown before saving it, so Worker Agents can add evidence or handoff notes without manually reconstructing the whole note.
 - `tasker_set_acceptance_criterion_status` accepts `pending`, `satisfied`, or `waived`.

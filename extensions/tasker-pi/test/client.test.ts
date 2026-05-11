@@ -12,7 +12,17 @@ beforeEach(() => {
   globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     requests.push({ url: String(url), init: init ?? {} });
     const body = String(url).endsWith("/tasks/TASK-1/context-bundle")
-      ? { task: { task: { identifier: "TASK-1" } }, queue: { key: "TASK" }, local_workflow: {}, agent_runs: [] }
+      ? {
+          task: { task: { identifier: "TASK-1" }, conflict_hints: [{ position: 1, target: "crates/tasker-db" }] },
+          queue: { key: "TASK" },
+          local_workflow: {},
+          advisory_hints: {
+            note: "Task Conflict Hints and likely files/paths are advisory scheduling/review/context planning aids only; they do not block claims and are not authoritative gates.",
+            task_conflict_hints: [{ position: 1, target: "crates/tasker-db" }],
+            likely_files_or_paths: ["crates/tasker-db"],
+          },
+          agent_runs: [],
+        }
       : String(url).endsWith("/tasks/TASK-1")
         ? { workpad_note: { body: "existing notes" } }
         : { ok: true };
@@ -43,16 +53,42 @@ describe("TaskerClient", () => {
   it("fetches the task context bundle from the narrow run-start endpoint", async () => {
     const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
 
-    await client.getTaskContextBundle("TASK-1");
+    const bundle = await client.getTaskContextBundle("TASK-1") as { advisory_hints: { likely_files_or_paths: string[] } };
 
     expect(requests[0].url).toBe("http://tasker.test/tasks/TASK-1/context-bundle");
     expect(requests[0].init.method).toBe("GET");
+    expect(bundle.advisory_hints.likely_files_or_paths).toEqual(["crates/tasker-db"]);
+  });
+
+  it("accepts context bundles with no advisory Task Conflict Hints", async () => {
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      requests.push({ url: String(url), init: init ?? {} });
+      return new Response(JSON.stringify({
+        task: { task: { identifier: "TASK-1" }, conflict_hints: [] },
+        queue: {},
+        local_workflow: {},
+        advisory_hints: {
+          note: "Hints are advisory and not authoritative gates.",
+          task_conflict_hints: [],
+          likely_files_or_paths: [],
+        },
+        agent_runs: [],
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+
+    const bundle = await client.getTaskContextBundle("TASK-1") as { advisory_hints: { task_conflict_hints: unknown[] } };
+
+    expect(bundle.advisory_hints.task_conflict_hints).toEqual([]);
   });
 
   it("rejects context bundles with raw transcript or launcher payload fields", async () => {
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       requests.push({ url: String(url), init: init ?? {} });
-      return new Response(JSON.stringify({ task: {}, queue: {}, local_workflow: {}, agent_runs: [], raw_json: "{}" }), {
+      return new Response(JSON.stringify({ task: {}, queue: {}, local_workflow: {}, advisory_hints: { task_conflict_hints: [], likely_files_or_paths: [] }, agent_runs: [], raw_json: "{}" }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });

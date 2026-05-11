@@ -1208,6 +1208,22 @@ mod tests {
             "crates/tasker-server/src/lib.rs"
         );
         assert_eq!(
+            json["advisory_hints"]["task_conflict_hints"][0]["target"],
+            "crates/tasker-server/src/lib.rs"
+        );
+        assert_eq!(
+            json["advisory_hints"]["likely_files_or_paths"][0],
+            "crates/tasker-server/src/lib.rs"
+        );
+        assert!(json["advisory_hints"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("advisory"));
+        assert!(json["advisory_hints"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("do not block claims"));
+        assert_eq!(
             json["local_workflow"]["local_worktree"],
             "/worktrees/TASK-1"
         );
@@ -1235,9 +1251,27 @@ mod tests {
                 .status(),
             StatusCode::CREATED
         );
+        let mut task = sample_task_json("TASK", "Bundle");
+        task.as_object_mut().unwrap().remove("conflict_hints");
+        let request = serde_json::json!({
+            "actor": {
+                "kind": "operator",
+                "id": "tester",
+                "display_name": "tester"
+            },
+            "task": task
+        });
         assert_eq!(
             app.clone()
-                .oneshot(create_task_request("TASK", "Bundle", "operator", &token))
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/tasks/bootstrap")
+                        .header("content-type", "application/json")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
                 .await
                 .unwrap()
                 .status(),
@@ -1254,6 +1288,14 @@ mod tests {
             .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["task"]["workpad_note"], Value::Null);
+        assert_eq!(
+            json["advisory_hints"]["task_conflict_hints"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            json["advisory_hints"]["likely_files_or_paths"],
+            serde_json::json!([])
+        );
         assert_eq!(json["local_workflow"]["local_worktree"], Value::Null);
         assert_eq!(json["agent_runs"].as_array().unwrap().len(), 0);
         assert_eq!(json["latest_failure"], Value::Null);

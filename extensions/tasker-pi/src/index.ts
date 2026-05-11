@@ -95,7 +95,7 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
     name: "tasker_get_task_context_bundle",
     label: "Tasker: Get Task Context Bundle",
     description:
-      "Fetch the read-only Tasker-owned run-start context bundle for a Worker Agent without raw transcripts, raw launcher payloads, secrets, or unrelated queue data.",
+      "Fetch the read-only Tasker-owned run-start context bundle, including advisory Task Conflict Hints and likely files/path guidance, for a Worker Agent without raw transcripts, raw launcher payloads, secrets, or unrelated queue data.",
     parameters: Type.Object({ identifier: Identifier }),
     async execute(_id, params, signal) {
       return asToolResult(await client.getTaskContextBundle(params.identifier, signal));

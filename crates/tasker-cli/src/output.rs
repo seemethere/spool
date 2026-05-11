@@ -148,7 +148,7 @@ pub fn write_task_detail(mut writer: impl Write, detail: &tasker_db::TaskDetail)
     }
     writeln!(
         writer,
-        "\nTask Conflict Hints (advisory scheduling/review):"
+        "\nTask Conflict Hints / likely files or paths (advisory scheduling/review/context planning; not gates):"
     )?;
     if detail.conflict_hints.is_empty() {
         writeln!(writer, "(none)")?;
@@ -828,6 +828,52 @@ mod tests {
 
         assert!(text.contains("key: TASK"));
         assert!(text.contains("Queue Concurrency Limit: 1"));
+    }
+
+    #[test]
+    fn task_detail_marks_conflict_hints_as_advisory_likely_paths() {
+        let detail = tasker_db::TaskDetail {
+            task: tasker_db::Task {
+                id: "task-1".to_string(),
+                task_queue_id: "queue-1".to_string(),
+                task_queue_key: "TASK".to_string(),
+                identifier: "TASK-1".to_string(),
+                sequence: 1,
+                title: "Test task".to_string(),
+                brief: "brief".to_string(),
+                priority: "normal".to_string(),
+                state: "ready".to_string(),
+                review_required: false,
+                validated_base_commit: None,
+                created_at: "now".to_string(),
+                updated_at: "now".to_string(),
+            },
+            acceptance_criteria: Vec::new(),
+            validation_items: Vec::new(),
+            tags: Vec::new(),
+            workpad_note: None,
+            task_links: Vec::new(),
+            conflict_hints: vec![tasker_db::TaskConflictHint {
+                id: "hint-1".to_string(),
+                task_id: "task-1".to_string(),
+                position: 1,
+                target: "crates/tasker-cli/src/output.rs".to_string(),
+            }],
+            conflict_overlaps: Vec::new(),
+            blocking_tasks: Vec::new(),
+            blocked_tasks: Vec::new(),
+            latest_rework_reason_code: None,
+            latest_rework_reason: None,
+        };
+        let mut out = Vec::new();
+
+        write_task_detail(&mut out, &detail).expect("write task detail");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(text.contains("Task Conflict Hints / likely files or paths"));
+        assert!(text.contains("advisory"));
+        assert!(text.contains("not gates"));
+        assert!(text.contains("crates/tasker-cli/src/output.rs"));
     }
 
     #[test]

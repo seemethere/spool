@@ -222,6 +222,16 @@ function validateTaskContextBundle(bundle: unknown): void {
   if (!value.local_workflow || typeof value.local_workflow !== "object") {
     throw new Error("Task context bundle missing local_workflow");
   }
+  if (!value.advisory_hints || typeof value.advisory_hints !== "object") {
+    throw new Error("Task context bundle missing advisory_hints");
+  }
+  const advisoryHints = value.advisory_hints as Record<string, unknown>;
+  if (!Array.isArray(advisoryHints.task_conflict_hints)) {
+    throw new Error("Task context bundle missing advisory Task Conflict Hints");
+  }
+  if (!Array.isArray(advisoryHints.likely_files_or_paths)) {
+    throw new Error("Task context bundle missing likely files/path guidance");
+  }
   if (!Array.isArray(value.agent_runs)) throw new Error("Task context bundle missing agent_runs");
   rejectForbiddenContextKeys(value);
 }

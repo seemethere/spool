@@ -226,9 +226,17 @@ pub struct TaskContextBundle {
     pub task: TaskDetail,
     pub queue: TaskContextQueue,
     pub local_workflow: TaskLocalWorkflowContext,
+    pub advisory_hints: TaskContextAdvisoryHints,
     pub agent_runs: Vec<TaskContextAgentRun>,
     pub latest_failure: Option<TaskContextRunFailure>,
     pub latest_integration_outcome: Option<TaskContextIntegrationOutcome>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskContextAdvisoryHints {
+    pub note: String,
+    pub task_conflict_hints: Vec<TaskConflictHint>,
+    pub likely_files_or_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
