@@ -483,6 +483,7 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
             &tasker_db::TransitionTaskState {
                 to_state: to_state.to_string(),
                 agent_run_id: None,
+                repair_override: false,
             },
             self.actor,
         )

@@ -775,6 +775,7 @@ async fn transition_task_state_enforces_gates_and_audit_events() {
         &TransitionTaskState {
             to_state: "integrating".to_string(),
             agent_run_id: None,
+            repair_override: false,
         },
         &worker_actor(),
     )
@@ -815,6 +816,7 @@ async fn transition_task_state_enforces_gates_and_audit_events() {
         &TransitionTaskState {
             to_state: "integrating".to_string(),
             agent_run_id: Some(claimed.run.id.clone()),
+            repair_override: false,
         },
         &worker_actor(),
     )
@@ -852,6 +854,7 @@ async fn transition_task_state_requires_requirements_before_ready() {
         &TransitionTaskState {
             to_state: "ready".to_string(),
             agent_run_id: None,
+            repair_override: false,
         },
         &Actor::operator("tester"),
     )
@@ -902,6 +905,7 @@ async fn transition_task_state_rejects_noop_transition_without_clearing_retry_ho
         &TransitionTaskState {
             to_state: "in_progress".to_string(),
             agent_run_id: None,
+            repair_override: false,
         },
         &Actor::operator("tester"),
     )
@@ -942,6 +946,7 @@ async fn cancel_transition_cancels_active_agent_runs() {
         &TransitionTaskState {
             to_state: "canceled".to_string(),
             agent_run_id: None,
+            repair_override: false,
         },
         &Actor::operator("tester"),
     )
@@ -978,6 +983,7 @@ async fn worker_agent_transitions_require_active_claim_lease() {
         &TransitionTaskState {
             to_state: "in_progress".to_string(),
             agent_run_id: None,
+            repair_override: false,
         },
         &Actor::operator("tester"),
     )
@@ -990,6 +996,7 @@ async fn worker_agent_transitions_require_active_claim_lease() {
         &TransitionTaskState {
             to_state: "canceled".to_string(),
             agent_run_id: None,
+            repair_override: false,
         },
         &worker_actor(),
     )
@@ -1021,6 +1028,7 @@ async fn in_progress_to_done_is_allowed_when_gates_pass() {
         &TransitionTaskState {
             to_state: "in_progress".to_string(),
             agent_run_id: None,
+            repair_override: false,
         },
         &Actor::operator("tester"),
     )
@@ -1059,6 +1067,7 @@ async fn in_progress_to_done_is_allowed_when_gates_pass() {
         &TransitionTaskState {
             to_state: "done".to_string(),
             agent_run_id: None,
+            repair_override: false,
         },
         &Actor::operator("tester"),
     )
@@ -1089,6 +1098,7 @@ async fn transition_task_state_rejects_invalid_edges_and_worker_review_required_
         &TransitionTaskState {
             to_state: "done".to_string(),
             agent_run_id: None,
+            repair_override: false,
         },
         &Actor::operator("tester"),
     )
@@ -1132,6 +1142,7 @@ async fn transition_task_state_rejects_invalid_edges_and_worker_review_required_
         &TransitionTaskState {
             to_state: "integrating".to_string(),
             agent_run_id: None,
+            repair_override: false,
         },
         &worker_actor(),
     )
@@ -1305,6 +1316,281 @@ async fn waivers_require_allowed_actor_and_reason() {
         detail.acceptance_criteria[0].waiver_reason.as_deref(),
         Some("not needed")
     );
+}
+
+#[tokio::test]
+async fn blocking_tasks_are_recorded_and_reject_cross_queue_and_cycles() {
+    let (_temp, pool) = migrated_pool().await;
+    let actor = Actor::operator("tester");
+    create_task_queue(&pool, &sample_queue("TASK", "Tasker"), &actor)
+        .await
+        .expect("create queue");
+    create_task_queue(&pool, &sample_queue("OTHER", "Other"), &actor)
+        .await
+        .expect("create other queue");
+    create_task(&pool, &sample_task("TASK", "Blocking"), &actor)
+        .await
+        .expect("create blocking task");
+    create_task(&pool, &sample_task("OTHER", "Other blocking"), &actor)
+        .await
+        .expect("create other blocking task");
+
+    let mut blocked = sample_task("TASK", "Blocked");
+    blocked.blocking_task_identifiers = vec![" task-1 ".to_string(), "TASK-1".to_string()];
+    let detail = create_task(&pool, &blocked, &actor)
+        .await
+        .expect("create blocked task");
+    assert_eq!(detail.blocking_tasks.len(), 1);
+    assert_eq!(detail.blocking_tasks[0].identifier, "TASK-1");
+    assert!(!detail.blocking_tasks[0].resolved);
+
+    let mut cross_queue = sample_task("TASK", "Cross queue blocked");
+    cross_queue.blocking_task_identifiers = vec!["OTHER-1".to_string()];
+    let error = create_task(&pool, &cross_queue, &actor)
+        .await
+        .expect_err("cross queue blocker rejected");
+    assert!(error.to_string().contains("same Task Queue"));
+
+    let mut tx = pool.begin().await.expect("begin tx");
+    let task_1_id: String = sqlx::query_scalar("SELECT id FROM tasks WHERE identifier = 'TASK-1'")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("task 1 id");
+    let task_2_id: String = sqlx::query_scalar("SELECT id FROM tasks WHERE identifier = 'TASK-2'")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("task 2 id");
+    let error = crate::tasks::ensure_no_blocking_cycle(&mut tx, &task_2_id, &task_1_id)
+        .await
+        .expect_err("cycle rejected");
+    assert!(error.to_string().contains("cycle"));
+}
+
+#[tokio::test]
+async fn claim_next_skips_blocked_tasks_until_blocking_tasks_are_done() {
+    let (_temp, pool) = migrated_pool().await;
+    let actor = Actor::operator("tester");
+    create_task_queue(&pool, &sample_queue("TASK", "Tasker"), &actor)
+        .await
+        .expect("create queue");
+    create_task(&pool, &sample_task("TASK", "Blocking"), &actor)
+        .await
+        .expect("create blocking task");
+    let mut blocked = sample_task("TASK", "Blocked");
+    blocked.blocking_task_identifiers = vec!["TASK-1".to_string()];
+    create_task(&pool, &blocked, &actor)
+        .await
+        .expect("create blocked task");
+
+    let first = claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+        .await
+        .expect("claim")
+        .expect("blocking task claimed");
+    assert_eq!(first.task.task.identifier, "TASK-1");
+    assert!(claim_next(
+        &pool,
+        &ClaimNextInput {
+            worker_id: "worker-2".to_string(),
+            ..sample_claim("TASK")
+        },
+        &Actor {
+            kind: "worker_agent".to_string(),
+            id: "worker-2".to_string(),
+            display_name: "worker 2".to_string(),
+        },
+    )
+    .await
+    .expect("claim blocked")
+    .is_none());
+
+    update_acceptance_criterion_status(
+        &pool,
+        "TASK-1",
+        1,
+        &UpdateRequirementStatus {
+            status: "satisfied".to_string(),
+            waiver_reason: None,
+            validated_base_commit: None,
+        },
+        &worker_actor(),
+    )
+    .await
+    .expect("criterion");
+    update_validation_item_status(
+        &pool,
+        "TASK-1",
+        1,
+        &UpdateRequirementStatus {
+            status: "passed".to_string(),
+            waiver_reason: None,
+            validated_base_commit: None,
+        },
+        &worker_actor(),
+    )
+    .await
+    .expect("validation");
+    transition_task_state(
+        &pool,
+        "TASK-1",
+        &TransitionTaskState {
+            to_state: "done".to_string(),
+            agent_run_id: None,
+            repair_override: false,
+        },
+        &actor,
+    )
+    .await
+    .expect("done");
+    finish_run(
+        &pool,
+        &first.run.id,
+        &FinishRunInput {
+            outcome: "completed".to_string(),
+            failure_reason: None,
+            failure_reason_code: None,
+            retry_hold_seconds: None,
+        },
+        &worker_actor(),
+    )
+    .await
+    .expect("finish run");
+
+    let second = claim_next(&pool, &sample_claim("TASK"), &worker_actor())
+        .await
+        .expect("claim")
+        .expect("blocked task unblocked");
+    assert_eq!(second.task.task.identifier, "TASK-2");
+}
+
+#[tokio::test]
+async fn blocked_tasks_cannot_complete_without_done_blockers_or_repair_override() {
+    let (_temp, pool) = migrated_pool().await;
+    let actor = Actor::operator("tester");
+    create_task_queue(&pool, &sample_queue("TASK", "Tasker"), &actor)
+        .await
+        .expect("create queue");
+    create_task(&pool, &sample_task("TASK", "Blocking"), &actor)
+        .await
+        .expect("create blocking task");
+    let mut blocked = sample_task("TASK", "Blocked");
+    blocked.blocking_task_identifiers = vec!["TASK-1".to_string()];
+    create_task(&pool, &blocked, &actor)
+        .await
+        .expect("create blocked task");
+
+    let detail = get_task_detail(&pool, "TASK-2")
+        .await
+        .expect("detail")
+        .expect("task");
+    assert_eq!(detail.blocking_tasks[0].identifier, "TASK-1");
+    assert_eq!(detail.blocked_tasks.len(), 0);
+    let blocker_detail = get_task_detail(&pool, "TASK-1")
+        .await
+        .expect("detail")
+        .expect("task");
+    assert_eq!(blocker_detail.blocked_tasks[0].identifier, "TASK-2");
+    let context = get_task_context_bundle(&pool, "TASK-2")
+        .await
+        .expect("context")
+        .expect("context task");
+    assert_eq!(context.task.blocking_tasks[0].identifier, "TASK-1");
+    let status_tasks = tasks_for_status_by_states(&pool, &["ready"])
+        .await
+        .expect("status tasks");
+    let blocked_status = status_tasks
+        .iter()
+        .find(|task| task.identifier == "TASK-2")
+        .expect("blocked task in status");
+    assert_eq!(blocked_status.unresolved_blocking_task_count, 1);
+    assert_eq!(
+        blocked_status.blocking_task_identifiers.as_deref(),
+        Some("TASK-1:ready")
+    );
+
+    transition_task_state(
+        &pool,
+        "TASK-2",
+        &TransitionTaskState {
+            to_state: "in_progress".to_string(),
+            agent_run_id: None,
+            repair_override: false,
+        },
+        &actor,
+    )
+    .await
+    .expect("start blocked manually");
+    update_acceptance_criterion_status(
+        &pool,
+        "TASK-2",
+        1,
+        &UpdateRequirementStatus {
+            status: "satisfied".to_string(),
+            waiver_reason: None,
+            validated_base_commit: None,
+        },
+        &actor,
+    )
+    .await
+    .expect("criterion");
+    update_validation_item_status(
+        &pool,
+        "TASK-2",
+        1,
+        &UpdateRequirementStatus {
+            status: "passed".to_string(),
+            waiver_reason: None,
+            validated_base_commit: None,
+        },
+        &actor,
+    )
+    .await
+    .expect("validation");
+
+    for to_state in ["human_review", "integrating", "done"] {
+        let error = transition_task_state(
+            &pool,
+            "TASK-2",
+            &TransitionTaskState {
+                to_state: to_state.to_string(),
+                agent_run_id: None,
+                repair_override: false,
+            },
+            &actor,
+        )
+        .await
+        .expect_err("blocked transition fails");
+        assert!(error
+            .to_string()
+            .contains("Blocked Tasks cannot transition"));
+    }
+
+    let worker_error = transition_task_state(
+        &pool,
+        "TASK-2",
+        &TransitionTaskState {
+            to_state: "done".to_string(),
+            agent_run_id: None,
+            repair_override: true,
+        },
+        &worker_actor(),
+    )
+    .await
+    .expect_err("worker repair override rejected");
+    assert!(worker_error.to_string().contains("Operator actor"));
+
+    let detail = transition_task_state(
+        &pool,
+        "TASK-2",
+        &TransitionTaskState {
+            to_state: "done".to_string(),
+            agent_run_id: None,
+            repair_override: true,
+        },
+        &actor,
+    )
+    .await
+    .expect("operator repair override");
+    assert_eq!(detail.task.state, "done");
 }
 
 #[tokio::test]
@@ -2338,6 +2624,7 @@ async fn status_lists_active_runs_and_retry_holds() {
         &TransitionTaskState {
             to_state: "integrating".to_string(),
             agent_run_id: Some(active_run.run.id.clone()),
+            repair_override: false,
         },
         &worker_actor(),
     )
@@ -2573,5 +2860,6 @@ fn sample_task(queue_key: &str, title: &str) -> CreateTask {
             "dogfood".to_string(),
         ],
         conflict_hints: vec![],
+        blocking_task_identifiers: vec![],
     }
 }

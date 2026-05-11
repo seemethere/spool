@@ -77,6 +77,13 @@ async fn claim_next_once(
               SELECT 1 FROM task_retry_holds
               WHERE task_retry_holds.task_id = tasks.id AND task_retry_holds.hold_until > CURRENT_TIMESTAMP
           )
+          AND NOT EXISTS (
+              SELECT 1 FROM task_relationships
+              JOIN tasks blocking_tasks ON blocking_tasks.id = task_relationships.source_task_id
+              WHERE task_relationships.target_task_id = tasks.id
+                AND task_relationships.relationship_kind = 'blocks'
+                AND blocking_tasks.state != 'done'
+          )
         ORDER BY
           CASE tasks.priority
             WHEN 'urgent' THEN 0

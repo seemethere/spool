@@ -55,6 +55,7 @@ pub use workpad::{count_workpad_revisions, update_workpad_note};
 pub(crate) use audit::append_audit_event_in_tx;
 pub(crate) use connection::with_sqlite_write_retry;
 pub(crate) use lifecycle::{agent_run_select_sql, expire_stale_agent_runs};
+pub(crate) use tasks::unresolved_blocking_task_count;
 pub(crate) use validation::*;
 
 #[cfg(test)]

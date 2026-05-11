@@ -228,6 +228,9 @@ pub fn validate_create_task(input: &CreateTask) -> Result<()> {
     for hint in &input.conflict_hints {
         ensure_not_blank("Task Conflict Hint", hint)?;
     }
+    for identifier in &input.blocking_task_identifiers {
+        ensure_not_blank("Blocking Task Identifier", identifier)?;
+    }
     Ok(())
 }
 

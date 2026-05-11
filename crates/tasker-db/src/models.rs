@@ -88,6 +88,8 @@ pub struct CreateTask {
     pub tags: Vec<String>,
     #[serde(default)]
     pub conflict_hints: Vec<String>,
+    #[serde(default)]
+    pub blocking_task_identifiers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -180,6 +182,14 @@ pub struct TaskConflictOverlap {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct BlockingTaskSummary {
+    pub identifier: String,
+    pub title: String,
+    pub state: String,
+    pub resolved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
 pub struct TaskConflictGroup {
     pub queue_key: String,
     pub target: String,
@@ -205,6 +215,8 @@ pub struct TaskDetail {
     pub task_links: Vec<TaskLink>,
     pub conflict_hints: Vec<TaskConflictHint>,
     pub conflict_overlaps: Vec<TaskConflictOverlap>,
+    pub blocking_tasks: Vec<BlockingTaskSummary>,
+    pub blocked_tasks: Vec<BlockingTaskSummary>,
     pub latest_rework_reason_code: Option<String>,
     pub latest_rework_reason: Option<String>,
 }
@@ -322,6 +334,8 @@ pub struct TaskStatusSummary {
     pub main_branch: String,
     pub latest_rework_reason_code: Option<String>,
     pub latest_rework_reason: Option<String>,
+    pub unresolved_blocking_task_count: i64,
+    pub blocking_task_identifiers: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
@@ -359,6 +373,8 @@ pub struct UpdateRequirementStatus {
 pub struct TransitionTaskState {
     pub to_state: String,
     pub agent_run_id: Option<String>,
+    #[serde(default)]
+    pub repair_override: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]

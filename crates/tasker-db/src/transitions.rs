@@ -48,12 +48,19 @@ pub async fn transition_task_state(
     .with_context(|| format!("failed to load Task {identifier}"))?
     .with_context(|| format!("Task {identifier} not found"))?;
 
+    if input.repair_override && actor.kind != "operator" {
+        anyhow::bail!("Repair Override requires an Operator actor");
+    }
     validate_transition(&task, &input.to_state, actor)?;
     if input.to_state == "ready" {
         ensure_ready_requirements_exist(&mut tx, &task.id).await?;
     }
-    if requires_completion_gates(&input.to_state) {
+    if requires_completion_gates(&input.to_state) && !input.repair_override {
         ensure_completion_gates_pass(&mut tx, &task.id).await?;
+        let unresolved = unresolved_blocking_task_count(&mut tx, &task.id).await?;
+        if unresolved > 0 {
+            anyhow::bail!("Blocked Tasks cannot transition to Human Review, Integrating, or Done until all Blocking Tasks are Done");
+        }
     }
     if actor.kind == "worker_agent" {
         ensure_worker_owns_active_run(&mut tx, &task.id, input.agent_run_id.as_deref(), actor)
@@ -125,6 +132,7 @@ pub async fn transition_task_state(
             "identifier": identifier,
             "from": task.state,
             "to": input.to_state,
+            "repair_override": input.repair_override,
         }),
     )
     .await?;

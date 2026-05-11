@@ -297,6 +297,9 @@ enum TaskCommand {
         /// Active Agent Run ID required for Worker Agent transition to Integrating.
         #[arg(long)]
         agent_run_id: Option<String>,
+        /// Operator-only Repair Override for exceptional gate repair.
+        #[arg(long)]
+        repair_override: bool,
     },
     /// Update Acceptance Criterion status for a Task.
     Criterion {
@@ -1327,6 +1330,7 @@ async fn task(paths: &TaskerPaths, db_path_overridden: bool, command: TaskComman
             actor_kind,
             actor,
             agent_run_id,
+            repair_override,
         } => {
             let to_state = bootstrap::normalize_label(&to);
             let actor = tasker_db::Actor {
@@ -1347,6 +1351,7 @@ async fn task(paths: &TaskerPaths, db_path_overridden: bool, command: TaskComman
                 &tasker_db::TransitionTaskState {
                     to_state,
                     agent_run_id,
+                    repair_override,
                 },
                 &actor,
             )
@@ -1740,6 +1745,12 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool, json: bool) -> Re
                                 &task.main_branch,
                             )
                         );
+                        if task.unresolved_blocking_task_count > 0 {
+                            println!(
+                                "      Blocked by: {}",
+                                task.blocking_task_identifiers.as_deref().unwrap_or("")
+                            );
+                        }
                         if state == "rework" {
                             println!(
                                 "      Rework reason: code={} reason={}",
@@ -2377,6 +2388,7 @@ async fn merge(paths: &TaskerPaths, db_path_overridden: bool, command: MergeComm
                 &tasker_db::TransitionTaskState {
                     to_state: "done".to_string(),
                     agent_run_id: None,
+                    repair_override: false,
                 },
                 &tasker_db::Actor::operator(actor),
             )
@@ -2431,6 +2443,7 @@ async fn retry_local_worktree_integration(
             &tasker_db::TransitionTaskState {
                 to_state: "integrating".to_string(),
                 agent_run_id: None,
+                repair_override: false,
             },
             actor,
         )
@@ -3348,6 +3361,8 @@ mod tests {
             main_branch: "main".to_string(),
             latest_rework_reason_code: None,
             latest_rework_reason: None,
+            unresolved_blocking_task_count: 0,
+            blocking_task_identifiers: None,
         }];
         let conflicts = vec![tasker_db::TaskConflictGroup {
             queue_key: "TASK".to_string(),
@@ -3501,6 +3516,7 @@ mod tests {
                 validation_items: vec!["validated".to_string()],
                 tags: vec![],
                 conflict_hints: vec![],
+                blocking_task_identifiers: vec![],
             },
             &tasker_db::Actor::operator("tester"),
         )
@@ -4139,6 +4155,7 @@ Implement Bootstrap Task Creation.
                 actor_kind: "operator".to_string(),
                 actor: "tester".to_string(),
                 agent_run_id: None,
+                repair_override: false,
             },
         )
         .await
@@ -4490,6 +4507,7 @@ Implement Bootstrap Task Creation.
             &tasker_db::TransitionTaskState {
                 to_state: "rework".to_string(),
                 agent_run_id: None,
+                repair_override: false,
             },
             &tasker_db::Actor::operator("tester"),
         )
@@ -4748,6 +4766,7 @@ Implement Bootstrap Task Creation.
                 actor_kind: "worker_agent".to_string(),
                 actor: "worker".to_string(),
                 agent_run_id: Some(run_id),
+                repair_override: false,
             },
         )
         .await
@@ -4789,6 +4808,7 @@ Implement Bootstrap Task Creation.
                 actor_kind: "worker_agent".to_string(),
                 actor: "worker".to_string(),
                 agent_run_id: Some(run_id),
+                repair_override: false,
             },
         )
         .await
@@ -4817,6 +4837,7 @@ Implement Bootstrap Task Creation.
                 actor_kind: "operator".to_string(),
                 actor: "operator".to_string(),
                 agent_run_id: None,
+                repair_override: false,
             },
         )
         .await
@@ -4845,6 +4866,7 @@ Implement Bootstrap Task Creation.
                 actor_kind: "worker_agent".to_string(),
                 actor: "worker".to_string(),
                 agent_run_id: Some(run_id),
+                repair_override: false,
             },
         )
         .await
@@ -4902,6 +4924,7 @@ Implement Bootstrap Task Creation.
                 validation_items: vec!["validated".to_string()],
                 tags: vec![],
                 conflict_hints: vec![],
+                blocking_task_identifiers: vec![],
             },
             &tasker_db::Actor::operator("tester"),
         )
@@ -5039,6 +5062,7 @@ Implement Bootstrap Task Creation.
                 validation_items: vec!["validated".to_string()],
                 tags: vec![],
                 conflict_hints: vec![],
+                blocking_task_identifiers: vec![],
             },
             &tasker_db::Actor::operator("tester"),
         )
@@ -5119,6 +5143,7 @@ Implement Bootstrap Task Creation.
             &tasker_db::TransitionTaskState {
                 to_state: "in_progress".to_string(),
                 agent_run_id: None,
+                repair_override: false,
             },
             &actor,
         )
@@ -5130,6 +5155,7 @@ Implement Bootstrap Task Creation.
             &tasker_db::TransitionTaskState {
                 to_state: "integrating".to_string(),
                 agent_run_id: None,
+                repair_override: false,
             },
             &actor,
         )

@@ -65,6 +65,8 @@ pub struct TransitionTaskRequest {
     pub actor: tasker_db::Actor,
     pub to_state: String,
     pub agent_run_id: Option<String>,
+    #[serde(default)]
+    pub repair_override: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,6 +255,7 @@ async fn transition_task(
         &tasker_db::TransitionTaskState {
             to_state: request.to_state,
             agent_run_id: request.agent_run_id,
+            repair_override: request.repair_override,
         },
         &request.actor,
     )

@@ -147,7 +147,22 @@ pub async fn tasks_for_status_by_states(
                     ORDER BY agent_runs.finished_at DESC, agent_runs.created_at DESC, agent_runs.id DESC
                     LIMIT 1
                 )
-            ) AS latest_rework_reason
+            ) AS latest_rework_reason,
+            (
+                SELECT COUNT(*)
+                FROM task_relationships
+                JOIN tasks blocking_tasks ON blocking_tasks.id = task_relationships.source_task_id
+                WHERE task_relationships.target_task_id = tasks.id
+                  AND task_relationships.relationship_kind = 'blocks'
+                  AND blocking_tasks.state != 'done'
+            ) AS unresolved_blocking_task_count,
+            (
+                SELECT group_concat(blocking_tasks.identifier || ':' || blocking_tasks.state, ', ')
+                FROM task_relationships
+                JOIN tasks blocking_tasks ON blocking_tasks.id = task_relationships.source_task_id
+                WHERE task_relationships.target_task_id = tasks.id
+                  AND task_relationships.relationship_kind = 'blocks'
+            ) AS blocking_task_identifiers
         FROM tasks
         JOIN task_queues ON task_queues.id = tasks.task_queue_id
         WHERE tasks.state IN (

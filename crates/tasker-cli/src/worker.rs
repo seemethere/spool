@@ -1141,6 +1141,7 @@ async fn prepare_fake_integrating_task(
         &tasker_db::TransitionTaskState {
             to_state: "integrating".to_string(),
             agent_run_id: Some(claimed.run.id.clone()),
+            repair_override: false,
         },
         actor,
     )
@@ -1351,6 +1352,7 @@ mod tests {
                 validation_items: vec!["Task Links recorded".to_string()],
                 tags: vec![],
                 conflict_hints: vec![],
+                blocking_task_identifiers: vec![],
             },
             &tasker_db::Actor::operator("tester"),
         )
@@ -2200,6 +2202,7 @@ mod tests {
                 validation_items: vec!["Validated".to_string()],
                 tags: vec![],
                 conflict_hints: vec![],
+                blocking_task_identifiers: vec![],
             },
             &tasker_db::Actor::operator("tester"),
         )

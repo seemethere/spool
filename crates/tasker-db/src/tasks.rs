@@ -128,6 +128,9 @@ pub async fn create_task(
         .context("failed to create Task Conflict Hint")?;
     }
 
+    let blocking_task_identifiers = normalized_task_identifiers(&input.blocking_task_identifiers);
+    create_blocking_relationships(&mut tx, &queue.id, &task_id, &blocking_task_identifiers).await?;
+
     let payload_json = serde_json::json!({
         "identifier": identifier,
         "queue_key": queue.key,
@@ -139,6 +142,7 @@ pub async fn create_task(
         "validation_items_count": input.validation_items.len(),
         "tags": normalized_tags(&input.tags),
         "conflict_hints": conflict_hints,
+        "blocking_task_identifiers": blocking_task_identifiers,
     })
     .to_string();
     sqlx::query(
@@ -199,6 +203,7 @@ pub async fn create_child_task(
         validation_items: input.validation_items.clone(),
         tags: input.tags.clone(),
         conflict_hints: input.conflict_hints.clone(),
+        blocking_task_identifiers: Vec::new(),
     };
     validate_create_task(&child_input)?;
 
@@ -306,6 +311,7 @@ pub async fn create_child_task(
         .await
         .context("failed to create Child Task relationship")?;
     if input.blocks_parent {
+        ensure_no_blocking_cycle(&mut tx, &child_task_id, &parent.id).await?;
         sqlx::query("INSERT INTO task_relationships (id, source_task_id, target_task_id, relationship_kind) VALUES (?, ?, ?, 'blocks')")
             .bind(Uuid::new_v4().to_string())
             .bind(&child_task_id)
@@ -465,6 +471,9 @@ pub async fn get_task_detail(pool: &SqlitePool, identifier: &str) -> Result<Opti
     .await
     .context("failed to load Task Conflict overlaps")?;
 
+    let blocking_tasks = load_blocking_tasks(pool, &task.id).await?;
+    let blocked_tasks = load_blocked_tasks(pool, &task.id).await?;
+
     let latest_rework_outcome = sqlx::query_as::<_, TaskContextIntegrationOutcome>(
         r#"
         SELECT
@@ -540,6 +549,8 @@ pub async fn get_task_detail(pool: &SqlitePool, identifier: &str) -> Result<Opti
         task_links,
         conflict_hints,
         conflict_overlaps,
+        blocking_tasks,
+        blocked_tasks,
         latest_rework_reason_code,
         latest_rework_reason,
     }))
@@ -665,6 +676,142 @@ fn primary_task_link_target(task_links: &[TaskLink], kind: &str) -> Option<Strin
         .find(|link| link.kind == kind && link.is_primary)
         .or_else(|| task_links.iter().find(|link| link.kind == kind))
         .map(|link| link.target.clone())
+}
+
+pub(crate) fn normalized_task_identifiers(identifiers: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for identifier in identifiers {
+        let identifier = identifier.trim().to_ascii_uppercase();
+        if !identifier.is_empty() && !normalized.contains(&identifier) {
+            normalized.push(identifier);
+        }
+    }
+    normalized
+}
+
+async fn create_blocking_relationships(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    queue_id: &str,
+    blocked_task_id: &str,
+    blocking_task_identifiers: &[String],
+) -> Result<()> {
+    for identifier in blocking_task_identifiers {
+        let blocking_task = sqlx::query_as::<_, Task>(
+            r#"
+            SELECT tasks.id, tasks.task_queue_id, task_queues.key AS task_queue_key, tasks.identifier,
+                   tasks.sequence, tasks.title, tasks.brief, tasks.priority, tasks.state,
+                   tasks.review_required, tasks.validated_base_commit, tasks.created_at, tasks.updated_at
+            FROM tasks
+            JOIN task_queues ON task_queues.id = tasks.task_queue_id
+            WHERE tasks.identifier = ?
+            "#,
+        )
+        .bind(identifier)
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("failed to load Blocking Task {identifier}"))?
+        .with_context(|| format!("Blocking Task {identifier} not found"))?;
+        if blocking_task.task_queue_id != queue_id {
+            anyhow::bail!("Blocking Tasks must be in the same Task Queue as the Blocked Task");
+        }
+        if blocking_task.id == blocked_task_id {
+            anyhow::bail!("Task cannot block itself");
+        }
+        ensure_no_blocking_cycle(tx, &blocking_task.id, blocked_task_id).await?;
+        sqlx::query("INSERT INTO task_relationships (id, source_task_id, target_task_id, relationship_kind) VALUES (?, ?, ?, 'blocks')")
+            .bind(Uuid::new_v4().to_string())
+            .bind(&blocking_task.id)
+            .bind(blocked_task_id)
+            .execute(&mut **tx)
+            .await
+            .context("failed to create Blocking Task relationship")?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn ensure_no_blocking_cycle(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    blocking_task_id: &str,
+    blocked_task_id: &str,
+) -> Result<()> {
+    let creates_cycle: i64 = sqlx::query_scalar(
+        r#"
+        WITH RECURSIVE downstream(task_id) AS (
+            SELECT target_task_id FROM task_relationships
+            WHERE source_task_id = ? AND relationship_kind = 'blocks'
+            UNION
+            SELECT task_relationships.target_task_id
+            FROM task_relationships
+            JOIN downstream ON task_relationships.source_task_id = downstream.task_id
+            WHERE task_relationships.relationship_kind = 'blocks'
+        )
+        SELECT COUNT(*) FROM downstream WHERE task_id = ?
+        "#,
+    )
+    .bind(blocked_task_id)
+    .bind(blocking_task_id)
+    .fetch_one(&mut **tx)
+    .await
+    .context("failed to check Blocking Task relationship cycle")?;
+    if creates_cycle > 0 {
+        anyhow::bail!("Blocking Task relationship would create a cycle");
+    }
+    Ok(())
+}
+
+pub(crate) async fn unresolved_blocking_task_count(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: &str,
+) -> Result<i64> {
+    sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM task_relationships
+        JOIN tasks blocking_tasks ON blocking_tasks.id = task_relationships.source_task_id
+        WHERE task_relationships.target_task_id = ?
+          AND task_relationships.relationship_kind = 'blocks'
+          AND blocking_tasks.state != 'done'
+        "#,
+    )
+    .bind(task_id)
+    .fetch_one(&mut **tx)
+    .await
+    .context("failed to count unresolved Blocking Tasks")
+}
+
+async fn load_blocking_tasks(pool: &SqlitePool, task_id: &str) -> Result<Vec<BlockingTaskSummary>> {
+    sqlx::query_as::<_, BlockingTaskSummary>(
+        r#"
+        SELECT tasks.identifier, tasks.title, tasks.state, tasks.state = 'done' AS resolved
+        FROM task_relationships
+        JOIN tasks ON tasks.id = task_relationships.source_task_id
+        WHERE task_relationships.target_task_id = ?
+          AND task_relationships.relationship_kind = 'blocks'
+        ORDER BY tasks.identifier
+        "#,
+    )
+    .bind(task_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load Blocking Tasks")
+}
+
+async fn load_blocked_tasks(pool: &SqlitePool, task_id: &str) -> Result<Vec<BlockingTaskSummary>> {
+    sqlx::query_as::<_, BlockingTaskSummary>(
+        r#"
+        SELECT tasks.identifier, tasks.title, tasks.state, blocking_tasks.state = 'done' AS resolved
+        FROM task_relationships
+        JOIN tasks ON tasks.id = task_relationships.target_task_id
+        JOIN tasks blocking_tasks ON blocking_tasks.id = task_relationships.source_task_id
+        WHERE task_relationships.source_task_id = ?
+          AND task_relationships.relationship_kind = 'blocks'
+        ORDER BY tasks.identifier
+        "#,
+    )
+    .bind(task_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load Blocked Tasks")
 }
 
 pub async fn upsert_task_link(

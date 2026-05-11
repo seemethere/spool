@@ -116,6 +116,36 @@ pub fn write_task_detail(mut writer: impl Write, detail: &tasker_db::TaskDetail)
             writeln!(writer, "  reason: {reason}")?;
         }
     }
+    writeln!(writer, "\nBlocking Tasks:")?;
+    if detail.blocking_tasks.is_empty() {
+        writeln!(writer, "(none)")?;
+    } else {
+        for task in &detail.blocking_tasks {
+            let status = if task.resolved {
+                "resolved"
+            } else {
+                "unresolved"
+            };
+            writeln!(
+                writer,
+                "  {} [{}] {} ({status})",
+                task.identifier, task.state, task.title
+            )?;
+        }
+    }
+    writeln!(writer, "\nBlocked Tasks:")?;
+    if detail.blocked_tasks.is_empty() {
+        writeln!(writer, "(none)")?;
+    } else {
+        for task in &detail.blocked_tasks {
+            let status = if task.resolved { "resolved" } else { "blocked" };
+            writeln!(
+                writer,
+                "  {} [{}] {} ({status})",
+                task.identifier, task.state, task.title
+            )?;
+        }
+    }
     writeln!(
         writer,
         "\nTask Conflict Hints (advisory scheduling/review):"
@@ -738,6 +768,8 @@ mod tests {
                 task_links: Vec::new(),
                 conflict_hints: Vec::new(),
                 conflict_overlaps: Vec::new(),
+                blocking_tasks: Vec::new(),
+                blocked_tasks: Vec::new(),
                 latest_rework_reason_code: None,
                 latest_rework_reason: None,
             },

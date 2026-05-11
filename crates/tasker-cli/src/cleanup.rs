@@ -821,6 +821,7 @@ mod tests {
                     validation_items: vec!["validation".to_string()],
                     tags: vec![],
                     conflict_hints: vec![],
+                    blocking_task_identifiers: vec![],
                 },
                 &tasker_db::Actor::operator("tester"),
             )

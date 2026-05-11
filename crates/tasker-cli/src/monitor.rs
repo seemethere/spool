@@ -924,12 +924,22 @@ pub fn write_snapshot(mut writer: impl Write, snapshot: &MonitorSnapshot) -> io:
     for queue in &snapshot.queues {
         for task in queue.ready_tasks.iter().take(NEXT_TASK_LIMIT) {
             next += 1;
-            writeln!(
-                writer,
-                "  › {}\tpriority={}",
-                compact_task_label(&task.identifier, &task.title, 64),
-                task.priority
-            )?;
+            if task.unresolved_blocking_task_count > 0 {
+                writeln!(
+                    writer,
+                    "  › {}\tpriority={}\tblocked_by={}",
+                    compact_task_label(&task.identifier, &task.title, 64),
+                    task.priority,
+                    task.blocking_task_identifiers.as_deref().unwrap_or("")
+                )?;
+            } else {
+                writeln!(
+                    writer,
+                    "  › {}\tpriority={}",
+                    compact_task_label(&task.identifier, &task.title, 64),
+                    task.priority
+                )?;
+            }
         }
         if queue.ready_tasks.len() > NEXT_TASK_LIMIT {
             writeln!(
@@ -1039,6 +1049,7 @@ mod tests {
                 validation_items: vec!["validation".to_string()],
                 tags: Vec::new(),
                 conflict_hints: Vec::new(),
+                blocking_task_identifiers: Vec::new(),
             },
             &tasker_db::Actor::operator("tester"),
         )
@@ -1317,6 +1328,8 @@ mod tests {
                     main_branch: "main".to_string(),
                     latest_rework_reason_code: None,
                     latest_rework_reason: None,
+                    unresolved_blocking_task_count: 0,
+                    blocking_task_identifiers: None,
                 }],
                 rework_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
@@ -1437,6 +1450,8 @@ mod tests {
                 main_branch: "main".to_string(),
                 latest_rework_reason_code: None,
                 latest_rework_reason: None,
+                unresolved_blocking_task_count: 0,
+                blocking_task_identifiers: None,
             })
             .collect();
         let snapshot = MonitorSnapshot {
@@ -1531,6 +1546,8 @@ mod tests {
                     main_branch: "main".to_string(),
                     latest_rework_reason_code: None,
                     latest_rework_reason: None,
+                    unresolved_blocking_task_count: 0,
+                    blocking_task_identifiers: None,
                 }],
                 advisory_conflict_hints: Vec::new(),
                 integration_retries: vec![tasker_db::IntegrationRetryStatus {

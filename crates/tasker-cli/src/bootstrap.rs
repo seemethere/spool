@@ -13,6 +13,8 @@ struct BootstrapFrontMatter {
     tags: Option<Vec<String>>,
     #[serde(default, alias = "anticipated_touched_files", alias = "touched_files")]
     conflict_hints: Option<Vec<String>>,
+    #[serde(default, alias = "blocking_tasks", alias = "blockers")]
+    blocking_task_identifiers: Option<Vec<String>>,
     review_required: Option<bool>,
 }
 
@@ -42,6 +44,7 @@ pub fn parse_bootstrap_task(
         validation_items: front_matter.validation_items.unwrap_or_default(),
         tags: front_matter.tags.unwrap_or_default(),
         conflict_hints: front_matter.conflict_hints.unwrap_or_default(),
+        blocking_task_identifiers: front_matter.blocking_task_identifiers.unwrap_or_default(),
     })
 }
 
@@ -76,6 +79,21 @@ mod tests {
         assert_eq!(parsed.priority, "normal");
         assert_eq!(parsed.state, "ready");
         assert_eq!(parsed.brief, "Brief");
+    }
+
+    #[test]
+    fn parser_reads_blocking_task_identifier_aliases() {
+        let parsed = parse_bootstrap_task(
+            "TASK",
+            "inline",
+            "---\ntitle: Test\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\nblockers:\n  - TASK-1\n  - TASK-2\n---\nBrief\n",
+        )
+        .expect("parse");
+
+        assert_eq!(
+            parsed.blocking_task_identifiers,
+            vec!["TASK-1".to_string(), "TASK-2".to_string()]
+        );
     }
 
     #[test]
