@@ -425,6 +425,12 @@ enum TelemetryCommand {
         /// Number of slow completed Agent Runs to list.
         #[arg(long, default_value_t = 5)]
         slow_limit: usize,
+        /// Efficiency budget source: fixed or adaptive. Defaults to config telemetry.efficiency_budget.
+        #[arg(long, value_parser = ["fixed", "adaptive"])]
+        efficiency_budget: Option<String>,
+        /// Recent Agent Run window for adaptive efficiency budgets.
+        #[arg(long = "adaptive-budget-window", value_parser = clap::value_parser!(u64).range(1..))]
+        adaptive_budget_window: Option<u64>,
         /// Emit machine-readable Agent Run telemetry JSON.
         #[arg(long)]
         json: bool,

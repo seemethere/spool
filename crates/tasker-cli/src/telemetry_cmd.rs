@@ -23,11 +23,36 @@ pub(crate) async fn telemetry(
         TelemetryCommand::Summary {
             queue,
             slow_limit,
+            efficiency_budget,
+            adaptive_budget_window,
             json,
         } => {
+            let config = TaskerConfig::load_or_default(paths)?;
+            let mode_text = efficiency_budget
+                .as_deref()
+                .unwrap_or(&config.telemetry.efficiency_budget);
+            let mode = match mode_text {
+                "fixed" => telemetry::EfficiencyBudgetMode::Fixed,
+                "adaptive" => telemetry::EfficiencyBudgetMode::Adaptive,
+                other => anyhow::bail!(
+                    "invalid telemetry.efficiency_budget {other:?}; expected fixed or adaptive"
+                ),
+            };
             let summary = telemetry::summarize_agent_runs(
                 &pool,
-                &telemetry::TelemetryOptions { queue, slow_limit },
+                &telemetry::TelemetryOptions {
+                    queue,
+                    slow_limit,
+                    budget: telemetry::EfficiencyBudgetOptions {
+                        mode,
+                        window_size: adaptive_budget_window
+                            .map(|value| value as usize)
+                            .unwrap_or(config.telemetry.adaptive_efficiency_budget_window),
+                        min_metric_coverage: config
+                            .telemetry
+                            .adaptive_efficiency_budget_min_coverage,
+                    },
+                },
             )
             .await?;
             if json {

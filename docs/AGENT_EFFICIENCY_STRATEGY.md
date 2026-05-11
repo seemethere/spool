@@ -140,6 +140,8 @@ Tasker surfaces local dogfood efficiency budget warnings in `tasker telemetry su
 
 Current defaults flag warning/severe overruns at 150/250 tool calls, 80k/100k total tokens, 80k/100k max context tokens, 100 MiB/200 MiB Run Transcript byte size, 1/10 repeated file reads, 1/5 repeated Tasker context fetches, and 1h/2h run duration. Missing token and context metrics are reported as unknown rather than passing or failing as zero, and token budget output labels exact token metrics separately from proxy-only runs.
 
+Operators can keep those fixed defaults or opt `tasker telemetry summary` into an adaptive local baseline with `--efficiency-budget adaptive` or `[telemetry] efficiency_budget = "adaptive"` in config. Adaptive budgets derive warning/severe thresholds only from sanitized numeric Agent Run metrics over the recent local window: tool calls, total tokens, max context tokens, Run Transcript byte size, repeated file reads, repeated Tasker context fetches, and run duration. CLI output prints the active source, window size, minimum coverage, and each metric threshold. Metrics with missing or sparse coverage fall back to the fixed defaults with an explicit note. Adaptive budgets are dogfooding tuning aids only; they are not product policy, billing metrics, or external telemetry, and raw transcripts, prompts, tool arguments, and file contents remain local-only artifacts.
+
 ## Guidance for near-term dogfooding
 
 - Prefer small implementation Tasks with explicit relevant ADRs, likely files, and validation commands.

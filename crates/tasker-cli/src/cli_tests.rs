@@ -801,6 +801,7 @@ async fn init_uses_existing_config_database_path() {
         database: tasker_config::DatabaseConfig {
             path: configured_db_path.clone(),
         },
+        telemetry: tasker_config::TelemetryConfig::default(),
     };
     config.write_if_missing(&paths).expect("write config");
 

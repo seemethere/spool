@@ -79,6 +79,8 @@ impl TaskerPaths {
 pub struct TaskerConfig {
     pub service: ServiceConfig,
     pub database: DatabaseConfig,
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -91,6 +93,39 @@ pub struct DatabaseConfig {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TelemetryConfig {
+    #[serde(default = "default_efficiency_budget")]
+    pub efficiency_budget: String,
+    #[serde(default = "default_adaptive_efficiency_budget_window")]
+    pub adaptive_efficiency_budget_window: usize,
+    #[serde(default = "default_adaptive_efficiency_budget_min_coverage")]
+    pub adaptive_efficiency_budget_min_coverage: usize,
+}
+
+fn default_efficiency_budget() -> String {
+    "fixed".to_string()
+}
+
+fn default_adaptive_efficiency_budget_window() -> usize {
+    20
+}
+
+fn default_adaptive_efficiency_budget_min_coverage() -> usize {
+    5
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            efficiency_budget: default_efficiency_budget(),
+            adaptive_efficiency_budget_window: default_adaptive_efficiency_budget_window(),
+            adaptive_efficiency_budget_min_coverage:
+                default_adaptive_efficiency_budget_min_coverage(),
+        }
+    }
+}
+
 impl TaskerConfig {
     pub fn default_for_paths(paths: &TaskerPaths) -> Self {
         Self {
@@ -100,6 +135,7 @@ impl TaskerConfig {
             database: DatabaseConfig {
                 path: paths.db_path.clone(),
             },
+            telemetry: TelemetryConfig::default(),
         }
     }
 

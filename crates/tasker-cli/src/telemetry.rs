@@ -83,7 +83,50 @@ pub struct EfficiencyBudgetStatus {
     pub unknowns: Vec<EfficiencyBudgetUnknown>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EfficiencyBudgetMode {
+    Fixed,
+    Adaptive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EfficiencyBudgetThresholdSummary {
+    pub metric: String,
+    pub source: String,
+    pub warning: i64,
+    pub severe: i64,
+    pub sample_size: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ActiveEfficiencyBudget {
+    pub mode: EfficiencyBudgetMode,
+    pub source: String,
+    pub window_size: usize,
+    pub min_metric_coverage: usize,
+    pub thresholds: Vec<EfficiencyBudgetThresholdSummary>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EfficiencyBudgetOptions {
+    pub mode: EfficiencyBudgetMode,
+    pub window_size: usize,
+    pub min_metric_coverage: usize,
+}
+
+impl Default for EfficiencyBudgetOptions {
+    fn default() -> Self {
+        Self {
+            mode: EfficiencyBudgetMode::Fixed,
+            window_size: 20,
+            min_metric_coverage: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EfficiencyBudgetThreshold {
     metric: &'static str,
     warning: i64,
@@ -126,6 +169,29 @@ const RUN_DURATION_BUDGET: EfficiencyBudgetThreshold = EfficiencyBudgetThreshold
     severe: 2 * 60 * 60,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EfficiencyBudgetThresholdSet {
+    tool_calls: EfficiencyBudgetThreshold,
+    total_tokens: EfficiencyBudgetThreshold,
+    max_context_tokens: EfficiencyBudgetThreshold,
+    transcript_bytes: EfficiencyBudgetThreshold,
+    repeated_reads: EfficiencyBudgetThreshold,
+    repeated_tasker_context_fetches: EfficiencyBudgetThreshold,
+    duration_seconds: EfficiencyBudgetThreshold,
+}
+
+fn fixed_budget_thresholds() -> EfficiencyBudgetThresholdSet {
+    EfficiencyBudgetThresholdSet {
+        tool_calls: TOOL_CALL_BUDGET,
+        total_tokens: TOTAL_TOKEN_BUDGET,
+        max_context_tokens: MAX_CONTEXT_BUDGET,
+        transcript_bytes: TRANSCRIPT_BYTE_BUDGET,
+        repeated_reads: REPEATED_READ_BUDGET,
+        repeated_tasker_context_fetches: REPEATED_TASKER_CONTEXT_BUDGET,
+        duration_seconds: RUN_DURATION_BUDGET,
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct EfficiencyBudgetInput {
     pub tool_call_count: Option<i64>,
@@ -139,20 +205,27 @@ pub struct EfficiencyBudgetInput {
 }
 
 pub fn evaluate_efficiency_budget(input: EfficiencyBudgetInput) -> EfficiencyBudgetStatus {
+    evaluate_efficiency_budget_with_thresholds(input, fixed_budget_thresholds())
+}
+
+pub fn evaluate_efficiency_budget_with_thresholds(
+    input: EfficiencyBudgetInput,
+    thresholds: EfficiencyBudgetThresholdSet,
+) -> EfficiencyBudgetStatus {
     let mut status = EfficiencyBudgetStatus {
         warnings: Vec::new(),
         unknowns: Vec::new(),
     };
     push_budget(
         &mut status.warnings,
-        TOOL_CALL_BUDGET,
+        thresholds.tool_calls,
         input.tool_call_count,
         None,
     );
     let total_token_kind = metric_kind(input.total_tokens, input.has_proxy_metrics);
     push_budget(
         &mut status.warnings,
-        TOTAL_TOKEN_BUDGET,
+        thresholds.total_tokens,
         input.total_tokens,
         Some(total_token_kind),
     );
@@ -166,7 +239,7 @@ pub fn evaluate_efficiency_budget(input: EfficiencyBudgetInput) -> EfficiencyBud
     let context_token_kind = metric_kind(input.max_context_tokens, input.has_proxy_metrics);
     push_budget(
         &mut status.warnings,
-        MAX_CONTEXT_BUDGET,
+        thresholds.max_context_tokens,
         input.max_context_tokens,
         Some(context_token_kind),
     );
@@ -179,25 +252,25 @@ pub fn evaluate_efficiency_budget(input: EfficiencyBudgetInput) -> EfficiencyBud
     }
     push_budget(
         &mut status.warnings,
-        TRANSCRIPT_BYTE_BUDGET,
+        thresholds.transcript_bytes,
         input.transcript_byte_size,
         None,
     );
     push_budget(
         &mut status.warnings,
-        REPEATED_READ_BUDGET,
+        thresholds.repeated_reads,
         input.repeated_read_count,
         None,
     );
     push_budget(
         &mut status.warnings,
-        REPEATED_TASKER_CONTEXT_BUDGET,
+        thresholds.repeated_tasker_context_fetches,
         input.repeated_tasker_context_fetch_count,
         None,
     );
     push_budget(
         &mut status.warnings,
-        RUN_DURATION_BUDGET,
+        thresholds.duration_seconds,
         input.duration_seconds,
         None,
     );
@@ -244,12 +317,14 @@ fn push_budget(
 pub struct TelemetryOptions {
     pub queue: String,
     pub slow_limit: usize,
+    pub budget: EfficiencyBudgetOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TelemetrySummary {
     pub queue: String,
     pub total_runs: usize,
+    pub efficiency_budget: ActiveEfficiencyBudget,
     pub duplicate_tasks: Vec<DuplicateTaskRun>,
     pub post_integrating_runs: Vec<TelemetryRun>,
     pub failed_or_timed_out_runs: Vec<TelemetryRun>,
@@ -703,6 +778,8 @@ pub async fn summarize_agent_runs(
         }
     }
 
+    let active_budget = active_efficiency_budget(&rows, &options.budget);
+
     let post_integrating_runs = rows
         .iter()
         .filter(|row| {
@@ -710,7 +787,7 @@ pub async fn summarize_agent_runs(
                 .as_ref()
                 .is_some_and(|integrating_at| row.created_at > *integrating_at)
         })
-        .map(run_from_row)
+        .map(|row| run_from_row(row, active_budget.threshold_set))
         .collect();
 
     let failed_or_timed_out_runs = rows
@@ -727,7 +804,7 @@ pub async fn summarize_agent_runs(
                     .as_ref()
                     .is_some_and(|reason| reason.to_ascii_lowercase().contains("timed out"))
         })
-        .map(run_from_row)
+        .map(|row| run_from_row(row, active_budget.threshold_set))
         .collect();
 
     let mut completed_runs_with_duration: Vec<_> = rows
@@ -735,7 +812,7 @@ pub async fn summarize_agent_runs(
         .filter(|row| row.outcome.as_deref() == Some("completed"))
         .filter_map(|row| {
             row.duration_seconds
-                .map(|duration| (duration, run_from_row(row)))
+                .map(|duration| (duration, run_from_row(row, active_budget.threshold_set)))
         })
         .collect();
     completed_runs_with_duration.sort_by(|(left, left_run), (right, right_run)| {
@@ -755,12 +832,13 @@ pub async fn summarize_agent_runs(
         .map(|(_, run)| run)
         .collect();
 
-    let efficiency = build_efficiency_summary(&rows);
+    let efficiency = build_efficiency_summary(&rows, active_budget.threshold_set);
     let integration_outcome_reason_counts = integration_reason_counts(pool, &options.queue).await?;
 
     Ok(TelemetrySummary {
         queue: options.queue.clone(),
         total_runs: rows.len(),
+        efficiency_budget: active_budget.summary,
         duplicate_tasks,
         post_integrating_runs,
         failed_or_timed_out_runs,
@@ -796,7 +874,7 @@ async fn integration_reason_counts(
     Ok(rows.into_iter().collect())
 }
 
-fn run_from_row(row: &TelemetryRunRow) -> TelemetryRun {
+fn run_from_row(row: &TelemetryRunRow, thresholds: EfficiencyBudgetThresholdSet) -> TelemetryRun {
     TelemetryRun {
         task_identifier: row.task_identifier.clone(),
         task_title: row.task_title.clone(),
@@ -824,25 +902,243 @@ fn run_from_row(row: &TelemetryRunRow) -> TelemetryRun {
         max_context_tokens: row.max_context_tokens,
         transcript_byte_size: row.transcript_byte_size,
         efficiency_hints_json: row.efficiency_hints_json.clone(),
-        budget_status: budget_status_for_row(row),
+        budget_status: budget_status_for_row(row, thresholds),
     }
 }
 
-fn budget_status_for_row(row: &TelemetryRunRow) -> EfficiencyBudgetStatus {
-    evaluate_efficiency_budget(EfficiencyBudgetInput {
-        tool_call_count: row.tool_call_count,
-        total_tokens: row.total_tokens,
-        max_context_tokens: row.max_context_tokens,
-        transcript_byte_size: row.transcript_byte_size,
-        repeated_read_count: row.repeated_read_count,
-        repeated_tasker_context_fetch_count: row.repeated_tasker_context_fetch_count,
-        duration_seconds: row.duration_seconds,
-        has_proxy_metrics: row.tool_call_count.is_some()
-            || row.transcript_byte_size.is_some()
-            || row.duration_seconds.is_some()
-            || row.assistant_turn_count.is_some()
-            || row.user_turn_count.is_some(),
-    })
+fn budget_status_for_row(
+    row: &TelemetryRunRow,
+    thresholds: EfficiencyBudgetThresholdSet,
+) -> EfficiencyBudgetStatus {
+    evaluate_efficiency_budget_with_thresholds(
+        EfficiencyBudgetInput {
+            tool_call_count: row.tool_call_count,
+            total_tokens: row.total_tokens,
+            max_context_tokens: row.max_context_tokens,
+            transcript_byte_size: row.transcript_byte_size,
+            repeated_read_count: row.repeated_read_count,
+            repeated_tasker_context_fetch_count: row.repeated_tasker_context_fetch_count,
+            duration_seconds: row.duration_seconds,
+            has_proxy_metrics: row.tool_call_count.is_some()
+                || row.transcript_byte_size.is_some()
+                || row.duration_seconds.is_some()
+                || row.assistant_turn_count.is_some()
+                || row.user_turn_count.is_some(),
+        },
+        thresholds,
+    )
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedEfficiencyBudget {
+    summary: ActiveEfficiencyBudget,
+    threshold_set: EfficiencyBudgetThresholdSet,
+}
+
+fn active_efficiency_budget(
+    rows: &[TelemetryRunRow],
+    options: &EfficiencyBudgetOptions,
+) -> ResolvedEfficiencyBudget {
+    let fixed = fixed_budget_thresholds();
+    let window_size = options.window_size.max(1);
+    let min_metric_coverage = options.min_metric_coverage.max(1);
+
+    if options.mode == EfficiencyBudgetMode::Fixed {
+        return ResolvedEfficiencyBudget {
+            summary: budget_summary(
+                EfficiencyBudgetMode::Fixed,
+                "fixed_defaults".to_string(),
+                window_size,
+                min_metric_coverage,
+                fixed,
+                &[],
+                Vec::new(),
+            ),
+            threshold_set: fixed,
+        };
+    }
+
+    let mut recent: Vec<&TelemetryRunRow> = rows
+        .iter()
+        .filter(|row| row_has_any_budget_metric(row))
+        .collect();
+    recent.sort_by(|left, right| {
+        right
+            .created_epoch
+            .cmp(&left.created_epoch)
+            .then_with(|| right.agent_run_id.cmp(&left.agent_run_id))
+    });
+    recent.truncate(window_size);
+
+    let mut threshold_set = fixed;
+    let mut threshold_summaries = Vec::new();
+    let mut notes = Vec::new();
+
+    threshold_set.tool_calls = adaptive_threshold(
+        TOOL_CALL_BUDGET,
+        values_for(&recent, |row| row.tool_call_count),
+        min_metric_coverage,
+        &mut threshold_summaries,
+    );
+    threshold_set.total_tokens = adaptive_threshold(
+        TOTAL_TOKEN_BUDGET,
+        values_for(&recent, |row| row.total_tokens),
+        min_metric_coverage,
+        &mut threshold_summaries,
+    );
+    threshold_set.max_context_tokens = adaptive_threshold(
+        MAX_CONTEXT_BUDGET,
+        values_for(&recent, |row| row.max_context_tokens),
+        min_metric_coverage,
+        &mut threshold_summaries,
+    );
+    threshold_set.transcript_bytes = adaptive_threshold(
+        TRANSCRIPT_BYTE_BUDGET,
+        values_for(&recent, |row| row.transcript_byte_size),
+        min_metric_coverage,
+        &mut threshold_summaries,
+    );
+    threshold_set.repeated_reads = adaptive_threshold(
+        REPEATED_READ_BUDGET,
+        values_for(&recent, |row| row.repeated_read_count),
+        min_metric_coverage,
+        &mut threshold_summaries,
+    );
+    threshold_set.repeated_tasker_context_fetches = adaptive_threshold(
+        REPEATED_TASKER_CONTEXT_BUDGET,
+        values_for(&recent, |row| row.repeated_tasker_context_fetch_count),
+        min_metric_coverage,
+        &mut threshold_summaries,
+    );
+    threshold_set.duration_seconds = adaptive_threshold(
+        RUN_DURATION_BUDGET,
+        values_for(&recent, |row| row.duration_seconds),
+        min_metric_coverage,
+        &mut threshold_summaries,
+    );
+
+    if recent.len() < min_metric_coverage {
+        notes.push(format!(
+            "adaptive baseline considered {} recent run(s), below min coverage {}; metrics without enough samples fall back to fixed defaults",
+            recent.len(), min_metric_coverage
+        ));
+    } else if threshold_summaries
+        .iter()
+        .any(|threshold| threshold.source == "fixed_defaults")
+    {
+        notes.push(
+            "some metrics had sparse or missing coverage and fell back to fixed defaults"
+                .to_string(),
+        );
+    }
+
+    ResolvedEfficiencyBudget {
+        summary: ActiveEfficiencyBudget {
+            mode: EfficiencyBudgetMode::Adaptive,
+            source: "adaptive_recent_local_agent_runs".to_string(),
+            window_size,
+            min_metric_coverage,
+            thresholds: threshold_summaries,
+            notes,
+        },
+        threshold_set,
+    }
+}
+
+fn row_has_any_budget_metric(row: &TelemetryRunRow) -> bool {
+    row.tool_call_count.is_some()
+        || row.total_tokens.is_some()
+        || row.max_context_tokens.is_some()
+        || row.transcript_byte_size.is_some()
+        || row.repeated_read_count.is_some()
+        || row.repeated_tasker_context_fetch_count.is_some()
+        || row.duration_seconds.is_some()
+}
+
+fn values_for(
+    rows: &[&TelemetryRunRow],
+    value: impl Fn(&TelemetryRunRow) -> Option<i64>,
+) -> Vec<i64> {
+    rows.iter().filter_map(|row| value(row)).collect()
+}
+
+fn adaptive_threshold(
+    fixed: EfficiencyBudgetThreshold,
+    mut values: Vec<i64>,
+    min_metric_coverage: usize,
+    summaries: &mut Vec<EfficiencyBudgetThresholdSummary>,
+) -> EfficiencyBudgetThreshold {
+    if values.len() < min_metric_coverage {
+        summaries.push(EfficiencyBudgetThresholdSummary {
+            metric: fixed.metric.to_string(),
+            source: "fixed_defaults".to_string(),
+            warning: fixed.warning,
+            severe: fixed.severe,
+            sample_size: values.len(),
+        });
+        return fixed;
+    }
+
+    values.sort_unstable();
+    let warning = scaled_percentile(&values, 90, 125).max(1);
+    let severe = scaled_percentile(&values, 95, 150).max(warning + 1);
+    summaries.push(EfficiencyBudgetThresholdSummary {
+        metric: fixed.metric.to_string(),
+        source: "adaptive_recent_local_agent_runs".to_string(),
+        warning,
+        severe,
+        sample_size: values.len(),
+    });
+    EfficiencyBudgetThreshold {
+        metric: fixed.metric,
+        warning,
+        severe,
+    }
+}
+
+fn scaled_percentile(values: &[i64], percentile: usize, scale_percent: i64) -> i64 {
+    let index = ((values.len() * percentile).saturating_add(99) / 100)
+        .saturating_sub(1)
+        .min(values.len().saturating_sub(1));
+    (values[index].saturating_mul(scale_percent) + 99) / 100
+}
+
+fn budget_summary(
+    mode: EfficiencyBudgetMode,
+    source: String,
+    window_size: usize,
+    min_metric_coverage: usize,
+    thresholds: EfficiencyBudgetThresholdSet,
+    sample_sizes: &[usize],
+    notes: Vec<String>,
+) -> ActiveEfficiencyBudget {
+    let threshold_values = [
+        thresholds.tool_calls,
+        thresholds.total_tokens,
+        thresholds.max_context_tokens,
+        thresholds.transcript_bytes,
+        thresholds.repeated_reads,
+        thresholds.repeated_tasker_context_fetches,
+        thresholds.duration_seconds,
+    ];
+    ActiveEfficiencyBudget {
+        mode,
+        source: source.clone(),
+        window_size,
+        min_metric_coverage,
+        thresholds: threshold_values
+            .into_iter()
+            .enumerate()
+            .map(|(index, threshold)| EfficiencyBudgetThresholdSummary {
+                metric: threshold.metric.to_string(),
+                source: source.clone(),
+                warning: threshold.warning,
+                severe: threshold.severe,
+                sample_size: sample_sizes.get(index).copied().unwrap_or(0),
+            })
+            .collect(),
+        notes,
+    }
 }
 
 fn json_counts(json: Option<&str>) -> BTreeMap<String, i64> {
@@ -929,7 +1225,10 @@ fn top_counts(counts: &BTreeMap<String, i64>, limit: usize) -> Vec<CountSummary>
     entries
 }
 
-fn build_efficiency_summary(rows: &[TelemetryRunRow]) -> EfficiencyTelemetrySummary {
+fn build_efficiency_summary(
+    rows: &[TelemetryRunRow],
+    thresholds: EfficiencyBudgetThresholdSet,
+) -> EfficiencyTelemetrySummary {
     let mut summary = EfficiencyTelemetrySummary {
         runs_with_metrics: 0,
         total_tool_calls: 0,
@@ -1010,7 +1309,7 @@ fn build_efficiency_summary(rows: &[TelemetryRunRow]) -> EfficiencyTelemetrySumm
             .as_deref()
             .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
             .unwrap_or_default();
-        let budget_status = budget_status_for_row(row);
+        let budget_status = budget_status_for_row(row, thresholds);
         if !hints.is_empty()
             || !budget_status.warnings.is_empty()
             || row.tool_call_count.unwrap_or(0) >= 30
@@ -1018,7 +1317,7 @@ fn build_efficiency_summary(rows: &[TelemetryRunRow]) -> EfficiencyTelemetrySumm
             || row.repeated_read_count.unwrap_or(0) > 0
             || row.repeated_tasker_context_fetch_count.unwrap_or(0) > 0
         {
-            summary.inefficient_runs.push(run_from_row(row));
+            summary.inefficient_runs.push(run_from_row(row, thresholds));
         }
     }
     summary.top_shell_command_categories = top_counts(&summary.shell_command_counts, 10);
@@ -1037,6 +1336,34 @@ pub fn render_summary(summary: &TelemetrySummary) -> String {
     writeln!(output, "Agent Run telemetry summary").expect("write string");
     writeln!(output, "Task Queue: {}", summary.queue).expect("write string");
     writeln!(output, "total Agent Runs: {}", summary.total_runs).expect("write string");
+    writeln!(
+        output,
+        "efficiency budget: source={} mode={} window_size={} min_metric_coverage={}",
+        summary.efficiency_budget.source,
+        match summary.efficiency_budget.mode {
+            EfficiencyBudgetMode::Fixed => "fixed",
+            EfficiencyBudgetMode::Adaptive => "adaptive",
+        },
+        summary.efficiency_budget.window_size,
+        summary.efficiency_budget.min_metric_coverage
+    )
+    .expect("write string");
+    writeln!(output, "efficiency budget thresholds:").expect("write string");
+    for threshold in &summary.efficiency_budget.thresholds {
+        writeln!(
+            output,
+            "  {}: warning={} severe={} source={} sample_size={}",
+            threshold.metric,
+            threshold.warning,
+            threshold.severe,
+            threshold.source,
+            threshold.sample_size
+        )
+        .expect("write string");
+    }
+    for note in &summary.efficiency_budget.notes {
+        writeln!(output, "  note: {note}").expect("write string");
+    }
     writeln!(
         output,
         "duplicate Agent Run waste: {} wasted run(s) across {} Task(s)",
@@ -2411,7 +2738,9 @@ fn recent_efficiency_offender(run: &TelemetryRunRow) -> RecentEfficiencyOffender
         max_context_tokens: run.max_context_tokens,
         transcript_byte_size: run.transcript_byte_size,
         duration_seconds: run.duration_seconds,
-        budget_warning_count: budget_status_for_row(run).warnings.len(),
+        budget_warning_count: budget_status_for_row(run, fixed_budget_thresholds())
+            .warnings
+            .len(),
     }
 }
 
@@ -2900,6 +3229,7 @@ mod tests {
             &TelemetryOptions {
                 queue: "TASK".to_string(),
                 slow_limit: 5,
+                budget: EfficiencyBudgetOptions::default(),
             },
         )
         .await
@@ -3032,6 +3362,100 @@ mod tests {
             .iter()
             .any(|unknown| unknown.metric == "total_tokens"
                 && unknown.token_metric_kind.as_deref() == Some("unknown")));
+    }
+
+    #[tokio::test]
+    async fn adaptive_efficiency_budget_uses_recent_numeric_metrics_and_falls_back_when_sparse() {
+        let pool = memory_pool().await;
+        seed_queue_and_task(&pool, "TASK", "Adaptive budgets")
+            .await
+            .expect("seed");
+        let (task_id, queue_id) = ids(&pool, "TASK-1").await;
+
+        for index in 1..=5 {
+            let run_id = format!("run-{index}");
+            insert_run(
+                &pool,
+                &task_id,
+                &queue_id,
+                &run_id,
+                &format!("2026-01-01 00:{index:02}:00"),
+                &format!("2026-01-01 00:{:02}:30", index),
+                Some("completed"),
+                None,
+            )
+            .await;
+            let total_tokens = (index <= 2).then_some(index as i64 * 1_000);
+            sqlx::query(
+                r#"
+                INSERT INTO agent_run_metrics (
+                    agent_run_id, launcher_kind, final_status, transcript_byte_size,
+                    total_tokens, tool_call_count, repeated_read_count,
+                    repeated_tasker_context_fetch_count, max_context_tokens,
+                    efficiency_hints_json, warnings_json
+                ) VALUES (?, 'pi', 'completed', ?, ?, ?, ?, ?, ?, '[]', '[]')
+                "#,
+            )
+            .bind(&run_id)
+            .bind(index as i64 * 100)
+            .bind(total_tokens)
+            .bind(index as i64 * 10)
+            .bind(index as i64)
+            .bind(index as i64 - 1)
+            .bind(index as i64 * 2_000)
+            .execute(&pool)
+            .await
+            .expect("metrics");
+        }
+
+        let summary = summarize_agent_runs(
+            &pool,
+            &TelemetryOptions {
+                queue: "TASK".to_string(),
+                slow_limit: 5,
+                budget: EfficiencyBudgetOptions {
+                    mode: EfficiencyBudgetMode::Adaptive,
+                    window_size: 5,
+                    min_metric_coverage: 3,
+                },
+            },
+        )
+        .await
+        .expect("summary");
+
+        assert_eq!(
+            summary.efficiency_budget.mode,
+            EfficiencyBudgetMode::Adaptive
+        );
+        assert_eq!(
+            summary.efficiency_budget.source,
+            "adaptive_recent_local_agent_runs"
+        );
+        let tool_calls = threshold(&summary, "tool_calls");
+        assert_eq!(tool_calls.source, "adaptive_recent_local_agent_runs");
+        assert_eq!(tool_calls.sample_size, 5);
+        assert_eq!(tool_calls.warning, 63);
+        assert_eq!(tool_calls.severe, 75);
+
+        let total_tokens = threshold(&summary, "total_tokens");
+        assert_eq!(total_tokens.source, "fixed_defaults");
+        assert_eq!(total_tokens.sample_size, 2);
+        assert_eq!(total_tokens.warning, TOTAL_TOKEN_BUDGET.warning);
+        assert!(summary
+            .efficiency_budget
+            .notes
+            .iter()
+            .any(|note| note.contains("fell back to fixed defaults")));
+
+        let rendered = render_summary(&summary);
+        assert!(rendered.contains("efficiency budget: source=adaptive_recent_local_agent_runs"));
+        assert!(rendered.contains("window_size=5"));
+        assert!(rendered.contains(
+            "tool_calls: warning=63 severe=75 source=adaptive_recent_local_agent_runs sample_size=5"
+        ));
+        assert!(rendered.contains(
+            "total_tokens: warning=80000 severe=100000 source=fixed_defaults sample_size=2"
+        ));
     }
 
     #[tokio::test]
@@ -3749,6 +4173,7 @@ mod tests {
             &TelemetryOptions {
                 queue: "TASK".to_string(),
                 slow_limit: 5,
+                budget: EfficiencyBudgetOptions::default(),
             },
         )
         .await
@@ -3814,6 +4239,18 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("ids")
+    }
+
+    fn threshold<'a>(
+        summary: &'a TelemetrySummary,
+        metric: &str,
+    ) -> &'a EfficiencyBudgetThresholdSummary {
+        summary
+            .efficiency_budget
+            .thresholds
+            .iter()
+            .find(|threshold| threshold.metric == metric)
+            .expect("threshold")
     }
 
     #[allow(clippy::too_many_arguments)]
