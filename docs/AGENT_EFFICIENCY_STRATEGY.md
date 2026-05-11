@@ -37,7 +37,7 @@ The unattended prompt correctly says Worker Agents should use Tasker Pi Extensio
 - Agents use ad hoc SQLite or transcript parsing when answering cross-run questions because there is no first-class Tasker tool for recent Agent Run summaries, Workpad Note search, repeated failure patterns, or transcript-derived tool counts.
 - Final requirement updates still often rely on CLI-compatible behavior in dogfood sessions when extension tool availability is unclear.
 
-The CLI is valuable for Operators, but repeated shell inspection is inefficient for Worker Agents and weakens the product direction that the Tasker Pi Extension should expose narrow Tasker workflow tools.
+The CLI is valuable for Operators, but repeated shell inspection is inefficient for Worker Agents and weakens the product direction that the Tasker Pi Extension should expose narrow Tasker workflow tools. The first mitigation is now the read-only `tasker_get_task_context_bundle` extension tool and matching Tasker API endpoint, which give Worker Agents one run-start source for Task context, advisory file/path hints, local workflow metadata, recent Agent Runs, and latest failure/integration summaries without raw Run Transcript bodies or launcher payloads.
 
 ### 3. Operational blockers have been a larger waste source than unclear code tasks
 
@@ -77,10 +77,10 @@ The gap is expected for a young local-first system, but it means future efficien
 
 | Priority | Area | Recommendation | Expected impact | Complexity | Evidence |
 |---|---|---|---|---|---|
-| P0 | Tools/extensions | Add a Tasker Pi Extension `get_task_context` style tool that returns Task brief, Acceptance Criteria, Validation Items, Workpad Note, Task Links, active/recent Agent Runs, current Local Worktree/Task Branch, and safe data-directory context in one response. | Fewer `task show`, `queue show`, `status`, and path-safety shell calls at run start. | Medium | Repeated `bin/tasker-local task show` and preflight shell calls across sampled transcripts. |
+| Done | Tools/extensions | Added the Tasker Pi Extension `tasker_get_task_context_bundle` tool and `/tasks/{identifier}/context-bundle` Tasker API endpoint. The bundle returns Task brief, Acceptance Criteria, Validation Items, Workpad Note, Task Links, advisory Task Conflict Hints / likely files-paths, queue and local workflow context, recent Agent Runs, and latest failure/integration summaries. | Fewer `task show`, `queue show`, `status`, and path-safety shell calls at run start. | Shipped | Repeated `bin/tasker-local task show` and preflight shell calls across sampled transcripts. |
 | P0 | Observability/telemetry | Extend normalized Agent Run metrics to count tool calls by tool name, tool errors, repeated reads of the same path, transcript byte size, blocking UI events, and shell-command categories. | Makes future diagnosis queryable without parsing huge transcripts. | Medium | TASKER-65 has 52 MB transcript and 45 tool calls; older runs require transcript parsing. |
 | P0 | Workflow safety | Keep improving pre-claim local-state guards: surface dirty Managed Source Repository and operation-lock status before claims consume Agent Runs. | Reduces zero-second failed runs and duplicate retries. | Low/Medium | Dirty repo setup failures in TASKER-52, TASKER-57, TASKER-63, TASKER-64. |
-| P1 | Prompts/context | Update the Worker Agent Role Prompt to require a short context plan: list relevant files/ADRs once, avoid rereading unchanged files, prefer `rg` narrowing before broad reads, and summarize local evidence in the Workpad Note. | Reduces repeated reads while preserving safety. | Low | Repeated reads in TASKER-58, TASKER-62, TASKER-65, TASKER-60, TASKER-33. |
+| Done | Prompts/context | Updated the Worker Agent Role Prompt to require the context bundle first, maintain a short context plan that preserves canonical `CONTEXT.md`, `ROADMAP.md`, and relevant ADR/doc reads, avoid rereading unchanged files, prefer `rg`/`find` narrowing and narrow read ranges, use safe CLI fallback only when extension tools are unavailable, and summarize efficiency-budget overruns in the Workpad Note handoff. | Reduces repeated reads while preserving safety. | Shipped | Repeated reads in TASKER-58, TASKER-62, TASKER-65, TASKER-60, TASKER-33. |
 | P1 | Task sizing/briefs | Add a bootstrap/delegation convention for `likely files`, `relevant ADRs`, and `expected validation commands` in the Task Brief or structured Task Conflict Hints. | Helps agents start narrow and choose checks earlier. | Low | Agents repeatedly infer file maps with broad `find`/`rg`; Task Conflict Hints are currently often empty. |
 | P1 | Tools/extensions | Add Tasker Pi Extension tools for requirement status updates, Workpad updates, Task Link creation, and transition requests that include current Agent Run attribution and validation base commit handling. | Reduces broad CLI mutation usage and enforces Worker Agent boundaries. | Medium | Worker prompt mandates extension tools; dogfood often falls back to CLI-compatible workflows. |
 | P1 | Observability/status | Add `tasker run summary --queue TASKER --recent N` or equivalent API/tool output showing recent failures, duplicate runs, blocking UI, and per-task run history. | Faster diagnosis before spawning more work. | Low/Medium | Telemetry summary is helpful but cross-run details require multiple commands or SQL. |
@@ -91,27 +91,23 @@ The gap is expected for a young local-first system, but it means future efficien
 
 ## Suggested follow-up Task candidates
 
-1. **Add Tasker Pi Extension task-context bundle**
-   - Acceptance idea: Worker Agent can fetch Task brief, structured requirements, Workpad Note, Task Links, Local Worktree metadata, recent Agent Runs, and active data/config context in one extension call.
-   - Validation idea: contract test against a test Tasker Service verifies no broad CLI calls are required for initial task context.
-
-2. **Persist per-tool efficiency metrics from Run Transcripts**
+1. **Persist per-tool efficiency metrics from Run Transcripts**
    - Acceptance idea: `agent_run_metrics` stores tool-call counts by tool name, repeated read count, tool error count, blocking UI count, and transcript byte size/event count.
    - Validation idea: fake pi transcript fixture produces deterministic metric rows and telemetry summary output.
 
-3. **Add recent Agent Run diagnostic summary**
+2. **Add recent Agent Run diagnostic summary**
    - Acceptance idea: CLI/API summarizes recent Agent Runs by Task with outcome, failure reason, duration, duplicate/waste classification, blocking UI, and transcript path.
    - Validation idea: temp SQLite test covers completed, failed, expired, and recovered failure sequences.
 
-4. **Document and prompt a Workpad Note handoff template**
+3. **Document and prompt a Workpad Note handoff template**
    - Acceptance idea: Worker Agent Role Prompt and docs define a concise Workpad Note shape for plan, changes, validation, risks, follow-ups, and base commit.
    - Validation idea: documentation-only check confirms terms match `CONTEXT.md` and no Workpad Markdown is described as authoritative gate state.
 
-5. **Populate Task Conflict Hints during bootstrap/delegation**
+4. **Populate Task Conflict Hints during bootstrap/delegation**
    - Acceptance idea: bootstrap Task files can include likely paths/areas and `task show` surfaces them prominently for Worker Agents.
    - Validation idea: bootstrap parsing test and task-show snapshot verify hints remain advisory and do not block scheduling.
 
-6. **Pre-claim Managed Source Repository cleanliness check in supervisor output**
+5. **Pre-claim Managed Source Repository cleanliness check in supervisor output**
    - Acceptance idea: supervisor reports dirty repo / operation lock before claiming when possible, avoiding zero-duration failed Agent Runs.
    - Validation idea: temp Git repository test covers clean, dirty, and stale-lock conditions.
 
@@ -146,7 +142,7 @@ Operators can keep those fixed defaults or opt `tasker telemetry summary` into a
 
 - Prefer small implementation Tasks with explicit relevant ADRs, likely files, and validation commands.
 - Treat Workpad Notes as handoff summaries, not authoritative requirement state; keep structured Acceptance Criteria and Validation Items current.
-- Continue using `tasker telemetry summary`, `tasker telemetry lifecycle`, `tasker telemetry trend --queue TASKER --landing-task <TASK>`, `tasker run show`, and `.tasker/data/runs/<id>/pi.jsonl` as local evidence sources until extension/API equivalents exist. Use `telemetry trend` to compare bounded before/after Agent Run windows around dogfood landing Tasks or timestamps without exposing raw transcripts, prompts, command output, or secrets.
+- At Worker Agent run start, prefer `tasker_get_task_context_bundle` over repeated `task show`, `queue show`, status, or Agent Run lookups. Continue using `tasker telemetry summary`, `tasker telemetry lifecycle`, `tasker telemetry trend --queue TASKER --landing-task <TASK>`, `tasker run show`, and `.tasker/data/runs/<id>/pi.jsonl` as local Operator/debug evidence sources until narrower extension/API equivalents exist. Use `telemetry trend` to compare bounded before/after Agent Run windows around dogfood landing Tasks or timestamps without exposing raw transcripts, prompts, command output, or secrets.
 - Prioritize reducing duplicate Agent Runs and local-state setup failures before optimizing model-level behavior; the current evidence shows workflow waste is more measurable than token/context waste.
 - Keep all telemetry local by default and derive Workflow Metrics from Audit Events, Agent Runs, Launcher Session Data, and Integration Outcomes.
 
