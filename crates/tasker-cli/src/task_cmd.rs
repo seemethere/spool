@@ -6,6 +6,15 @@ pub(crate) async fn task(
     db_path_overridden: bool,
     command: TaskCommand,
 ) -> Result<()> {
+    if let TaskCommand::Lint { file } = &command {
+        let input = bootstrap::lint_bootstrap_task_file(file)?;
+        println!("valid bootstrap task file");
+        println!("title: {}", input.title);
+        println!("priority: {}", input.priority);
+        println!("state: {}", input.state);
+        return Ok(());
+    }
+
     let pool = open_pool(paths, db_path_overridden).await?;
 
     match command {
@@ -25,6 +34,7 @@ pub(crate) async fn task(
             println!("title: {}", detail.task.title);
             println!("state: {}", detail.task.state);
         }
+        TaskCommand::Lint { .. } => unreachable!("lint returns before opening the Task Backend"),
         TaskCommand::Show { identifier } => {
             let detail = tasker_db::get_task_detail(&pool, &identifier)
                 .await?

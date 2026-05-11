@@ -2177,6 +2177,112 @@ fn bootstrap_parser_defaults_to_ready_normal() {
     assert_eq!(parsed.brief, "Brief");
 }
 
+#[tokio::test]
+async fn bootstrap_lint_succeeds_for_valid_task_file_without_database() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = TaskerPaths::resolve(temp.path().join("missing-config"), PathOverrides::default());
+    let task_file = temp.path().join("task.md");
+    fs::write(
+        &task_file,
+        "---\ntitle: Test lint\npriority: high\nstate: backlog\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\n---\nBrief\n",
+    )
+    .expect("write task file");
+
+    task(
+        &paths,
+        false,
+        TaskCommand::Lint {
+            file: task_file.clone(),
+        },
+    )
+    .await
+    .expect("lint valid task file");
+
+    let parsed = bootstrap::lint_bootstrap_task_file(&task_file).expect("parse lint output source");
+    assert_eq!(parsed.title, "Test lint");
+    assert_eq!(parsed.priority, "high");
+    assert_eq!(parsed.state, "backlog");
+}
+
+#[test]
+fn bootstrap_lint_fails_for_invalid_priority_and_missing_required_fields() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let invalid_priority = temp.path().join("invalid-priority.md");
+    fs::write(
+        &invalid_priority,
+        "---\ntitle: Test\npriority: maybe\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\n---\nBrief\n",
+    )
+    .expect("write invalid priority file");
+    let error =
+        bootstrap::lint_bootstrap_task_file(&invalid_priority).expect_err("invalid priority fails");
+    let message = error.to_string();
+    assert!(message.contains("invalid priority \"maybe\""));
+    assert!(message.contains("expected one of: urgent, high, normal, low"));
+
+    let missing_required = temp.path().join("missing-required.md");
+    fs::write(
+        &missing_required,
+        "---\npriority: normal\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\n---\nBrief\n",
+    )
+    .expect("write missing required file");
+    let error =
+        bootstrap::lint_bootstrap_task_file(&missing_required).expect_err("missing title fails");
+    assert!(error
+        .to_string()
+        .contains("failed to parse YAML front matter"));
+    assert!(error.to_string().contains("missing field `title`"));
+}
+
+#[tokio::test]
+async fn bootstrap_lint_does_not_create_task_or_audit_events() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = TaskerPaths::resolve(temp.path(), PathOverrides::default());
+    init(&paths, false).await.expect("init");
+    let repo = temp.path().join("repo");
+    init_git_repo(&repo);
+    queue(
+        &paths,
+        false,
+        QueueCommand::Create {
+            key: "TASK".to_string(),
+            name: "Tasker".to_string(),
+            managed_source_repository: repo,
+            main_branch: "main".to_string(),
+            worktree_root: temp.path().join("worktrees"),
+            branch_template: "tasker/{task_identifier}".to_string(),
+            done_worktree_retention: false,
+            queue_concurrency_limit: None,
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect("create queue");
+    let task_file = temp.path().join("task.md");
+    fs::write(
+        &task_file,
+        "---\ntitle: Test lint\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\n---\nBrief\n",
+    )
+    .expect("write task file");
+
+    task(&paths, false, TaskCommand::Lint { file: task_file })
+        .await
+        .expect("lint task file");
+
+    let pool = open_pool(&paths, false).await.expect("open pool");
+    let task_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks")
+        .fetch_one(&pool)
+        .await
+        .expect("count tasks");
+    let task_audit_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE subject_type = 'task'")
+            .fetch_one(&pool)
+            .await
+            .expect("count task audit events");
+
+    assert_eq!(task_count, 0);
+    assert_eq!(task_audit_count, 0);
+}
+
 #[test]
 fn bootstrap_parser_requires_front_matter() {
     let error = bootstrap::parse_bootstrap_task("TASK", "inline", "title: Missing delimiters")

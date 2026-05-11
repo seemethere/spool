@@ -306,6 +306,12 @@ enum TaskCommand {
         #[arg(long, default_value = "local-operator")]
         actor: String,
     },
+    /// Validate a Bootstrap Task Creation file without creating a Task.
+    Lint {
+        /// Markdown file containing YAML front matter and the Task Brief body.
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Show a Task by Task Identifier.
     Show { identifier: String },
     /// Retry recovery: move a resolved failed, canceled, or stuck Task back to Ready.
@@ -876,7 +882,7 @@ fn command_is_unsafe_mutation(command: &Option<Command>) -> bool {
         ),
         Some(Command::Task { command }) => !matches!(
             command,
-            TaskCommand::Show { .. } | TaskCommand::Audit { .. }
+            TaskCommand::Lint { .. } | TaskCommand::Show { .. } | TaskCommand::Audit { .. }
         ),
         Some(Command::Run { command }) => matches!(command, RunCommand::Fail { .. }),
         Some(Command::Cleanup { command }) => cleanup_command_is_unsafe_mutation(command),
@@ -946,7 +952,7 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
                 requirement_command_queue_key(command)
             }
             TaskCommand::Workpad { command } => workpad_command_queue_key(command),
-            TaskCommand::Show { .. } => None,
+            TaskCommand::Lint { .. } | TaskCommand::Show { .. } => None,
         },
         Some(
             Command::Work { queue, .. }

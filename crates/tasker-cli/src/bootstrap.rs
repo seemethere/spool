@@ -24,6 +24,12 @@ pub fn parse_bootstrap_task_file(queue_key: &str, file: &Path) -> Result<tasker_
     parse_bootstrap_task(queue_key, &file.display().to_string(), &text)
 }
 
+pub fn lint_bootstrap_task_file(file: &Path) -> Result<tasker_db::CreateTask> {
+    let input = parse_bootstrap_task_file("__lint__", file)?;
+    tasker_db::validate_create_task(&input)?;
+    Ok(input)
+}
+
 pub fn parse_bootstrap_task(
     queue_key: &str,
     source_name: &str,
@@ -31,8 +37,10 @@ pub fn parse_bootstrap_task(
 ) -> Result<tasker_db::CreateTask> {
     let (front_matter, brief) = split_front_matter(text)?;
     let front_matter_text = front_matter;
-    let front_matter: BootstrapFrontMatter = serde_yaml::from_str(front_matter_text)
-        .with_context(|| format!("failed to parse YAML front matter in {source_name}"))?;
+    let front_matter: BootstrapFrontMatter =
+        serde_yaml::from_str(front_matter_text).map_err(|error| {
+            anyhow::anyhow!("failed to parse YAML front matter in {source_name}: {error}")
+        })?;
 
     let priority = validate_enum_front_matter_field(
         source_name,
@@ -236,5 +244,22 @@ mod tests {
             .expect_err("missing front matter fails");
 
         assert!(error.to_string().contains("must start"));
+    }
+
+    #[test]
+    fn lint_uses_create_task_validation_rules() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let task_file = temp.path().join("task.md");
+        fs::write(
+            &task_file,
+            "---\ntitle: Test\npriority: maybe\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\n---\nBrief\n",
+        )
+        .expect("write task file");
+
+        let error = lint_bootstrap_task_file(&task_file).expect_err("invalid priority fails");
+
+        let message = error.to_string();
+        assert!(message.contains("invalid priority \"maybe\""));
+        assert!(message.contains("expected one of: urgent, high, normal, low"));
     }
 }
