@@ -398,6 +398,12 @@ pub struct TransitionTaskState {
     pub repair_override: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecordReviewDecision {
+    pub decision: String,
+    pub feedback: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
 pub struct AgentRun {
     pub id: String,

@@ -340,6 +340,26 @@ enum TaskCommand {
         #[arg(long)]
         repair_override: bool,
     },
+    /// Record a human Review Decision for a Task in Human Review.
+    ReviewDecision {
+        /// Task Identifier.
+        identifier: String,
+        /// Review Decision: approve or rework.
+        #[arg(long)]
+        decision: String,
+        /// Human feedback text, required for rework decisions unless --feedback-file is used.
+        #[arg(long, conflicts_with = "feedback_file")]
+        feedback: Option<String>,
+        /// File containing human feedback, required for rework decisions unless --feedback is used.
+        #[arg(long)]
+        feedback_file: Option<PathBuf>,
+        /// Actor kind for audit attribution and permission checks.
+        #[arg(long, default_value = "review_agent")]
+        actor_kind: String,
+        /// Actor display name for audit attribution.
+        #[arg(long, default_value = "local-review-agent")]
+        actor: String,
+    },
     /// Update Acceptance Criterion status for a Task.
     Criterion {
         #[command(subcommand)]
@@ -981,6 +1001,7 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
             TaskCommand::Create { queue, .. } => Some(queue.clone()),
             TaskCommand::Retry { identifier, .. }
             | TaskCommand::Transition { identifier, .. }
+            | TaskCommand::ReviewDecision { identifier, .. }
             | TaskCommand::Audit { identifier } => queue_key_from_task_identifier(identifier),
             TaskCommand::Criterion { command } | TaskCommand::Validation { command } => {
                 requirement_command_queue_key(command)

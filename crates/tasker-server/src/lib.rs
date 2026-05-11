@@ -70,6 +70,13 @@ pub struct TransitionTaskRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RecordReviewDecisionRequest {
+    pub actor: tasker_db::Actor,
+    pub decision: String,
+    pub feedback: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ClaimNextRequest {
     pub actor: tasker_db::Actor,
     pub worker_id: String,
@@ -116,6 +123,10 @@ pub fn router(app_version: impl Into<String>, pool: SqlitePool) -> Router {
             axum::routing::put(update_workpad),
         )
         .route("/tasks/{identifier}/transition", post(transition_task))
+        .route(
+            "/tasks/{identifier}/review-decision",
+            post(record_review_decision),
+        )
         .route(
             "/tasks/{identifier}/acceptance-criteria/{position}/status",
             axum::routing::put(update_acceptance_criterion_status),
@@ -256,6 +267,27 @@ async fn transition_task(
             to_state: request.to_state,
             agent_run_id: request.agent_run_id,
             repair_override: request.repair_override,
+        },
+        &request.actor,
+    )
+    .await
+    .map(Json)
+    .map_err(task_mutation_error)
+}
+
+async fn record_review_decision(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+    Json(request): Json<RecordReviewDecisionRequest>,
+) -> Result<Json<tasker_db::TaskDetail>, (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    tasker_db::record_review_decision(
+        &state.pool,
+        &identifier,
+        &tasker_db::RecordReviewDecision {
+            decision: request.decision,
+            feedback: request.feedback,
         },
         &request.actor,
     )
@@ -570,6 +602,7 @@ fn task_mutation_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>
         || message.contains("Child Task creation requires")
         || message.contains("active Agent Run ID")
         || message.contains("active Claim Lease")
+        || message.contains("Review Decisions require")
     {
         error_response(StatusCode::FORBIDDEN, message)
     } else if message.contains("not found") {
@@ -581,6 +614,7 @@ fn task_mutation_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>
         || message.contains("only supports Backlog or Ready")
         || message.contains("invalid Agent Run outcome")
         || message.contains("State Transition")
+        || message.contains("Review Decision")
         || message.contains("already in requested")
         || message.contains("pass gates")
         || message.contains("Ready Tasks require")
@@ -896,6 +930,119 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn review_decision_endpoint_records_approve_decision() {
+        let (_temp, pool, token) = migrated_pool().await;
+        let app = router("test-version", pool);
+
+        assert_eq!(
+            app.clone()
+                .oneshot(create_queue_request("TASK", "Tasker", "operator", &token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(create_task_request(
+                    "TASK",
+                    "Review",
+                    "delegating_agent",
+                    &token
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(transition_request(
+                    "TASK-1",
+                    "in_progress",
+                    "operator",
+                    &token
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(update_requirement_request(
+                    "/tasks/TASK-1/acceptance-criteria/1/status",
+                    "satisfied",
+                    None,
+                    "operator",
+                    &token,
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(update_requirement_request(
+                    "/tasks/TASK-1/validation-items/1/status",
+                    "passed",
+                    None,
+                    "operator",
+                    &token,
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(transition_request(
+                    "TASK-1",
+                    "human_review",
+                    "operator",
+                    &token
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let response = app
+            .clone()
+            .oneshot(review_decision_request(
+                "TASK-1",
+                "approve",
+                None,
+                "review_agent",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["task"]["state"], "integrating");
+
+        let audit = app
+            .oneshot(authorized_get("/tasks/TASK-1/audit-events", &token))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(audit.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.as_array().unwrap().iter().any(|event| {
+            event["event_type"] == "task.review_decision_recorded"
+                && event["actor_kind"] == "review_agent"
+        }));
     }
 
     #[tokio::test]
@@ -1593,6 +1740,32 @@ mod tests {
         Request::builder()
             .method("POST")
             .uri(format!("/tasks/{identifier}/transition"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(request.to_string()))
+            .unwrap()
+    }
+
+    fn review_decision_request(
+        identifier: &str,
+        decision: &str,
+        feedback: Option<&str>,
+        actor_kind: &str,
+        token: &str,
+    ) -> Request<Body> {
+        let request = serde_json::json!({
+            "actor": {
+                "kind": actor_kind,
+                "id": "reviewer",
+                "display_name": "reviewer"
+            },
+            "decision": decision,
+            "feedback": feedback
+        });
+
+        Request::builder()
+            .method("POST")
+            .uri(format!("/tasks/{identifier}/review-decision"))
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {token}"))
             .body(Body::from(request.to_string()))

@@ -111,6 +111,43 @@ pub(crate) async fn task(
                 detail.task.identifier, detail.task.state
             );
         }
+        TaskCommand::ReviewDecision {
+            identifier,
+            decision,
+            feedback,
+            feedback_file,
+            actor_kind,
+            actor,
+        } => {
+            let feedback = match (feedback, feedback_file) {
+                (Some(feedback), None) => Some(feedback),
+                (None, Some(file)) => Some(
+                    fs::read_to_string(&file)
+                        .with_context(|| format!("failed to read {}", file.display()))?,
+                ),
+                (None, None) => None,
+                (Some(_), Some(_)) => unreachable!("clap enforces feedback conflict"),
+            };
+            let actor = tasker_db::Actor {
+                kind: actor_kind,
+                id: actor.clone(),
+                display_name: actor,
+            };
+            let detail = tasker_db::record_review_decision(
+                &pool,
+                &identifier,
+                &tasker_db::RecordReviewDecision {
+                    decision: bootstrap::normalize_label(&decision),
+                    feedback,
+                },
+                &actor,
+            )
+            .await?;
+            println!(
+                "recorded Review Decision for Task {}: {}",
+                detail.task.identifier, detail.task.state
+            );
+        }
         TaskCommand::Criterion { command } => match command {
             RequirementCommand::Set {
                 identifier,

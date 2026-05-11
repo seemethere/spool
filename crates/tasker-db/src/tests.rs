@@ -1170,6 +1170,164 @@ async fn transition_task_state_rejects_invalid_edges_and_worker_review_required_
 }
 
 #[tokio::test]
+async fn review_decision_approve_moves_human_review_task_to_integrating_with_audit() {
+    let (_temp, pool) = migrated_pool().await;
+    create_human_review_task(&pool, true).await;
+    let actor = Actor {
+        kind: "review_agent".to_string(),
+        id: "reviewer".to_string(),
+        display_name: "reviewer".to_string(),
+    };
+
+    let detail = record_review_decision(
+        &pool,
+        "TASK-1",
+        &RecordReviewDecision {
+            decision: "approve".to_string(),
+            feedback: None,
+        },
+        &actor,
+    )
+    .await
+    .expect("approve Review Decision");
+
+    assert_eq!(detail.task.state, "integrating");
+    let events = list_task_audit_events(&pool, "TASK-1")
+        .await
+        .expect("audit events");
+    let review_event = events
+        .iter()
+        .find(|event| event.event_type == "task.review_decision_recorded")
+        .expect("review decision audit event");
+    assert_eq!(review_event.actor_kind, "review_agent");
+    assert!(review_event
+        .payload_json
+        .contains("\"decision\":\"approve\""));
+    assert!(events.iter().any(|event| {
+        event.event_type == "task.state_transitioned"
+            && event.payload_json.contains("\"to\":\"integrating\"")
+    }));
+}
+
+#[tokio::test]
+async fn review_decision_rework_moves_to_rework_and_captures_feedback() {
+    let (_temp, pool) = migrated_pool().await;
+    create_human_review_task(&pool, true).await;
+
+    let detail = record_review_decision(
+        &pool,
+        "TASK-1",
+        &RecordReviewDecision {
+            decision: "rework".to_string(),
+            feedback: Some("Please tighten the deterministic tests.".to_string()),
+        },
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect("rework Review Decision");
+
+    assert_eq!(detail.task.state, "rework");
+    let workpad = detail
+        .workpad_note
+        .expect("feedback captured in Workpad Note");
+    assert!(workpad.body.contains("Review Decision: Rework"));
+    assert!(workpad.body.contains("Please tighten"));
+    let events = list_task_audit_events(&pool, "TASK-1")
+        .await
+        .expect("audit events");
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "workpad_note.updated"));
+    assert!(events.iter().any(|event| {
+        event.event_type == "task.review_decision_recorded"
+            && event.actor_kind == "operator"
+            && event.payload_json.contains("\"decision\":\"rework\"")
+    }));
+}
+
+#[tokio::test]
+async fn review_decision_rejects_invalid_state_gate_failure_and_actor() {
+    let (_temp, pool) = migrated_pool().await;
+    create_task_queue(
+        &pool,
+        &sample_queue("TASK", "Tasker"),
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect("create queue");
+    create_task(
+        &pool,
+        &sample_task("TASK", "Ready"),
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect("create task");
+    let invalid_state = record_review_decision(
+        &pool,
+        "TASK-1",
+        &RecordReviewDecision {
+            decision: "approve".to_string(),
+            feedback: None,
+        },
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect_err("not in Human Review");
+    assert!(invalid_state.to_string().contains("Human Review"));
+
+    transition_task_state(
+        &pool,
+        "TASK-1",
+        &TransitionTaskState {
+            to_state: "in_progress".to_string(),
+            agent_run_id: None,
+            repair_override: false,
+        },
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect("start");
+    transition_task_state(
+        &pool,
+        "TASK-1",
+        &TransitionTaskState {
+            to_state: "human_review".to_string(),
+            agent_run_id: None,
+            repair_override: true,
+        },
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect("operator repair to Human Review for gate failure test");
+
+    let gate_failure = record_review_decision(
+        &pool,
+        "TASK-1",
+        &RecordReviewDecision {
+            decision: "approve".to_string(),
+            feedback: None,
+        },
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect_err("approve gates fail");
+    assert!(gate_failure.to_string().contains("pass gates"));
+
+    let worker = record_review_decision(
+        &pool,
+        "TASK-1",
+        &RecordReviewDecision {
+            decision: "rework".to_string(),
+            feedback: Some("feedback".to_string()),
+        },
+        &worker_actor(),
+    )
+    .await
+    .expect_err("worker cannot record Review Decision");
+    assert!(worker.to_string().contains("Review Decisions require"));
+}
+
+#[tokio::test]
 async fn updates_requirement_statuses_and_audit_events() {
     let (_temp, pool) = migrated_pool().await;
     create_task_queue(
@@ -3002,6 +3160,75 @@ fn sample_claim(queue_key: &str) -> ClaimNextInput {
         launcher_kind: "fake".to_string(),
         lease_seconds: 90,
     }
+}
+
+async fn create_human_review_task(pool: &SqlitePool, gates_pass: bool) {
+    create_task_queue(
+        pool,
+        &sample_queue("TASK", "Tasker"),
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect("create queue");
+    create_task(
+        pool,
+        &sample_task("TASK", "Review"),
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect("create task");
+    transition_task_state(
+        pool,
+        "TASK-1",
+        &TransitionTaskState {
+            to_state: "in_progress".to_string(),
+            agent_run_id: None,
+            repair_override: false,
+        },
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect("start task");
+    if gates_pass {
+        update_acceptance_criterion_status(
+            pool,
+            "TASK-1",
+            1,
+            &UpdateRequirementStatus {
+                status: "satisfied".to_string(),
+                waiver_reason: None,
+                validated_base_commit: None,
+            },
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("criterion");
+        update_validation_item_status(
+            pool,
+            "TASK-1",
+            1,
+            &UpdateRequirementStatus {
+                status: "passed".to_string(),
+                waiver_reason: None,
+                validated_base_commit: None,
+            },
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("validation");
+    }
+    transition_task_state(
+        pool,
+        "TASK-1",
+        &TransitionTaskState {
+            to_state: "human_review".to_string(),
+            agent_run_id: None,
+            repair_override: false,
+        },
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect("move to Human Review");
 }
 
 fn sample_task(queue_key: &str, title: &str) -> CreateTask {

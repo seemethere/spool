@@ -14,6 +14,7 @@ mod metrics;
 mod models;
 mod queues;
 mod requirements;
+mod review;
 mod runs;
 mod status;
 mod tasks;
@@ -42,6 +43,7 @@ pub use requirements::{
     record_task_validated_base_commit, update_acceptance_criterion_status,
     update_validation_item_status,
 };
+pub use review::record_review_decision;
 pub use runs::{claim_next, finish_run, heartbeat_run, operator_fail_run, retry_task};
 pub use status::{
     active_agent_runs_for_status, active_retry_holds_for_status, due_integration_retries,

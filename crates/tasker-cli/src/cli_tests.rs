@@ -1213,6 +1213,137 @@ Implement Bootstrap Task Creation.
 }
 
 #[tokio::test]
+async fn task_review_decision_command_records_rework_feedback() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = TaskerPaths::resolve(temp.path(), PathOverrides::default());
+    init(&paths, false).await.expect("init");
+    let repo = temp.path().join("repo");
+    init_git_repo(&repo);
+    queue(
+        &paths,
+        false,
+        QueueCommand::Create {
+            key: "TASK".to_string(),
+            name: "Tasker".to_string(),
+            managed_source_repository: repo,
+            main_branch: "main".to_string(),
+            worktree_root: temp.path().join("worktrees"),
+            branch_template: "tasker/{task_identifier}".to_string(),
+            done_worktree_retention: false,
+            queue_concurrency_limit: None,
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect("create queue");
+    let task_file = temp.path().join("review-task.md");
+    fs::write(
+        &task_file,
+        r#"---
+title: Review me
+acceptance_criteria:
+  - It works
+validation_items:
+  - Tests pass
+---
+Implement reviewable work.
+"#,
+    )
+    .expect("write task file");
+    task(
+        &paths,
+        false,
+        TaskCommand::Create {
+            bootstrap: false,
+            queue: "TASK".to_string(),
+            from_file: Some(task_file),
+            file: None,
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect("create task");
+    let pool = open_pool(&paths, false).await.expect("pool");
+    let actor = tasker_db::Actor::operator("tester");
+    tasker_db::transition_task_state(
+        &pool,
+        "TASK-1",
+        &tasker_db::TransitionTaskState {
+            to_state: "in_progress".to_string(),
+            agent_run_id: None,
+            repair_override: false,
+        },
+        &actor,
+    )
+    .await
+    .expect("start");
+    tasker_db::update_acceptance_criterion_status(
+        &pool,
+        "TASK-1",
+        1,
+        &tasker_db::UpdateRequirementStatus {
+            status: "satisfied".to_string(),
+            waiver_reason: None,
+            validated_base_commit: None,
+        },
+        &actor,
+    )
+    .await
+    .expect("criterion");
+    tasker_db::update_validation_item_status(
+        &pool,
+        "TASK-1",
+        1,
+        &tasker_db::UpdateRequirementStatus {
+            status: "passed".to_string(),
+            waiver_reason: None,
+            validated_base_commit: None,
+        },
+        &actor,
+    )
+    .await
+    .expect("validation");
+    tasker_db::transition_task_state(
+        &pool,
+        "TASK-1",
+        &tasker_db::TransitionTaskState {
+            to_state: "human_review".to_string(),
+            agent_run_id: None,
+            repair_override: false,
+        },
+        &actor,
+    )
+    .await
+    .expect("human review");
+
+    task(
+        &paths,
+        false,
+        TaskCommand::ReviewDecision {
+            identifier: "TASK-1".to_string(),
+            decision: "rework".to_string(),
+            feedback: Some("Address the review feedback.".to_string()),
+            feedback_file: None,
+            actor_kind: "review_agent".to_string(),
+            actor: "reviewer".to_string(),
+        },
+    )
+    .await
+    .expect("record Review Decision");
+
+    let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+        .await
+        .expect("load task")
+        .expect("task exists");
+    assert_eq!(detail.task.state, "rework");
+    assert!(detail
+        .workpad_note
+        .expect("Workpad Note")
+        .body
+        .contains("Address the review feedback"));
+}
+
+#[tokio::test]
 async fn worker_integrating_transition_rejects_dirty_local_worktree_without_state_change() {
     let temp = tempfile::tempdir().expect("tempdir");
     let paths = TaskerPaths::resolve(temp.path().join("home"), PathOverrides::default());
