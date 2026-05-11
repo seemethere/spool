@@ -303,9 +303,6 @@ fn worker_start_target(
     if options.watch {
         let available = unblock.unclaimed_eligible.len();
         if available == 0 {
-            if outcome.started_workers == 0 && active.is_empty() && unblock.active_runs == 0 {
-                return outcome.started_workers + 1;
-            }
             return outcome.started_workers;
         }
         let open_supervisor_slots = options.concurrency.saturating_sub(active.len());
@@ -838,14 +835,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supervisor_watch_picks_up_task_after_initial_no_eligible_exit() {
+    async fn supervisor_watch_picks_up_task_when_it_becomes_eligible() {
         let temp = TempDir::new().expect("tempdir");
-        let count = temp.path().join("count");
+        let count = temp.path().join("worker-count");
         let script = temp.path().join("worker.sh");
         fs::write(
             &script,
             format!(
-                "#!/bin/sh\nif [ ! -f {count} ]; then echo 1 > {count}; echo 'no eligible Tasks found for Task Queue TASK'; exit 0; fi\nsleep 1\nexit 0\n",
+                "#!/bin/sh\necho run >> {count}\nsleep 1\nexit 0\n",
                 count = count.display()
             ),
         )
@@ -876,14 +873,22 @@ mod tests {
         });
 
         tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            !count.exists(),
+            "watch mode should not spawn a no-eligible probe while no Task is eligible"
+        );
         sqlx::query("UPDATE tasks SET state = 'ready' WHERE identifier = 'TASK-1'")
             .execute(&pool)
             .await
             .expect("ready task");
         let outcome = handle.await.expect("join").expect("supervise");
 
-        assert!(outcome.no_eligible_exits >= 1);
-        assert!(outcome.started_workers >= 2);
+        assert_eq!(outcome.no_eligible_exits, 0);
+        assert!(outcome.started_workers >= 1);
+        assert!(
+            count.exists(),
+            "worker should start after the Task becomes eligible"
+        );
         assert!(outcome.timed_out);
     }
 
@@ -1080,6 +1085,112 @@ exit 0
         assert!(
             outcome.started_workers >= 2,
             "watch mode should backfill the second worker before the first exits"
+        );
+        assert!(outcome.timed_out);
+    }
+
+    #[tokio::test]
+    async fn supervisor_watch_does_not_backfill_open_slots_without_eligible_tasks() {
+        let temp = TempDir::new().expect("tempdir");
+        let count = temp.path().join("worker-count");
+        let script = temp.path().join("worker.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho run >> {count}\necho 'no eligible Tasks found for Task Queue TASK'\nexit 0\n",
+                count = count.display()
+            ),
+        )
+        .expect("write script");
+        make_executable(&script);
+        let pool = empty_pool(temp.path()).await;
+        seed_active_run(&pool, "existing-worker").await;
+
+        let outcome = supervise_batch(
+            &pool,
+            SupervisorOptions {
+                queue: "TASK".to_string(),
+                concurrency: 2,
+                timeout_seconds: 2,
+                poll_seconds: 1,
+                worker_command: vec![script.display().to_string()],
+                lock_dir: temp.path().join("supervisors"),
+                data_dir: temp.path().to_path_buf(),
+                allow_overlap: false,
+                watch: true,
+                run_prefix: Some("supervisor-test-watch-no-spin".to_string()),
+            },
+        )
+        .await
+        .expect("supervise");
+
+        assert_eq!(outcome.started_workers, 0);
+        assert_eq!(outcome.no_eligible_exits, 0);
+        assert!(outcome.timed_out);
+        assert!(
+            !count.exists(),
+            "open supervisor capacity without eligible Tasks should not spawn workers"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_watch_does_not_spin_after_backfilled_worker_claims_only_task() {
+        let temp = TempDir::new().expect("tempdir");
+        let count = temp.path().join("worker-count");
+        let db_path = temp.path().join("tasker.db");
+        let script = temp.path().join("worker.sh");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+actor="$2"
+echo "$actor" >> {count}
+python3 - "$actor" {db_path} <<'PY'
+import sqlite3, sys
+actor = sys.argv[1]
+db_path = sys.argv[2]
+conn = sqlite3.connect(db_path)
+conn.execute("UPDATE tasks SET state = 'in_progress' WHERE identifier = 'TASK-1'")
+conn.execute("INSERT INTO agent_runs (id, task_id, task_queue_id, worker_actor_kind, worker_actor_id, worker_actor_display_name, worker_id, launcher_kind, lease_expires_at) VALUES (?, 'task-1', 'queue-1', 'worker_agent', ?, ?, ?, 'fake', datetime('now', '+60 seconds'))", (actor + '-run', actor, actor, actor))
+conn.commit()
+PY
+sleep 5
+exit 0
+"#,
+                count = count.display(),
+                db_path = db_path.display()
+            ),
+        )
+        .expect("write script");
+        make_executable(&script);
+        let pool = empty_pool(temp.path()).await;
+        seed_task(&pool, "ready").await;
+
+        let outcome = supervise_batch(
+            &pool,
+            SupervisorOptions {
+                queue: "TASK".to_string(),
+                concurrency: 3,
+                timeout_seconds: 3,
+                poll_seconds: 1,
+                worker_command: vec![script.display().to_string()],
+                lock_dir: temp.path().join("supervisors"),
+                data_dir: temp.path().to_path_buf(),
+                allow_overlap: false,
+                watch: true,
+                run_prefix: Some("supervisor-test-watch-single-claim".to_string()),
+            },
+        )
+        .await
+        .expect("supervise");
+
+        assert_eq!(outcome.started_workers, 1);
+        assert_eq!(
+            fs::read_to_string(&count)
+                .expect("worker count")
+                .lines()
+                .count(),
+            1
         );
         assert!(outcome.timed_out);
     }
