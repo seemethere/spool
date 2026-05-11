@@ -727,8 +727,12 @@ fn is_unrecovered_attention_outcome(run: &RecentRunSnapshot) -> bool {
     matches!(
         run.outcome.as_deref(),
         Some("failed" | "expired" | "canceled")
-    ) && run.task_state != "done"
+    ) && !is_terminal_task_state(&run.task_state)
         && !run.recovered_by_later_success
+}
+
+fn is_terminal_task_state(task_state: &str) -> bool {
+    matches!(task_state, "done" | "canceled")
 }
 
 fn is_stale_lease(lease_expires_at: &str, captured_at: &str) -> bool {
@@ -1361,6 +1365,44 @@ mod tests {
 
         assert_eq!(failed_run.task_state, "done");
         assert!(attention_texts(&snapshot).is_empty());
+    }
+
+    #[tokio::test]
+    async fn canceled_task_suppresses_failed_run_attention_but_keeps_recent_history() {
+        let pool = temp_pool().await;
+        seed_queue_and_task(&pool).await;
+        let failed = claim_with_worker(&pool, "worker-failed").await;
+        finish_run(
+            &pool,
+            &failed.run.id,
+            "worker-failed",
+            "failed",
+            Some("abandoned after cleanup"),
+        )
+        .await;
+        sqlx::query("DELETE FROM task_retry_holds")
+            .execute(&pool)
+            .await
+            .expect("clear retry hold");
+        sqlx::query("UPDATE tasks SET state = 'canceled'")
+            .execute(&pool)
+            .await
+            .expect("mark canceled");
+
+        let snapshot = load_snapshot(&pool, &options()).await.expect("snapshot");
+        let failed_run = snapshot
+            .recent_runs
+            .iter()
+            .find(|run| run.agent_run_id == failed.run.id)
+            .expect("failed run remains recent");
+
+        assert_eq!(failed_run.task_state, "canceled");
+        assert!(attention_texts(&snapshot).is_empty());
+        let mut out = Vec::new();
+        write_snapshot(&mut out, &snapshot).expect("write");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("Recent Agent Runs:"));
+        assert!(text.contains("abandoned after cleanup"));
     }
 
     #[test]
