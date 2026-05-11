@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 use sqlx::{FromRow, SqlitePool};
-use std::fmt::Write;
+use std::{collections::BTreeMap, fmt::Write};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetryOptions {
@@ -43,6 +43,10 @@ pub struct TelemetryRun {
     pub tool_call_count: Option<i64>,
     pub tool_error_count: Option<i64>,
     pub repeated_failed_tool_attempt_count: Option<i64>,
+    pub tool_call_counts: BTreeMap<String, i64>,
+    pub repeated_read_count: Option<i64>,
+    pub repeated_tasker_context_fetch_count: Option<i64>,
+    pub shell_command_counts: BTreeMap<String, i64>,
     pub assistant_turn_count: Option<i64>,
     pub user_turn_count: Option<i64>,
     pub input_tokens: Option<i64>,
@@ -60,6 +64,10 @@ pub struct EfficiencyTelemetrySummary {
     pub total_tool_calls: i64,
     pub total_tool_errors: i64,
     pub total_repeated_failed_tool_attempts: i64,
+    pub tool_call_counts: BTreeMap<String, i64>,
+    pub total_repeated_reads: i64,
+    pub total_repeated_tasker_context_fetches: i64,
+    pub shell_command_counts: BTreeMap<String, i64>,
     pub total_assistant_turns: i64,
     pub total_user_turns: i64,
     pub max_input_tokens: Option<i64>,
@@ -86,6 +94,10 @@ struct TelemetryRunRow {
     tool_call_count: Option<i64>,
     tool_error_count: Option<i64>,
     repeated_failed_tool_attempt_count: Option<i64>,
+    tool_call_counts_json: Option<String>,
+    repeated_read_count: Option<i64>,
+    repeated_tasker_context_fetch_count: Option<i64>,
+    shell_command_counts_json: Option<String>,
     assistant_turn_count: Option<i64>,
     user_turn_count: Option<i64>,
     input_tokens: Option<i64>,
@@ -131,6 +143,10 @@ pub async fn summarize_agent_runs(
             agent_run_metrics.tool_call_count AS tool_call_count,
             agent_run_metrics.tool_error_count AS tool_error_count,
             agent_run_metrics.repeated_failed_tool_attempt_count AS repeated_failed_tool_attempt_count,
+            agent_run_metrics.tool_call_counts_json AS tool_call_counts_json,
+            agent_run_metrics.repeated_read_count AS repeated_read_count,
+            agent_run_metrics.repeated_tasker_context_fetch_count AS repeated_tasker_context_fetch_count,
+            agent_run_metrics.shell_command_counts_json AS shell_command_counts_json,
             agent_run_metrics.assistant_turn_count AS assistant_turn_count,
             agent_run_metrics.user_turn_count AS user_turn_count,
             agent_run_metrics.input_tokens AS input_tokens,
@@ -270,6 +286,10 @@ fn run_from_row(row: &TelemetryRunRow) -> TelemetryRun {
         tool_call_count: row.tool_call_count,
         tool_error_count: row.tool_error_count,
         repeated_failed_tool_attempt_count: row.repeated_failed_tool_attempt_count,
+        tool_call_counts: json_counts(row.tool_call_counts_json.as_deref()),
+        repeated_read_count: row.repeated_read_count,
+        repeated_tasker_context_fetch_count: row.repeated_tasker_context_fetch_count,
+        shell_command_counts: json_counts(row.shell_command_counts_json.as_deref()),
         assistant_turn_count: row.assistant_turn_count,
         user_turn_count: row.user_turn_count,
         input_tokens: row.input_tokens,
@@ -282,12 +302,39 @@ fn run_from_row(row: &TelemetryRunRow) -> TelemetryRun {
     }
 }
 
+fn json_counts(json: Option<&str>) -> BTreeMap<String, i64> {
+    json.and_then(|json| serde_json::from_str::<BTreeMap<String, i64>>(json).ok())
+        .unwrap_or_default()
+}
+
+fn merge_counts(target: &mut BTreeMap<String, i64>, source: BTreeMap<String, i64>) {
+    for (key, count) in source {
+        *target.entry(key).or_insert(0) += count;
+    }
+}
+
+fn render_counts(counts: &BTreeMap<String, i64>) -> String {
+    if counts.is_empty() {
+        "none".to_string()
+    } else {
+        counts
+            .iter()
+            .map(|(key, count)| format!("{key}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 fn build_efficiency_summary(rows: &[TelemetryRunRow]) -> EfficiencyTelemetrySummary {
     let mut summary = EfficiencyTelemetrySummary {
         runs_with_metrics: 0,
         total_tool_calls: 0,
         total_tool_errors: 0,
         total_repeated_failed_tool_attempts: 0,
+        tool_call_counts: BTreeMap::new(),
+        total_repeated_reads: 0,
+        total_repeated_tasker_context_fetches: 0,
+        shell_command_counts: BTreeMap::new(),
         total_assistant_turns: 0,
         total_user_turns: 0,
         max_input_tokens: None,
@@ -308,7 +355,11 @@ fn build_efficiency_summary(rows: &[TelemetryRunRow]) -> EfficiencyTelemetrySumm
             || row.total_tokens.is_some()
             || row.cache_read_tokens.is_some()
             || row.cache_write_tokens.is_some()
-            || row.max_context_tokens.is_some();
+            || row.max_context_tokens.is_some()
+            || row.repeated_read_count.is_some()
+            || row.repeated_tasker_context_fetch_count.is_some()
+            || row.tool_call_counts_json.is_some()
+            || row.shell_command_counts_json.is_some();
         if has_metrics {
             summary.runs_with_metrics += 1;
         }
@@ -316,6 +367,17 @@ fn build_efficiency_summary(rows: &[TelemetryRunRow]) -> EfficiencyTelemetrySumm
         summary.total_tool_errors += row.tool_error_count.unwrap_or(0);
         summary.total_repeated_failed_tool_attempts +=
             row.repeated_failed_tool_attempt_count.unwrap_or(0);
+        merge_counts(
+            &mut summary.tool_call_counts,
+            json_counts(row.tool_call_counts_json.as_deref()),
+        );
+        summary.total_repeated_reads += row.repeated_read_count.unwrap_or(0);
+        summary.total_repeated_tasker_context_fetches +=
+            row.repeated_tasker_context_fetch_count.unwrap_or(0);
+        merge_counts(
+            &mut summary.shell_command_counts,
+            json_counts(row.shell_command_counts_json.as_deref()),
+        );
         summary.total_assistant_turns += row.assistant_turn_count.unwrap_or(0);
         summary.total_user_turns += row.user_turn_count.unwrap_or(0);
         if let Some(tokens) = row.input_tokens {
@@ -346,6 +408,8 @@ fn build_efficiency_summary(rows: &[TelemetryRunRow]) -> EfficiencyTelemetrySumm
         if !hints.is_empty()
             || row.tool_call_count.unwrap_or(0) >= 30
             || row.repeated_failed_tool_attempt_count.unwrap_or(0) > 0
+            || row.repeated_read_count.unwrap_or(0) > 0
+            || row.repeated_tasker_context_fetch_count.unwrap_or(0) > 0
         {
             summary.inefficient_runs.push(run_from_row(row));
         }
@@ -443,11 +507,13 @@ pub fn render_summary(summary: &TelemetrySummary) -> String {
 
     writeln!(
         output,
-        "efficiency metrics: {} run(s), {} tool call(s), {} tool error(s), {} repeated failed tool attempt(s), assistant/user turns {}/{}, max tokens input/output/total {}/{}/{}, cache read/write {}/{}, max context tokens {}",
+        "efficiency metrics: {} run(s), {} tool call(s), {} tool error(s), {} repeated failed tool attempt(s), {} repeated read(s), {} repeated Tasker context fetch(es), assistant/user turns {}/{}, max tokens input/output/total {}/{}/{}, cache read/write {}/{}, max context tokens {}",
         summary.efficiency.runs_with_metrics,
         summary.efficiency.total_tool_calls,
         summary.efficiency.total_tool_errors,
         summary.efficiency.total_repeated_failed_tool_attempts,
+        summary.efficiency.total_repeated_reads,
+        summary.efficiency.total_repeated_tasker_context_fetches,
         summary.efficiency.total_assistant_turns,
         summary.efficiency.total_user_turns,
         summary.efficiency.max_input_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
@@ -458,18 +524,32 @@ pub fn render_summary(summary: &TelemetrySummary) -> String {
         summary.efficiency.max_context_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string())
     )
     .expect("write string");
+    writeln!(
+        output,
+        "  tool calls by tool: {}",
+        render_counts(&summary.efficiency.tool_call_counts)
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "  shell command categories: {}",
+        render_counts(&summary.efficiency.shell_command_counts)
+    )
+    .expect("write string");
     if !summary.efficiency.inefficient_runs.is_empty() {
         writeln!(output, "optimization hints:").expect("write string");
         for run in &summary.efficiency.inefficient_runs {
             let hints = run.efficiency_hints_json.as_deref().unwrap_or("[]");
             writeln!(
                 output,
-                "  {} - {}: {} tool_calls={} tool_errors={} hints={}",
+                "  {} - {}: {} tool_calls={} tool_errors={} repeated_reads={} repeated_tasker_context_fetches={} hints={}",
                 run.task_identifier,
                 run.task_title,
                 run.agent_run_id,
                 run.tool_call_count.unwrap_or(0),
                 run.tool_error_count.unwrap_or(0),
+                run.repeated_read_count.unwrap_or(0),
+                run.repeated_tasker_context_fetch_count.unwrap_or(0),
                 hints
             )
             .expect("write string");
@@ -1249,10 +1329,14 @@ mod tests {
             r#"
             INSERT INTO agent_run_metrics (
                 agent_run_id, launcher_kind, final_status, tool_call_count, tool_error_count,
-                repeated_failed_tool_attempt_count, assistant_turn_count, user_turn_count,
-                max_context_tokens, efficiency_hints_json
-            ) VALUES ('run-2', 'pi', 'completed', 42, 6, 2, 9, 4, 123456,
-                '["excessive tool calls","repeated failed tool attempts","large context growth","validation/tool loop"]')
+                repeated_failed_tool_attempt_count, tool_call_counts_json, repeated_read_count,
+                repeated_tasker_context_fetch_count, shell_command_counts_json,
+                assistant_turn_count, user_turn_count, max_context_tokens, efficiency_hints_json
+            ) VALUES ('run-2', 'pi', 'completed', 42, 6, 2,
+                '{"read":13,"bash":25,"edit":4}', 3, 2,
+                '{"tasker_cli":7,"cargo":3,"git":2,"search":8,"other":5}',
+                9, 4, 123456,
+                '["excessive tool calls","repeated failed tool attempts","repeated file reads","repeated Tasker context fetches","large context growth","validation/tool loop"]')
             "#,
         )
         .execute(&pool)
@@ -1278,15 +1362,29 @@ mod tests {
         assert_eq!(summary.efficiency.total_tool_calls, 42);
         assert_eq!(summary.efficiency.total_tool_errors, 6);
         assert_eq!(summary.efficiency.total_repeated_failed_tool_attempts, 2);
+        assert_eq!(summary.efficiency.tool_call_counts.get("read"), Some(&13));
+        assert_eq!(summary.efficiency.tool_call_counts.get("bash"), Some(&25));
+        assert_eq!(summary.efficiency.total_repeated_reads, 3);
+        assert_eq!(summary.efficiency.total_repeated_tasker_context_fetches, 2);
+        assert_eq!(
+            summary.efficiency.shell_command_counts.get("tasker_cli"),
+            Some(&7)
+        );
         assert_eq!(summary.efficiency.max_context_tokens, Some(123456));
         assert_eq!(summary.efficiency.inefficient_runs[0].agent_run_id, "run-2");
         let json = serde_json::to_value(&summary).expect("json");
         assert_eq!(json["efficiency"]["total_tool_calls"], 42);
+        assert_eq!(json["efficiency"]["tool_call_counts"]["bash"], 25);
+        assert_eq!(json["efficiency"]["total_repeated_reads"], 3);
+        assert_eq!(json["efficiency"]["shell_command_counts"]["search"], 8);
         assert!(json.to_string().contains("excessive tool calls"));
         assert!(!json.to_string().contains("brief"));
         let rendered = render_summary(&summary);
         assert!(rendered.contains("TASK-1 - Repeated work"));
         assert!(rendered.contains("post-Integrating Agent Runs: 1"));
+        assert!(rendered.contains("tool calls by tool: bash=25"));
+        assert!(rendered.contains("shell command categories:"));
+        assert!(rendered.contains("repeated_reads=3"));
         assert!(rendered.contains("optimization hints:"));
     }
 

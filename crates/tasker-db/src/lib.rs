@@ -786,6 +786,10 @@ pub struct AgentRunMetrics {
     pub tool_call_count: Option<i64>,
     pub tool_error_count: Option<i64>,
     pub repeated_failed_tool_attempt_count: Option<i64>,
+    pub tool_call_counts_json: String,
+    pub repeated_read_count: Option<i64>,
+    pub repeated_tasker_context_fetch_count: Option<i64>,
+    pub shell_command_counts_json: String,
     pub assistant_turn_count: Option<i64>,
     pub user_turn_count: Option<i64>,
     pub max_context_tokens: Option<i64>,
@@ -2867,8 +2871,9 @@ pub async fn get_agent_run_metrics(
                unattended_question_detected, blocking_ui_detected, transcript_path,
                transcript_byte_size, transcript_jsonl_event_count, input_tokens, output_tokens,
                total_tokens, cache_read_tokens, cache_write_tokens, tool_call_count, tool_error_count,
-               repeated_failed_tool_attempt_count, assistant_turn_count, user_turn_count,
-               max_context_tokens, efficiency_hints_json,
+               repeated_failed_tool_attempt_count, tool_call_counts_json, repeated_read_count,
+               repeated_tasker_context_fetch_count, shell_command_counts_json,
+               assistant_turn_count, user_turn_count, max_context_tokens, efficiency_hints_json,
                warnings_json, created_at, updated_at
         FROM agent_run_metrics
         WHERE agent_run_id = ?
@@ -2916,13 +2921,14 @@ pub async fn refresh_agent_run_metrics(
             unattended_question_detected, blocking_ui_detected, transcript_path,
             transcript_byte_size, transcript_jsonl_event_count, input_tokens, output_tokens,
             total_tokens, cache_read_tokens, cache_write_tokens, tool_call_count, tool_error_count,
-            repeated_failed_tool_attempt_count, assistant_turn_count, user_turn_count,
-            max_context_tokens, efficiency_hints_json, warnings_json
+            repeated_failed_tool_attempt_count, tool_call_counts_json, repeated_read_count,
+            repeated_tasker_context_fetch_count, shell_command_counts_json,
+            assistant_turn_count, user_turn_count, max_context_tokens, efficiency_hints_json, warnings_json
         )
         SELECT
             agent_runs.id,
             CAST((julianday(agent_runs.finished_at) - julianday(agent_runs.created_at)) * 86400000 AS INTEGER),
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         FROM agent_runs
         WHERE agent_runs.id = ? AND agent_runs.outcome IS NOT NULL
         ON CONFLICT(agent_run_id) DO UPDATE SET
@@ -2944,6 +2950,10 @@ pub async fn refresh_agent_run_metrics(
             tool_call_count = excluded.tool_call_count,
             tool_error_count = excluded.tool_error_count,
             repeated_failed_tool_attempt_count = excluded.repeated_failed_tool_attempt_count,
+            tool_call_counts_json = excluded.tool_call_counts_json,
+            repeated_read_count = excluded.repeated_read_count,
+            repeated_tasker_context_fetch_count = excluded.repeated_tasker_context_fetch_count,
+            shell_command_counts_json = excluded.shell_command_counts_json,
             assistant_turn_count = excluded.assistant_turn_count,
             user_turn_count = excluded.user_turn_count,
             max_context_tokens = excluded.max_context_tokens,
@@ -2969,6 +2979,10 @@ pub async fn refresh_agent_run_metrics(
     .bind(summary.tool_call_count)
     .bind(summary.tool_error_count)
     .bind(summary.repeated_failed_tool_attempt_count)
+    .bind(summary.tool_call_counts_json()?)
+    .bind(summary.repeated_read_count)
+    .bind(summary.repeated_tasker_context_fetch_count)
+    .bind(summary.shell_command_counts_json()?)
     .bind(summary.assistant_turn_count)
     .bind(summary.user_turn_count)
     .bind(summary.max_context_tokens)
@@ -3000,6 +3014,12 @@ struct AgentRunMetricsSummary {
     tool_call_count: Option<i64>,
     tool_error_count: Option<i64>,
     repeated_failed_tool_attempt_count: Option<i64>,
+    tool_call_counts: std::collections::BTreeMap<String, i64>,
+    repeated_read_count: Option<i64>,
+    repeated_tasker_context_fetch_count: Option<i64>,
+    shell_command_counts: std::collections::BTreeMap<String, i64>,
+    read_paths: std::collections::HashMap<String, i64>,
+    tasker_context_fetch_signatures: std::collections::HashMap<String, i64>,
     assistant_turn_count: Option<i64>,
     user_turn_count: Option<i64>,
     max_context_tokens: Option<i64>,
@@ -3236,19 +3256,20 @@ impl AgentRunMetricsSummary {
             .and_then(|value| value.as_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let has_tool_name = value
-            .get("tool_name")
-            .or_else(|| value.get("tool"))
-            .or_else(|| value.get("name"))
-            .is_some();
+        let tool_name = tool_name(value);
+        let has_tool_name = tool_name.is_some();
         let is_tool_call = (type_text.contains("tool")
             && (type_text.contains("call")
                 || type_text.contains("use")
-                || type_text.contains("start")))
+                || type_text.contains("start")
+                || type_text.contains("execution")))
             || type_text == "function_call"
             || value.get("function_call").is_some();
         if is_tool_call {
             self.tool_call_count = Some(self.tool_call_count.unwrap_or(0) + 1);
+            let name = tool_name.unwrap_or_else(|| "unknown".to_string());
+            *self.tool_call_counts.entry(name.clone()).or_insert(0) += 1;
+            self.observe_tool_call_details(&name, value);
         }
         let status = value
             .get("status")
@@ -3274,6 +3295,59 @@ impl AgentRunMetricsSummary {
         }
     }
 
+    fn observe_tool_call_details(&mut self, name: &str, value: &serde_json::Value) {
+        let canonical = canonical_tool_name(name);
+        if canonical == "read" {
+            if let Some(path) = tool_string_arg(value, &["path", "file", "filename"]) {
+                let count = self.read_paths.entry(path).or_insert(0);
+                *count += 1;
+                if *count > 1 {
+                    self.repeated_read_count = Some(self.repeated_read_count.unwrap_or(0) + 1);
+                }
+            }
+        }
+        if canonical == "bash" {
+            if let Some(command) = tool_string_arg(value, &["command", "cmd"]) {
+                let category = shell_command_category(&command);
+                *self
+                    .shell_command_counts
+                    .entry(category.to_string())
+                    .or_insert(0) += 1;
+                if let Some(signature) = tasker_context_fetch_signature(&command) {
+                    let count = self
+                        .tasker_context_fetch_signatures
+                        .entry(signature)
+                        .or_insert(0);
+                    *count += 1;
+                    if *count > 1 {
+                        self.repeated_tasker_context_fetch_count =
+                            Some(self.repeated_tasker_context_fetch_count.unwrap_or(0) + 1);
+                    }
+                }
+            }
+        } else if is_tasker_context_tool(&canonical) {
+            let count = self
+                .tasker_context_fetch_signatures
+                .entry(format!("tool:{canonical}"))
+                .or_insert(0);
+            *count += 1;
+            if *count > 1 {
+                self.repeated_tasker_context_fetch_count =
+                    Some(self.repeated_tasker_context_fetch_count.unwrap_or(0) + 1);
+            }
+        }
+    }
+
+    fn tool_call_counts_json(&self) -> Result<String> {
+        serde_json::to_string(&self.tool_call_counts)
+            .context("failed to serialize Agent Run per-tool counts")
+    }
+
+    fn shell_command_counts_json(&self) -> Result<String> {
+        serde_json::to_string(&self.shell_command_counts)
+            .context("failed to serialize Agent Run shell command counts")
+    }
+
     fn efficiency_hints_json(&self) -> Result<String> {
         let mut hints = Vec::new();
         if self.tool_call_count.unwrap_or(0) >= 30 {
@@ -3281,6 +3355,15 @@ impl AgentRunMetricsSummary {
         }
         if self.repeated_failed_tool_attempt_count.unwrap_or(0) > 0 {
             hints.push("repeated failed tool attempts".to_string());
+        }
+        if self.repeated_read_count.unwrap_or(0) > 0 {
+            hints.push("repeated file reads".to_string());
+        }
+        if self.repeated_tasker_context_fetch_count.unwrap_or(0) > 0 {
+            hints.push("repeated Tasker context fetches".to_string());
+        }
+        if self.transcript_byte_size.unwrap_or(0) >= 10_000_000 {
+            hints.push("large transcript/proxy output volume".to_string());
         }
         if self.max_context_tokens.unwrap_or(0) >= 100_000 {
             hints.push("large context growth".to_string());
@@ -3297,13 +3380,139 @@ impl AgentRunMetricsSummary {
     }
 }
 
-fn tool_signature(value: &serde_json::Value) -> String {
-    let name = value
+fn tool_name(value: &serde_json::Value) -> Option<String> {
+    let raw = value
         .get("tool_name")
         .or_else(|| value.get("tool"))
         .or_else(|| value.get("name"))
         .and_then(|value| value.as_str())
-        .unwrap_or("unknown");
+        .or_else(|| {
+            value
+                .pointer("/function/name")
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| {
+            value
+                .pointer("/function_call/name")
+                .and_then(|value| value.as_str())
+        })?;
+    Some(sanitize_metric_key(raw))
+}
+
+fn sanitize_metric_key(raw: &str) -> String {
+    let lowered = raw.trim().to_ascii_lowercase();
+    let sanitized: String = lowered
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn canonical_tool_name(name: &str) -> String {
+    name.rsplit(['.', ':']).next().unwrap_or(name).to_string()
+}
+
+fn tool_args(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    value
+        .get("args")
+        .or_else(|| value.get("arguments"))
+        .or_else(|| value.get("input"))
+        .or_else(|| value.pointer("/function/arguments"))
+        .or_else(|| value.pointer("/function_call/arguments"))
+}
+
+fn tool_string_arg(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let args = tool_args(value)?;
+    if let Some(text) = args.as_str() {
+        if keys.iter().any(|key| matches!(*key, "command" | "cmd")) {
+            return Some(text.to_string());
+        }
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+            return string_arg_from_object(&parsed, keys);
+        }
+        return None;
+    }
+    string_arg_from_object(args, keys)
+}
+
+fn string_arg_from_object(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(text) = value.get(*key).and_then(|value| value.as_str()) {
+            return Some(text.trim().to_string());
+        }
+    }
+    None
+}
+
+fn shell_command_category(command: &str) -> &'static str {
+    let lowered = command.trim_start().to_ascii_lowercase();
+    if lowered.contains("tasker-local")
+        || lowered.starts_with("tasker ")
+        || lowered.contains(" tasker ")
+        || lowered.contains("cargo run -p tasker-cli")
+    {
+        "tasker_cli"
+    } else if lowered.starts_with("cargo ") || lowered.contains(" cargo ") {
+        "cargo"
+    } else if lowered.starts_with("git ") || lowered.contains(" git ") {
+        "git"
+    } else if lowered.starts_with("rg ")
+        || lowered.contains(" rg ")
+        || lowered.starts_with("find ")
+        || lowered.contains(" find ")
+        || lowered.starts_with("grep ")
+        || lowered.contains(" grep ")
+    {
+        "search"
+    } else {
+        "other"
+    }
+}
+
+fn tasker_context_fetch_signature(command: &str) -> Option<String> {
+    let lowered = command.to_ascii_lowercase();
+    let normalized = lowered.split_whitespace().collect::<Vec<_>>().join(" ");
+    let context_kind = if normalized.contains("tasker-local task show")
+        || normalized.contains("tasker task show")
+        || normalized.contains("task show")
+    {
+        "task_show"
+    } else if normalized.contains("tasker-local queue show")
+        || normalized.contains("tasker queue show")
+        || normalized.contains("queue show")
+    {
+        "queue_show"
+    } else if normalized.contains("tasker-local status")
+        || normalized.contains("tasker status")
+        || normalized == "status"
+    {
+        "status"
+    } else {
+        return None;
+    };
+    Some(context_kind.to_string())
+}
+
+fn is_tasker_context_tool(canonical: &str) -> bool {
+    canonical.contains("get_task")
+        || canonical.contains("task_context")
+        || canonical.contains("task_show")
+        || canonical.contains("queue_show")
+        || canonical == "status"
+}
+
+fn tool_signature(value: &serde_json::Value) -> String {
+    let name = tool_name(value).unwrap_or_else(|| "unknown".to_string());
     let args = value
         .get("args")
         .or_else(|| value.get("arguments"))
@@ -5858,7 +6067,7 @@ mod tests {
             serde_json::json!({
                 "launcher":"pi",
                 "status":0,
-                "stdout":"{\"role\":\"user\",\"content\":\"brief\"}\n{\"role\":\"assistant\",\"content\":\"plan\",\"usage\":{\"input_tokens\":30,\"output_tokens\":12,\"total_tokens\":42}}\n{\"type\":\"message_update\",\"assistantMessageEvent\":{\"partial\":{\"usage\":{\"input\":45,\"output\":15,\"totalTokens\":60,\"cacheRead\":1000,\"cacheWrite\":50}}}}\n{\"type\":\"tool_call\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"}}\n{\"type\":\"tool_error\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"},\"status\":\"error\"}\n{\"type\":\"tool_error\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"},\"status\":\"error\"}\n{\"type\":\"agent_end\"}\n",
+                "stdout":"{\"role\":\"user\",\"content\":\"brief\"}\n{\"role\":\"assistant\",\"content\":\"plan\",\"usage\":{\"input_tokens\":30,\"output_tokens\":12,\"total_tokens\":42}}\n{\"type\":\"message_update\",\"assistantMessageEvent\":{\"partial\":{\"usage\":{\"input\":45,\"output\":15,\"totalTokens\":60,\"cacheRead\":1000,\"cacheWrite\":50}}}}\n{\"type\":\"tool_call\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"bin/tasker-local task show TASK-1\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"bin/tasker-local task show TASK-1\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"tasker status\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"tasker status\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"edit\",\"args\":{}}\n{\"type\":\"tool_call\",\"tool_name\":\"write\",\"args\":{}}\n{\"type\":\"tool_call\",\"tool_name\":\"tasker.get_task_context\",\"args\":{}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"cargo test -p tasker-db\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"git status --short\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"rg telemetry crates\"}}\n{\"type\":\"tool_error\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"},\"status\":\"error\"}\n{\"type\":\"tool_error\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"},\"status\":\"error\"}\n{\"type\":\"agent_end\"}\n",
                 "stderr":"",
                 "unattended_question_detected":false,
                 "timed_out":false
@@ -5911,9 +6120,24 @@ mod tests {
         assert_eq!(metrics.timed_out, Some(0));
         assert_eq!(metrics.unattended_question_detected, Some(0));
         assert_eq!(metrics.transcript_jsonl_event_count, Some(1));
-        assert_eq!(metrics.tool_call_count, Some(1));
+        assert_eq!(metrics.tool_call_count, Some(12));
         assert_eq!(metrics.tool_error_count, Some(2));
         assert_eq!(metrics.repeated_failed_tool_attempt_count, Some(1));
+        assert_eq!(metrics.repeated_read_count, Some(1));
+        assert_eq!(metrics.repeated_tasker_context_fetch_count, Some(2));
+        let tool_counts: std::collections::BTreeMap<String, i64> =
+            serde_json::from_str(&metrics.tool_call_counts_json).expect("tool counts");
+        assert_eq!(tool_counts.get("read"), Some(&2));
+        assert_eq!(tool_counts.get("bash"), Some(&7));
+        assert_eq!(tool_counts.get("edit"), Some(&1));
+        assert_eq!(tool_counts.get("write"), Some(&1));
+        assert_eq!(tool_counts.get("tasker.get_task_context"), Some(&1));
+        let shell_counts: std::collections::BTreeMap<String, i64> =
+            serde_json::from_str(&metrics.shell_command_counts_json).expect("shell counts");
+        assert_eq!(shell_counts.get("tasker_cli"), Some(&4));
+        assert_eq!(shell_counts.get("cargo"), Some(&1));
+        assert_eq!(shell_counts.get("git"), Some(&1));
+        assert_eq!(shell_counts.get("search"), Some(&1));
         assert_eq!(metrics.assistant_turn_count, Some(1));
         assert_eq!(metrics.user_turn_count, Some(1));
         assert_eq!(metrics.input_tokens, Some(45));
@@ -5927,6 +6151,10 @@ mod tests {
         assert!(hints
             .iter()
             .any(|hint| hint == "repeated failed tool attempts"));
+        assert!(hints.iter().any(|hint| hint == "repeated file reads"));
+        assert!(hints
+            .iter()
+            .any(|hint| hint == "repeated Tasker context fetches"));
     }
 
     #[tokio::test]

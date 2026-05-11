@@ -494,13 +494,29 @@ pub fn write_run_detail(mut writer: impl Write, detail: &tasker_db::AgentRunDeta
         {
             writeln!(
                 writer,
-                "  efficiency: tool_calls={} tool_errors={} repeated_failed_tools={} assistant_turns={} user_turns={} max_context_tokens={}",
+                "  efficiency: tool_calls={} tool_errors={} repeated_failed_tools={} repeated_reads={} repeated_tasker_context_fetches={} assistant_turns={} user_turns={} max_context_tokens={}",
                 metrics.tool_call_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
                 metrics.tool_error_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
                 metrics.repeated_failed_tool_attempt_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                metrics.repeated_read_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                metrics.repeated_tasker_context_fetch_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
                 metrics.assistant_turn_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
                 metrics.user_turn_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
                 metrics.max_context_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string())
+            )?;
+        }
+        if metrics.tool_call_counts_json != "{}" {
+            writeln!(
+                writer,
+                "  tool calls by tool: {}",
+                metrics.tool_call_counts_json
+            )?;
+        }
+        if metrics.shell_command_counts_json != "{}" {
+            writeln!(
+                writer,
+                "  shell command categories: {}",
+                metrics.shell_command_counts_json
             )?;
         }
         if let Ok(hints) = serde_json::from_str::<Vec<String>>(&metrics.efficiency_hints_json) {
