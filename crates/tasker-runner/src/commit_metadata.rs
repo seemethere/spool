@@ -1,15 +1,15 @@
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct TaskerCommitTrailers {
+pub struct TaskerCommitTrailers {
     pub task_identifier: Option<String>,
     pub task_queue: Option<String>,
     pub agent_run_id: Option<String>,
 }
 
-pub(crate) const TASKER_TASK_TRAILER: &str = "Tasker-Task";
-pub(crate) const TASKER_QUEUE_TRAILER: &str = "Tasker-Queue";
-pub(crate) const TASKER_AGENT_RUN_TRAILER: &str = "Tasker-Agent-Run";
+pub const TASKER_TASK_TRAILER: &str = "Tasker-Task";
+pub const TASKER_QUEUE_TRAILER: &str = "Tasker-Queue";
+pub const TASKER_AGENT_RUN_TRAILER: &str = "Tasker-Agent-Run";
 
-pub(crate) fn final_commit_message(
+pub fn final_commit_message(
     task_identifier: &str,
     task_title: &str,
     task_queue: &str,
@@ -25,7 +25,7 @@ pub(crate) fn final_commit_message(
     message
 }
 
-pub(crate) fn parse_tasker_commit_trailers(message: &str) -> TaskerCommitTrailers {
+pub fn parse_tasker_commit_trailers(message: &str) -> TaskerCommitTrailers {
     let mut trailers = TaskerCommitTrailers::default();
     for line in message.lines() {
         let Some((key, value)) = line.split_once(':') else {

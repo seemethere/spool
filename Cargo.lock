@@ -2051,6 +2051,8 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "sqlx",
+ "tasker-db",
  "tempfile",
 ]
 

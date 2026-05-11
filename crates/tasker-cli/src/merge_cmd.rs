@@ -1,5 +1,6 @@
 use super::*;
 use crate::status_cmd::integration_recovery_hint;
+use tasker_runner::local_worktree_delivery;
 use tasker_runner::repo_lock;
 
 pub(crate) async fn merge(

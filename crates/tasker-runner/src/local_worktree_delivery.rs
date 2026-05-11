@@ -38,7 +38,7 @@ pub async fn integrate_local_worktree_for_run(
         .with_context(|| format!("Task Queue {} not found", detail.task.task_queue_key))?;
     let task_branch = required_task_link(&detail, "task_branch")?;
     let local_worktree = required_task_link(&detail, "local_worktree")?;
-    let _repo_operation_lock = tasker_runner::repo_lock::acquire_guard(
+    let _repo_operation_lock = crate::repo_lock::acquire_guard(
         data_dir,
         &detail.task.task_queue_key,
         "integration",

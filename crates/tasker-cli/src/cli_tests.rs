@@ -1,6 +1,7 @@
 use std::fs;
 
 use clap::CommandFactory;
+use tasker_runner::commit_metadata;
 
 use super::*;
 

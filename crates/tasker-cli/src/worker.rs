@@ -1178,7 +1178,7 @@ async fn run_agent_gated_integration_if_ready(
     .map(Some)
 }
 
-pub use crate::local_worktree_delivery::{
+pub use tasker_runner::local_worktree_delivery::{
     integrate_local_worktree_for_run, LocalIntegrationResult,
 };
 
