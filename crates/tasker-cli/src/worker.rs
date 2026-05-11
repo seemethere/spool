@@ -613,7 +613,7 @@ fn write_pi_transcript(
 
 const DEFAULT_WORKER_ROLE_PROMPT: &str = "You are a Tasker Worker Agent running unattended. Do not ask questions or open interactive UI. Use the Tasker Pi Extension tools to read and update Tasker state, Workpad Notes, requirements, child tasks, and transitions.";
 
-const WORKER_CONTEXT_BUNDLE_GUIDANCE: &str = "Run-start context discipline:\n- First call the Tasker Pi Extension tool `tasker_get_task_context_bundle` for this Task Identifier before broad file/context discovery, repeated Tasker CLI status/show reads, or Agent Run lookups.\n- Treat that bundle as the preferred source for the Task Brief, Acceptance Criteria, Validation Items, Workpad Note, Task Links, Task Conflict Hints, recent Agent Runs, Task Queue/local workflow context, latest failure summary, and latest Integration Outcome summary.\n- From the bundle, write a short context plan in your own reasoning before reading source files: identify the likely files/ADRs/docs to inspect, what you need from each, and any conflict/overlap risks. Then use targeted `rg`/narrow reads and avoid rereading unchanged files.\n- If the Tasker Pi Extension tool is unavailable, use narrow safe fallback reads only: prefer the repo-local `bin/tasker-local` wrapper from the Managed Source Repository root for `queue show <queue>` preflight and `task show <task>`; avoid bare `tasker`, broad status loops, repeated show commands, raw SQL, or transcript scraping unless the Task explicitly requires them.\n- Do not expose raw Run Transcript bodies, raw launcher payloads, prompt bodies, secrets, or unrelated queue data.";
+const WORKER_CONTEXT_BUNDLE_GUIDANCE: &str = "Run-start context discipline:\n- First call the Tasker Pi Extension tool `tasker_get_task_context_bundle` for this Task Identifier before broad file/context discovery, repeated Tasker CLI status/show reads, or Agent Run lookups.\n- Treat that bundle as the preferred source for the Task Brief, Acceptance Criteria, Validation Items, Workpad Note, Task Links, Task Conflict Hints, recent Agent Runs, Task Queue/local workflow context, latest failure summary, and latest Integration Outcome summary. Structured Tasker fields remain authoritative for gates and scheduling; Workpad Note Markdown is narrative/handoff context.\n- From the bundle, write and maintain a short context plan in your own reasoning before reading source files: identify the likely files/ADRs/docs to inspect, what you need from each, and any conflict/overlap risks. Then use targeted `rg`/`find` narrowing and narrow read ranges instead of broad rereads when revisiting known files. Avoid rereading unchanged files; keep track of files and symbols already inspected.\n- Reread only when necessary for correctness, such as after files changed, while resolving conflicts, or before precise edits that need exact current text. When a reread is necessary, briefly note the reason in reasoning or the Workpad Note handoff.\n- If an Agent Run exceeds efficiency budget warnings, summarize efficiency-relevant behavior in the Workpad Note handoff, including repeated file reads, large transcript/context, excessive shell/tool calls, or repeated Tasker context fetches, alongside summary, changed files, validation, risks, and follow-up Task candidates. These efficiency notes are narrative and do not replace structured Acceptance Criterion or Validation Item statuses.\n- If the Tasker Pi Extension tool is unavailable, use narrow safe fallback reads only: prefer the repo-local `bin/tasker-local` wrapper from the Managed Source Repository root for `queue show <queue>` preflight and `task show <task>`; avoid bare `tasker`, broad status loops, repeated show commands, raw SQL, or transcript scraping unless the Task explicitly requires them.\n- Do not expose raw Run Transcript bodies, raw launcher payloads, prompt bodies, secrets, or unrelated queue data.";
 
 fn build_worker_prompt(
     task: &tasker_db::TaskDetail,
@@ -1257,7 +1257,23 @@ mod tests {
         assert!(prompt.contains("Task Conflict Hints"));
         assert!(prompt.contains("recent Agent Runs"));
         assert!(prompt.contains("Task Queue/local workflow context"));
-        assert!(prompt.contains("short context plan"));
+        assert!(prompt.contains("Structured Tasker fields remain authoritative"));
+        assert!(prompt.contains("Workpad Note Markdown is narrative/handoff context"));
+        assert!(prompt.contains("write and maintain a short context plan"));
+        assert!(prompt.contains("targeted `rg`/`find` narrowing"));
+        assert!(prompt.contains("narrow read ranges"));
+        assert!(prompt.contains("Avoid rereading unchanged files"));
+        assert!(prompt.contains("Reread only when necessary for correctness"));
+        assert!(prompt.contains("after files changed"));
+        assert!(prompt.contains("resolving conflicts"));
+        assert!(prompt.contains("precise edits"));
+        assert!(prompt.contains("briefly note the reason"));
+        assert!(prompt.contains("efficiency budget warnings"));
+        assert!(prompt.contains("repeated file reads"));
+        assert!(prompt.contains("large transcript/context"));
+        assert!(prompt.contains("excessive shell/tool calls"));
+        assert!(prompt.contains("repeated Tasker context fetches"));
+        assert!(prompt.contains("structured Acceptance Criterion or Validation Item statuses"));
         assert!(prompt.contains("bin/tasker-local"));
         assert!(prompt.contains("queue show <queue>"));
         assert!(prompt.contains("preflight"));
@@ -1310,7 +1326,9 @@ mod tests {
 
         assert!(prompt.starts_with("Custom worker instructions."));
         assert!(prompt.contains("tasker_get_task_context_bundle"));
-        assert!(prompt.contains("short context plan"));
+        assert!(prompt.contains("write and maintain a short context plan"));
+        assert!(prompt.contains("Avoid rereading unchanged files"));
+        assert!(prompt.contains("efficiency budget warnings"));
         assert!(prompt.contains("bin/tasker-local"));
     }
 
