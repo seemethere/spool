@@ -3458,6 +3458,8 @@ struct AgentRunMetricsSummary {
     shell_command_counts: std::collections::BTreeMap<String, i64>,
     read_paths: std::collections::HashMap<String, i64>,
     tasker_context_fetch_signatures: std::collections::HashMap<String, i64>,
+    seen_tool_call_ids: std::collections::HashSet<String>,
+    seen_tool_detail_ids: std::collections::HashSet<String>,
     assistant_turn_count: Option<i64>,
     user_turn_count: Option<i64>,
     max_context_tokens: Option<i64>,
@@ -3564,6 +3566,17 @@ impl AgentRunMetricsSummary {
         }
         self.observe_roles_and_usage(value);
         self.observe_tool_event(value);
+        self.observe_nested_tool_events(value);
+    }
+
+    fn observe_nested_tool_events(&mut self, value: &serde_json::Value) {
+        for path in ["/message/content", "/assistantMessageEvent/partial/content"] {
+            if let Some(content) = value.pointer(path).and_then(|value| value.as_array()) {
+                for item in content {
+                    self.observe_tool_event(item);
+                }
+            }
+        }
     }
 
     fn observe_roles_and_usage(&mut self, value: &serde_json::Value) {
@@ -3696,18 +3709,38 @@ impl AgentRunMetricsSummary {
             .to_ascii_lowercase();
         let tool_name = tool_name(value);
         let has_tool_name = tool_name.is_some();
-        let is_tool_call = (type_text.contains("tool")
-            && (type_text.contains("call")
-                || type_text.contains("use")
-                || type_text.contains("start")
-                || type_text.contains("execution")))
-            || type_text == "function_call"
-            || value.get("function_call").is_some();
+        let is_tool_delta = type_text.contains("toolcall_delta")
+            || type_text.contains("tool_call_delta")
+            || type_text.contains("tool_delta");
+        let is_tool_call = !is_tool_delta
+            && ((type_text.contains("tool")
+                && (type_text.contains("call")
+                    || type_text.contains("use")
+                    || type_text.contains("start")
+                    || type_text.contains("execution")))
+                || type_text == "function_call"
+                || value.get("function_call").is_some());
         if is_tool_call {
-            self.tool_call_count = Some(self.tool_call_count.unwrap_or(0) + 1);
+            let call_id = tool_call_id(value);
+            let already_counted = call_id
+                .as_ref()
+                .is_some_and(|call_id| self.seen_tool_call_ids.contains(call_id));
             let name = tool_name.unwrap_or_else(|| "unknown".to_string());
-            *self.tool_call_counts.entry(name.clone()).or_insert(0) += 1;
-            self.observe_tool_call_details(&name, value);
+            if !already_counted {
+                if let Some(call_id) = &call_id {
+                    self.seen_tool_call_ids.insert(call_id.clone());
+                }
+                self.tool_call_count = Some(self.tool_call_count.unwrap_or(0) + 1);
+                *self.tool_call_counts.entry(name.clone()).or_insert(0) += 1;
+            }
+            let details_already_observed = call_id
+                .as_ref()
+                .is_some_and(|call_id| self.seen_tool_detail_ids.contains(call_id));
+            if !details_already_observed && self.observe_tool_call_details(&name, value) {
+                if let Some(call_id) = call_id {
+                    self.seen_tool_detail_ids.insert(call_id);
+                }
+            }
         }
         let status = value
             .get("status")
@@ -3733,7 +3766,7 @@ impl AgentRunMetricsSummary {
         }
     }
 
-    fn observe_tool_call_details(&mut self, name: &str, value: &serde_json::Value) {
+    fn observe_tool_call_details(&mut self, name: &str, value: &serde_json::Value) -> bool {
         let canonical = canonical_tool_name(name);
         if canonical == "read" {
             if let Some(path) = tool_string_arg(value, &["path", "file", "filename"]) {
@@ -3742,7 +3775,9 @@ impl AgentRunMetricsSummary {
                 if *count > 1 {
                     self.repeated_read_count = Some(self.repeated_read_count.unwrap_or(0) + 1);
                 }
+                return true;
             }
+            return false;
         }
         if canonical == "bash" {
             if let Some(command) = tool_string_arg(value, &["command", "cmd"]) {
@@ -3762,7 +3797,9 @@ impl AgentRunMetricsSummary {
                             Some(self.repeated_tasker_context_fetch_count.unwrap_or(0) + 1);
                     }
                 }
+                return true;
             }
+            return false;
         } else if is_tasker_context_tool(&canonical) {
             let count = self
                 .tasker_context_fetch_signatures
@@ -3773,7 +3810,9 @@ impl AgentRunMetricsSummary {
                 self.repeated_tasker_context_fetch_count =
                     Some(self.repeated_tasker_context_fetch_count.unwrap_or(0) + 1);
             }
+            return true;
         }
+        false
     }
 
     fn tool_call_counts_json(&self) -> Result<String> {
@@ -3821,6 +3860,7 @@ impl AgentRunMetricsSummary {
 fn tool_name(value: &serde_json::Value) -> Option<String> {
     let raw = value
         .get("tool_name")
+        .or_else(|| value.get("toolName"))
         .or_else(|| value.get("tool"))
         .or_else(|| value.get("name"))
         .and_then(|value| value.as_str())
@@ -3833,8 +3873,23 @@ fn tool_name(value: &serde_json::Value) -> Option<String> {
             value
                 .pointer("/function_call/name")
                 .and_then(|value| value.as_str())
+        })
+        .or_else(|| {
+            value
+                .pointer("/toolCall/name")
+                .and_then(|value| value.as_str())
         })?;
     Some(sanitize_metric_key(raw))
+}
+
+fn tool_call_id(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("id")
+        .or_else(|| value.get("tool_call_id"))
+        .or_else(|| value.get("toolCallId"))
+        .or_else(|| value.get("call_id"))
+        .and_then(|value| value.as_str())
+        .map(sanitize_metric_key)
 }
 
 fn sanitize_metric_key(raw: &str) -> String {
@@ -3865,6 +3920,7 @@ fn tool_args(value: &serde_json::Value) -> Option<&serde_json::Value> {
         .get("args")
         .or_else(|| value.get("arguments"))
         .or_else(|| value.get("input"))
+        .or_else(|| value.get("partialJson"))
         .or_else(|| value.pointer("/function/arguments"))
         .or_else(|| value.pointer("/function_call/arguments"))
 }
@@ -3912,6 +3968,26 @@ fn shell_command_category(command: &str) -> &'static str {
         || lowered.contains(" grep ")
     {
         "search"
+    } else if lowered.starts_with("ls")
+        || lowered.contains(" ls ")
+        || lowered.starts_with("pwd")
+        || lowered.contains(" pwd")
+        || lowered.starts_with("tree")
+        || lowered.contains(" tree ")
+    {
+        "filesystem"
+    } else if lowered.starts_with("npm ")
+        || lowered.contains(" npm ")
+        || lowered.starts_with("pnpm ")
+        || lowered.contains(" pnpm ")
+        || lowered.starts_with("yarn ")
+        || lowered.contains(" yarn ")
+        || lowered.starts_with("bun ")
+        || lowered.contains(" bun ")
+        || lowered.starts_with("make ")
+        || lowered.contains(" make ")
+    {
+        "package_build"
     } else {
         "other"
     }
@@ -3930,6 +4006,11 @@ fn tasker_context_fetch_signature(command: &str) -> Option<String> {
         || normalized.contains("queue show")
     {
         "queue_show"
+    } else if normalized.contains("tasker-local run show")
+        || normalized.contains("tasker run show")
+        || normalized.contains("run show")
+    {
+        "run_show"
     } else if normalized.contains("tasker-local status")
         || normalized.contains("tasker status")
         || normalized == "status"
@@ -6505,7 +6586,7 @@ mod tests {
             serde_json::json!({
                 "launcher":"pi",
                 "status":0,
-                "stdout":"{\"role\":\"user\",\"content\":\"brief\"}\n{\"role\":\"assistant\",\"content\":\"plan\",\"usage\":{\"input_tokens\":30,\"output_tokens\":12,\"total_tokens\":42}}\n{\"type\":\"message_update\",\"assistantMessageEvent\":{\"partial\":{\"usage\":{\"input\":45,\"output\":15,\"totalTokens\":60,\"cacheRead\":1000,\"cacheWrite\":50}}}}\n{\"type\":\"tool_call\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"bin/tasker-local task show TASK-1\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"bin/tasker-local task show TASK-1\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"tasker status\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"tasker status\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"edit\",\"args\":{}}\n{\"type\":\"tool_call\",\"tool_name\":\"write\",\"args\":{}}\n{\"type\":\"tool_call\",\"tool_name\":\"tasker.get_task_context\",\"args\":{}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"cargo test -p tasker-db\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"git status --short\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"rg telemetry crates\"}}\n{\"type\":\"tool_error\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"},\"status\":\"error\"}\n{\"type\":\"tool_error\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"},\"status\":\"error\"}\n{\"type\":\"agent_end\"}\n",
+                "stdout":"{\"role\":\"user\",\"content\":\"brief\"}\n{\"role\":\"assistant\",\"content\":\"plan\",\"usage\":{\"input_tokens\":30,\"output_tokens\":12,\"total_tokens\":42}}\n{\"type\":\"message_update\",\"assistantMessageEvent\":{\"partial\":{\"usage\":{\"input\":45,\"output\":15,\"totalTokens\":60,\"cacheRead\":1000,\"cacheWrite\":50}}}}\n{\"type\":\"tool_call\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"bin/tasker-local task show TASK-1\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"bin/tasker-local task show TASK-1\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"tasker status\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"tasker status\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"edit\",\"args\":{}}\n{\"type\":\"tool_call\",\"tool_name\":\"write\",\"args\":{}}\n{\"type\":\"tool_call\",\"tool_name\":\"tasker.get_task_context\",\"args\":{}}\n{\"type\":\"message_update\",\"message\":{\"content\":[{\"type\":\"toolCall\",\"id\":\"call-read-1\",\"name\":\"read\",\"partialJson\":\"\"},{\"type\":\"toolCall\",\"id\":\"call-read-1\",\"name\":\"read\",\"partialJson\":\"{\\\"path\\\":\\\"CONTEXT.md\\\"}\"},{\"type\":\"toolCall\",\"id\":\"call-read-2\",\"name\":\"read\",\"partialJson\":\"{\\\"path\\\":\\\"CONTEXT.md\\\"}\"}]}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"cargo test -p tasker-db\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"git status --short\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"rg telemetry crates\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"ls crates\"}}\n{\"type\":\"tool_call\",\"tool_name\":\"bash\",\"args\":{\"command\":\"bun test\"}}\n{\"type\":\"tool_error\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"},\"status\":\"error\"}\n{\"type\":\"tool_error\",\"tool_name\":\"read\",\"args\":{\"path\":\"src/lib.rs\"},\"status\":\"error\"}\n{\"type\":\"agent_end\"}\n",
                 "stderr":"",
                 "unattended_question_detected":false,
                 "timed_out":false
@@ -6558,15 +6639,15 @@ mod tests {
         assert_eq!(metrics.timed_out, Some(0));
         assert_eq!(metrics.unattended_question_detected, Some(0));
         assert_eq!(metrics.transcript_jsonl_event_count, Some(1));
-        assert_eq!(metrics.tool_call_count, Some(12));
+        assert_eq!(metrics.tool_call_count, Some(16));
         assert_eq!(metrics.tool_error_count, Some(2));
         assert_eq!(metrics.repeated_failed_tool_attempt_count, Some(1));
-        assert_eq!(metrics.repeated_read_count, Some(1));
+        assert_eq!(metrics.repeated_read_count, Some(2));
         assert_eq!(metrics.repeated_tasker_context_fetch_count, Some(2));
         let tool_counts: std::collections::BTreeMap<String, i64> =
             serde_json::from_str(&metrics.tool_call_counts_json).expect("tool counts");
-        assert_eq!(tool_counts.get("read"), Some(&2));
-        assert_eq!(tool_counts.get("bash"), Some(&7));
+        assert_eq!(tool_counts.get("read"), Some(&4));
+        assert_eq!(tool_counts.get("bash"), Some(&9));
         assert_eq!(tool_counts.get("edit"), Some(&1));
         assert_eq!(tool_counts.get("write"), Some(&1));
         assert_eq!(tool_counts.get("tasker.get_task_context"), Some(&1));
@@ -6576,6 +6657,8 @@ mod tests {
         assert_eq!(shell_counts.get("cargo"), Some(&1));
         assert_eq!(shell_counts.get("git"), Some(&1));
         assert_eq!(shell_counts.get("search"), Some(&1));
+        assert_eq!(shell_counts.get("filesystem"), Some(&1));
+        assert_eq!(shell_counts.get("package_build"), Some(&1));
         assert_eq!(metrics.assistant_turn_count, Some(1));
         assert_eq!(metrics.user_turn_count, Some(1));
         assert_eq!(metrics.input_tokens, Some(45));
