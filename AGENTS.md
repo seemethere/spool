@@ -69,6 +69,29 @@ Temporary dogfooding escape hatches are allowed only when clearly marked:
 
 These do not replace the target model.
 
+## Agent efficiency rules
+
+Efficiency is a first-class dogfooding concern. Optimize for fewer tokens, fewer tool calls, and less repeated context discovery while preserving correctness.
+
+Before broad exploration:
+
+- Read `CONTEXT.md`, `ROADMAP.md`, and only the ADRs/docs relevant to the Task area.
+- Use the Task Brief, Acceptance Criteria, Validation Items, Task Links, Workpad Note, and Task Conflict Hints to make a short context plan before reading many files.
+- Prefer targeted `rg`/`find` queries and narrow `read` ranges over opening large files end-to-end.
+- Avoid rereading unchanged files. Keep notes in your reasoning about files and symbols already inspected.
+- Avoid broad SQL, transcript parsing, or repeated `tasker status`/`task show` loops unless the Task is explicitly about observability or telemetry.
+
+During implementation:
+
+- Start with the smallest plausible change that satisfies the Acceptance Criteria.
+- Prefer focused deterministic tests over full-suite runs until the final validation step.
+- Do not run expensive commands repeatedly after unrelated edits; batch validation when safe.
+- Keep Workpad Notes concise: summary, changed files, validation, risks, and follow-up Task candidates.
+
+For Tasker workflow updates, prefer Tasker Pi Extension tools when available. Use `bin/tasker-local` for operator/debug reads and fallback workflow mutations only when needed.
+
+When investigating efficiency, cite numeric summaries and local artifact paths, not raw prompt bodies, raw transcripts, secrets, or large pasted logs. Token/cache/context metrics are local-only and should come from Tasker telemetry when available.
+
 ## Project dogfooding command safety
 
 Project dogfooding commands must use the project Tasker database, not the default user Tasker database. Prefer the repo-local `bin/tasker-local` wrapper for project dogfood CLI reads and operator/debug commands. It runs `cargo run -p tasker-cli --bin tasker` from the Managed Source Repository root with the repository's `.tasker/config.toml`, so the CLI rebuilds automatically when needed. This favors correctness over fastest startup during dogfooding; there is no separate fast path currently.
