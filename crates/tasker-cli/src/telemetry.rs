@@ -1159,6 +1159,11 @@ pub fn render_summary(summary: &TelemetrySummary) -> String {
         render_count_summaries(&summary.efficiency.top_shell_command_categories)
     )
     .expect("write string");
+    writeln!(
+        output,
+        "  note: shell command categories are sanitized local proxy counts; raw commands, command arguments, and command output are not exported"
+    )
+    .expect("write string");
     if !summary.efficiency.inefficient_runs.is_empty() {
         writeln!(output, "optimization hints and budget warnings:").expect("write string");
         for run in &summary.efficiency.inefficient_runs {
@@ -2021,7 +2026,7 @@ fn trend_cautions(before: &TrendBucket, after: &TrendBucket) -> Vec<String> {
             before.agent_runs, after.agent_runs
         ),
         "exact-token coverage may be partial; zero token totals can mean unavailable metrics, not zero usage".to_string(),
-        "tool-call, shell-category, transcript-byte, and context metrics are local proxies and should not be treated as billing or secret-bearing data".to_string(),
+        "tool-call, shell-category, transcript-byte, and context metrics are sanitized local proxies; raw shell commands, command arguments, and command output are not exported".to_string(),
     ];
     if before.runs_with_metrics < before.agent_runs || after.runs_with_metrics < after.agent_runs {
         cautions.push(format!(
@@ -2455,7 +2460,7 @@ mod tests {
                 assistant_turn_count, user_turn_count, max_context_tokens, efficiency_hints_json
             ) VALUES ('run-2', 'pi', 'completed', 42, 6, 2,
                 '{"read":13,"bash":25,"edit":4}', 3, 2,
-                '{"tasker_cli":7,"cargo":3,"git":2,"search":8,"sqlite":4,"process":3,"text_processing":6,"package_build":2,"miscellaneous":1}',
+                '{"tasker_cli":7,"cargo_build_test":3,"git":2,"search":8,"database":4,"process_supervisor":3,"text_processing":6,"package_manager":2,"miscellaneous":1,"other":5}',
                 9, 4, 123456,
                 '["excessive tool calls","repeated failed tool attempts","repeated file reads","repeated Tasker context fetches","large context growth","validation/tool loop"]')
             "#,
@@ -2515,6 +2520,7 @@ mod tests {
             json["efficiency"]["shell_command_counts"]["miscellaneous"],
             1
         );
+        assert_eq!(json["efficiency"]["shell_command_counts"]["other"], 5);
         assert_eq!(
             json["efficiency"]["top_shell_command_categories"][0]["category"],
             "search"
@@ -2538,6 +2544,7 @@ mod tests {
         assert!(rendered.contains("tool calls by tool: bash=25"));
         assert!(rendered.contains("shell command categories:"));
         assert!(rendered.contains("top shell command categories: search=8"));
+        assert!(rendered.contains("other=5"));
         assert!(rendered.contains("repeated_reads=3"));
         assert!(rendered.contains("optimization hints and budget warnings:"));
         assert!(rendered.contains("max_context_tokens:severe"));
@@ -2955,7 +2962,7 @@ mod tests {
                 90_000,
                 100_000,
                 2_000,
-                r#"{"tasker_cli":4,"search":3}"#,
+                r#"{"tasker_cli":4,"search":3,"other":2}"#,
             ),
             (
                 "before-2",
@@ -2965,7 +2972,7 @@ mod tests {
                 70_000,
                 80_000,
                 1_000,
-                r#"{"tasker_cli":2,"cargo":1}"#,
+                r#"{"tasker_cli":2,"cargo_build_test":1}"#,
             ),
             (
                 "after-1",
@@ -2975,7 +2982,7 @@ mod tests {
                 40_000,
                 50_000,
                 500,
-                r#"{"tasker_cli":1,"search":1}"#,
+                r#"{"tasker_cli":1,"search":1,"miscellaneous":1}"#,
             ),
         ] {
             sqlx::query(
@@ -3051,6 +3058,11 @@ mod tests {
         assert_eq!(landing.after.repeated_tasker_context_fetches, 0);
         assert_eq!(landing.deltas.total_tokens, -120_000);
         assert_eq!(landing.deltas.max_context_tokens, Some(-50_000));
+        assert_eq!(landing.before.shell_command_counts.get("other"), Some(&2));
+        assert_eq!(
+            landing.after.shell_command_counts.get("miscellaneous"),
+            Some(&1)
+        );
         assert_eq!(landing.before.duplicate_agent_run_waste, 1);
         assert_eq!(landing.after.duplicate_agent_run_waste, 0);
         assert_eq!(
@@ -3085,6 +3097,7 @@ mod tests {
         assert!(rendered.contains("Efficiency trend telemetry"));
         assert!(rendered.contains("cautions:"));
         assert!(rendered.contains("Integration Outcome reasons"));
+        assert!(rendered.contains("other=2"));
     }
 
     #[tokio::test]

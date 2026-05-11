@@ -417,7 +417,7 @@ enum TelemetryCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Summarize Agent Run waste and latency for a Task Queue.
+    /// Summarize Agent Run waste, latency, and sanitized local proxy efficiency metrics for a Task Queue.
     Summary {
         /// Task Queue Key to summarize.
         #[arg(long)]
@@ -456,7 +456,7 @@ enum TelemetryCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Compare Agent Run efficiency trends around dogfood landing points.
+    /// Compare sanitized local proxy Agent Run efficiency trends around dogfood landing points.
     Trend {
         /// Task Queue Key to summarize.
         #[arg(long)]

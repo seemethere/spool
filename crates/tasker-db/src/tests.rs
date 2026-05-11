@@ -2369,13 +2369,13 @@ async fn persists_agent_run_metrics_for_pi_launcher_outcome() {
     let shell_counts: std::collections::BTreeMap<String, i64> =
         serde_json::from_str(&metrics.shell_command_counts_json).expect("shell counts");
     assert_eq!(shell_counts.get("tasker_cli"), Some(&4));
-    assert_eq!(shell_counts.get("cargo"), Some(&1));
+    assert_eq!(shell_counts.get("cargo_build_test"), Some(&1));
     assert_eq!(shell_counts.get("git"), Some(&1));
     assert_eq!(shell_counts.get("search"), Some(&1));
-    assert_eq!(shell_counts.get("filesystem"), Some(&1));
-    assert_eq!(shell_counts.get("package_build"), Some(&1));
-    assert_eq!(shell_counts.get("sqlite"), Some(&1));
-    assert_eq!(shell_counts.get("process"), Some(&1));
+    assert_eq!(shell_counts.get("file_inspection"), Some(&1));
+    assert_eq!(shell_counts.get("package_manager"), Some(&1));
+    assert_eq!(shell_counts.get("database"), Some(&1));
+    assert_eq!(shell_counts.get("process_supervisor"), Some(&1));
     assert_eq!(shell_counts.get("text_processing"), Some(&1));
     assert_eq!(shell_counts.get("miscellaneous"), Some(&1));
     assert_eq!(shell_counts.get("other"), None);

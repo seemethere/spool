@@ -839,7 +839,7 @@ fn shell_command_category(command: &str) -> &'static str {
             .iter()
             .any(|token| matches!(token.as_str(), "cargo-nextest" | "nextest"))
     {
-        "cargo"
+        "cargo_build_test"
     } else if has_shell_invocation(&tokens, &["git"])
         || tokens
             .iter()
@@ -862,7 +862,7 @@ fn shell_command_category(command: &str) -> &'static str {
             "supervisorctl",
         ],
     ) {
-        "process"
+        "process_supervisor"
     } else if has_shell_invocation(
         &tokens,
         &["rg", "ripgrep", "grep", "egrep", "fgrep", "find", "fd"],
@@ -875,7 +875,7 @@ fn shell_command_category(command: &str) -> &'static str {
             "rmdir", "cp", "mv", "rm", "touch",
         ],
     ) {
-        "filesystem"
+        "file_inspection"
     } else if has_shell_invocation(
         &tokens,
         &[
@@ -883,13 +883,13 @@ fn shell_command_category(command: &str) -> &'static str {
             "webpack",
         ],
     ) {
-        "package_build"
+        "package_manager"
     } else if has_shell_invocation(&tokens, &["sqlite3", "sqlx"])
         || tokens
             .iter()
             .any(|token| matches!(token.as_str(), "sqlite" | "sqlite-utils"))
     {
-        "sqlite"
+        "database"
     } else if has_shell_invocation(
         &tokens,
         &[
@@ -1075,26 +1075,29 @@ mod shell_command_category_tests {
     fn classifies_common_dogfood_shell_commands_without_raw_command_storage() {
         let cases = [
             ("bin/tasker-local task show TASKER-86", "tasker_cli"),
-            ("cargo test -p tasker-db agent_run_metrics", "cargo"),
+            (
+                "cargo test -p tasker-db agent_run_metrics",
+                "cargo_build_test",
+            ),
             (
                 "cargo clippy -p tasker-cli --all-targets -- -D warnings",
-                "cargo",
+                "cargo_build_test",
             ),
             ("git status --short", "git"),
             ("rg telemetry crates", "search"),
             ("find crates -name '*.rs'", "search"),
-            ("ls -la && stat Cargo.toml", "filesystem"),
+            ("ls -la && stat Cargo.toml", "file_inspection"),
             (
                 "sqlite3 .tasker/data/tasker.db 'select count(*) from tasks'",
-                "sqlite",
+                "database",
             ),
-            ("ps aux | grep tasker", "process"),
-            ("pgrep -fl tasker", "process"),
+            ("ps aux | grep tasker", "process_supervisor"),
+            ("pgrep -fl tasker", "process_supervisor"),
             ("jq '.efficiency' summary.json", "text_processing"),
             ("sed -n '1,20p' CONTEXT.md", "text_processing"),
             ("awk '{print $1}' counts.txt", "text_processing"),
-            ("pnpm build", "package_build"),
-            ("make test", "package_build"),
+            ("pnpm build", "package_manager"),
+            ("make test", "package_manager"),
             ("python scripts/one_off.py", "miscellaneous"),
         ];
 
