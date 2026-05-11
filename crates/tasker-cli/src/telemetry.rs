@@ -299,6 +299,12 @@ pub struct TelemetryRun {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CountSummary {
+    pub category: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EfficiencyTelemetrySummary {
     pub runs_with_metrics: usize,
     pub total_tool_calls: i64,
@@ -308,6 +314,7 @@ pub struct EfficiencyTelemetrySummary {
     pub total_repeated_reads: i64,
     pub total_repeated_tasker_context_fetches: i64,
     pub shell_command_counts: BTreeMap<String, i64>,
+    pub top_shell_command_categories: Vec<CountSummary>,
     pub total_assistant_turns: i64,
     pub total_user_turns: i64,
     pub max_input_tokens: Option<i64>,
@@ -890,6 +897,36 @@ fn render_counts(counts: &BTreeMap<String, i64>) -> String {
     }
 }
 
+fn render_count_summaries(counts: &[CountSummary]) -> String {
+    if counts.is_empty() {
+        "none".to_string()
+    } else {
+        counts
+            .iter()
+            .map(|entry| format!("{}={}", entry.category, entry.count))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn top_counts(counts: &BTreeMap<String, i64>, limit: usize) -> Vec<CountSummary> {
+    let mut entries = counts
+        .iter()
+        .map(|(category, count)| CountSummary {
+            category: category.clone(),
+            count: *count,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.category.cmp(&right.category))
+    });
+    entries.truncate(limit);
+    entries
+}
+
 fn build_efficiency_summary(rows: &[TelemetryRunRow]) -> EfficiencyTelemetrySummary {
     let mut summary = EfficiencyTelemetrySummary {
         runs_with_metrics: 0,
@@ -900,6 +937,7 @@ fn build_efficiency_summary(rows: &[TelemetryRunRow]) -> EfficiencyTelemetrySumm
         total_repeated_reads: 0,
         total_repeated_tasker_context_fetches: 0,
         shell_command_counts: BTreeMap::new(),
+        top_shell_command_categories: Vec::new(),
         total_assistant_turns: 0,
         total_user_turns: 0,
         max_input_tokens: None,
@@ -981,6 +1019,7 @@ fn build_efficiency_summary(rows: &[TelemetryRunRow]) -> EfficiencyTelemetrySumm
             summary.inefficient_runs.push(run_from_row(row));
         }
     }
+    summary.top_shell_command_categories = top_counts(&summary.shell_command_counts, 10);
     summary.inefficient_runs.sort_by(|left, right| {
         right
             .tool_call_count
@@ -1110,6 +1149,12 @@ pub fn render_summary(summary: &TelemetrySummary) -> String {
         output,
         "  shell command categories: {}",
         render_counts(&summary.efficiency.shell_command_counts)
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "  top shell command categories: {}",
+        render_count_summaries(&summary.efficiency.top_shell_command_categories)
     )
     .expect("write string");
     if !summary.efficiency.inefficient_runs.is_empty() {
@@ -1911,7 +1956,7 @@ mod tests {
                 assistant_turn_count, user_turn_count, max_context_tokens, efficiency_hints_json
             ) VALUES ('run-2', 'pi', 'completed', 42, 6, 2,
                 '{"read":13,"bash":25,"edit":4}', 3, 2,
-                '{"tasker_cli":7,"cargo":3,"git":2,"search":8,"other":5}',
+                '{"tasker_cli":7,"cargo":3,"git":2,"search":8,"sqlite":4,"process":3,"text_processing":6,"package_build":2,"miscellaneous":1}',
                 9, 4, 123456,
                 '["excessive tool calls","repeated failed tool attempts","repeated file reads","repeated Tasker context fetches","large context growth","validation/tool loop"]')
             "#,
@@ -1967,6 +2012,18 @@ mod tests {
         assert_eq!(json["efficiency"]["tool_call_counts"]["bash"], 25);
         assert_eq!(json["efficiency"]["total_repeated_reads"], 3);
         assert_eq!(json["efficiency"]["shell_command_counts"]["search"], 8);
+        assert_eq!(
+            json["efficiency"]["shell_command_counts"]["miscellaneous"],
+            1
+        );
+        assert_eq!(
+            json["efficiency"]["top_shell_command_categories"][0]["category"],
+            "search"
+        );
+        assert_eq!(
+            json["efficiency"]["top_shell_command_categories"][0]["count"],
+            8
+        );
         assert!(json.to_string().contains("excessive tool calls"));
         assert_eq!(
             json["efficiency"]["inefficient_runs"][0]["budget_status"]["warnings"][0]["level"],
@@ -1981,6 +2038,7 @@ mod tests {
         assert!(rendered.contains("post-Integrating Agent Runs: 1"));
         assert!(rendered.contains("tool calls by tool: bash=25"));
         assert!(rendered.contains("shell command categories:"));
+        assert!(rendered.contains("top shell command categories: search=8"));
         assert!(rendered.contains("repeated_reads=3"));
         assert!(rendered.contains("optimization hints and budget warnings:"));
         assert!(rendered.contains("max_context_tokens:severe"));

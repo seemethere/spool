@@ -812,46 +812,156 @@ fn string_arg_from_object(value: &serde_json::Value, keys: &[&str]) -> Option<St
 
 fn shell_command_category(command: &str) -> &'static str {
     let lowered = command.trim_start().to_ascii_lowercase();
-    if lowered.contains("tasker-local")
-        || lowered.starts_with("tasker ")
-        || lowered.contains(" tasker ")
-        || lowered.contains("cargo run -p tasker-cli")
+    let tokens = shell_command_tokens(&lowered);
+    if tokens.iter().any(|token| token == "tasker-local")
+        || is_direct_tasker_invocation(&lowered)
+        || tokens.windows(4).any(|window| {
+            window[0] == "cargo"
+                && window[1] == "run"
+                && matches!(window[2].as_str(), "-p" | "--package")
+                && window[3] == "tasker-cli"
+        })
     {
         "tasker_cli"
-    } else if lowered.starts_with("cargo ") || lowered.contains(" cargo ") {
+    } else if has_shell_invocation(&tokens, &["cargo"])
+        || tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "cargo-nextest" | "nextest"))
+    {
         "cargo"
-    } else if lowered.starts_with("git ") || lowered.contains(" git ") {
+    } else if has_shell_invocation(&tokens, &["git"])
+        || tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "gh" | "git-lfs"))
+    {
         "git"
-    } else if lowered.starts_with("rg ")
-        || lowered.contains(" rg ")
-        || lowered.starts_with("find ")
-        || lowered.contains(" find ")
-        || lowered.starts_with("grep ")
-        || lowered.contains(" grep ")
-    {
+    } else if has_shell_invocation(
+        &tokens,
+        &[
+            "ps",
+            "pgrep",
+            "pkill",
+            "kill",
+            "killall",
+            "jobs",
+            "lsof",
+            "top",
+            "htop",
+            "launchctl",
+            "supervisorctl",
+        ],
+    ) {
+        "process"
+    } else if has_shell_invocation(
+        &tokens,
+        &["rg", "ripgrep", "grep", "egrep", "fgrep", "find", "fd"],
+    ) {
         "search"
-    } else if lowered.starts_with("ls")
-        || lowered.contains(" ls ")
-        || lowered.starts_with("pwd")
-        || lowered.contains(" pwd")
-        || lowered.starts_with("tree")
-        || lowered.contains(" tree ")
-    {
+    } else if has_shell_invocation(
+        &tokens,
+        &[
+            "ls", "pwd", "tree", "stat", "du", "df", "realpath", "dirname", "basename", "mkdir",
+            "rmdir", "cp", "mv", "rm", "touch",
+        ],
+    ) {
         "filesystem"
-    } else if lowered.starts_with("npm ")
-        || lowered.contains(" npm ")
-        || lowered.starts_with("pnpm ")
-        || lowered.contains(" pnpm ")
-        || lowered.starts_with("yarn ")
-        || lowered.contains(" yarn ")
-        || lowered.starts_with("bun ")
-        || lowered.contains(" bun ")
-        || lowered.starts_with("make ")
-        || lowered.contains(" make ")
-    {
+    } else if has_shell_invocation(
+        &tokens,
+        &[
+            "npm", "pnpm", "yarn", "bun", "make", "just", "cmake", "ninja", "node", "tsc", "vite",
+            "webpack",
+        ],
+    ) {
         "package_build"
+    } else if has_shell_invocation(&tokens, &["sqlite3", "sqlx"])
+        || tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "sqlite" | "sqlite-utils"))
+    {
+        "sqlite"
+    } else if has_shell_invocation(
+        &tokens,
+        &[
+            "jq", "sed", "awk", "cut", "sort", "uniq", "wc", "head", "tail", "tr", "xargs", "tee",
+            "cat",
+        ],
+    ) {
+        "text_processing"
     } else {
-        "other"
+        "miscellaneous"
+    }
+}
+
+fn is_direct_tasker_invocation(command: &str) -> bool {
+    let trimmed = command.trim_start_matches(|ch: char| ch.is_ascii_whitespace() || ch == '(');
+    trimmed.starts_with("tasker ")
+        || trimmed.contains("&& tasker ")
+        || trimmed.contains("; tasker ")
+        || trimmed.contains("| tasker ")
+}
+
+fn shell_command_tokens(command: &str) -> Vec<String> {
+    command
+        .split(|ch: char| {
+            ch.is_ascii_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')' | '<' | '>' | '`')
+        })
+        .filter_map(|raw| {
+            let trimmed =
+                raw.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '[' | ']' | '{' | '}' | ','));
+            if trimmed.is_empty() || trimmed.contains('=') && !trimmed.starts_with('-') {
+                return None;
+            }
+            let basename = trimmed.rsplit('/').next().unwrap_or(trimmed);
+            let command_name = basename.strip_suffix(':').unwrap_or(basename);
+            if command_name.is_empty() {
+                None
+            } else {
+                Some(command_name.to_string())
+            }
+        })
+        .collect()
+}
+
+fn has_shell_invocation(tokens: &[String], commands: &[&str]) -> bool {
+    tokens
+        .iter()
+        .any(|token| commands.contains(&token.as_str()))
+}
+
+#[cfg(test)]
+mod shell_command_category_tests {
+    use super::shell_command_category;
+
+    #[test]
+    fn classifies_common_dogfood_shell_commands_without_raw_command_storage() {
+        let cases = [
+            ("bin/tasker-local task show TASKER-86", "tasker_cli"),
+            ("cargo test -p tasker-db agent_run_metrics", "cargo"),
+            (
+                "cargo clippy -p tasker-cli --all-targets -- -D warnings",
+                "cargo",
+            ),
+            ("git status --short", "git"),
+            ("rg telemetry crates", "search"),
+            ("find crates -name '*.rs'", "search"),
+            ("ls -la && stat Cargo.toml", "filesystem"),
+            (
+                "sqlite3 .tasker/data/tasker.db 'select count(*) from tasks'",
+                "sqlite",
+            ),
+            ("ps aux | grep tasker", "process"),
+            ("pgrep -fl tasker", "process"),
+            ("jq '.efficiency' summary.json", "text_processing"),
+            ("sed -n '1,20p' CONTEXT.md", "text_processing"),
+            ("awk '{print $1}' counts.txt", "text_processing"),
+            ("pnpm build", "package_build"),
+            ("make test", "package_build"),
+            ("python scripts/one_off.py", "miscellaneous"),
+        ];
+
+        for (command, expected) in cases {
+            assert_eq!(shell_command_category(command), expected, "{command}");
+        }
     }
 }
 
