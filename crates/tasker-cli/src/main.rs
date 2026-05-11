@@ -1411,6 +1411,7 @@ struct QueueTelemetry<'a> {
     state_counts: Vec<StateCount<'a>>,
     active_runs: Vec<&'a tasker_db::ActiveAgentRunStatus>,
     ready_task_summaries: Vec<&'a tasker_db::TaskStatusSummary>,
+    rework_task_summaries: Vec<&'a tasker_db::TaskStatusSummary>,
     integrating_task_summaries: Vec<&'a tasker_db::TaskStatusSummary>,
     advisory_conflict_hints: Vec<&'a tasker_db::TaskConflictGroup>,
     retry_holds: Vec<&'a tasker_db::ActiveRetryHoldStatus>,
@@ -1471,6 +1472,10 @@ fn build_status_telemetry<'a>(
                 .iter()
                 .filter(|task| task.queue_key == row.queue_key && task.state == "ready")
                 .collect(),
+            rework_task_summaries: status_tasks
+                .iter()
+                .filter(|task| task.queue_key == row.queue_key && task.state == "rework")
+                .collect(),
             integrating_task_summaries: status_tasks
                 .iter()
                 .filter(|task| task.queue_key == row.queue_key && task.state == "integrating")
@@ -1508,7 +1513,7 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool, json: bool) -> Re
     let active_runs = tasker_db::active_agent_runs_for_status(&pool).await?;
     let active_holds = tasker_db::active_retry_holds_for_status(&pool).await?;
     let status_tasks =
-        tasker_db::tasks_for_status_by_states(&pool, &["ready", "integrating"]).await?;
+        tasker_db::tasks_for_status_by_states(&pool, &["ready", "rework", "integrating"]).await?;
     let conflict_groups = tasker_db::task_conflict_groups_for_status(&pool).await?;
     let integration_retries = tasker_db::integration_retries_for_status(&pool).await?;
 
@@ -1579,7 +1584,7 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool, json: bool) -> Re
                     run.lease_expires_at
                 );
             }
-            for state in ["ready", "integrating"] {
+            for state in ["ready", "rework", "integrating"] {
                 let queue_tasks: Vec<_> = status_tasks
                     .iter()
                     .filter(|task| task.queue_key == row.queue_key && task.state == state)
@@ -1588,10 +1593,24 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool, json: bool) -> Re
                     println!("  {state} Task summaries:");
                     for task in queue_tasks {
                         println!(
-                            "    {}\tpriority={}",
+                            "    {}\tpriority={}\tlocal_worktree={}",
                             display::task_label(&task.identifier, &task.title, 64),
-                            task.priority
+                            task.priority,
+                            local_worktree_status(
+                                task.local_worktree.as_deref(),
+                                task.task_branch.as_deref(),
+                                &task.main_branch,
+                            )
                         );
+                        if state == "rework" {
+                            println!(
+                                "      Rework reason: code={} reason={}",
+                                task.latest_rework_reason_code
+                                    .as_deref()
+                                    .unwrap_or("unknown_legacy"),
+                                task.latest_rework_reason.as_deref().unwrap_or("")
+                            );
+                        }
                     }
                 }
             }
@@ -1666,6 +1685,47 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool, json: bool) -> Re
     }
 
     Ok(())
+}
+
+fn local_worktree_status(
+    local_worktree: Option<&str>,
+    task_branch: Option<&str>,
+    main_branch: &str,
+) -> String {
+    let Some(path) = local_worktree else {
+        return "missing Task Link".to_string();
+    };
+    let worktree = Path::new(path);
+    if !worktree.exists() {
+        return format!("missing ({path})");
+    }
+
+    let cleanliness = match git_output(worktree, &["status", "--porcelain"]) {
+        Ok(status) if status.trim().is_empty() => "clean".to_string(),
+        Ok(_) => "dirty".to_string(),
+        Err(_) => "exists, git status unavailable".to_string(),
+    };
+    let branch = git_output(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .ok()
+        .map(|branch| branch.trim().to_string());
+    let branch_note = match (branch.as_deref(), task_branch) {
+        (Some(actual), Some(expected)) if actual != expected => {
+            format!(" branch={actual} expected={expected}")
+        }
+        (Some(actual), _) => format!(" branch={actual}"),
+        (None, Some(expected)) => format!(" branch=unknown expected={expected}"),
+        (None, None) => " branch=unknown".to_string(),
+    };
+    let includes_main = match git_status(
+        worktree,
+        &["merge-base", "--is-ancestor", main_branch, "HEAD"],
+    ) {
+        Ok(status) if status.success() => "yes",
+        Ok(_) => "no",
+        Err(_) => "unknown",
+    };
+
+    format!("{cleanliness}{branch_note} includes_main={includes_main} ({path})")
 }
 
 fn integration_recovery_hint(reason_code: &str) -> &'static str {
@@ -3595,6 +3655,11 @@ mod tests {
             title: "Ready task".to_string(),
             state: "ready".to_string(),
             priority: "normal".to_string(),
+            local_worktree: None,
+            task_branch: None,
+            main_branch: "main".to_string(),
+            latest_rework_reason_code: None,
+            latest_rework_reason: None,
         }];
         let conflicts = vec![tasker_db::TaskConflictGroup {
             queue_key: "TASK".to_string(),

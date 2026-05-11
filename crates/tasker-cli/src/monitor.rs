@@ -1,7 +1,8 @@
 use std::{
     collections::BTreeMap,
     io::{self, IsTerminal, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::Command as ProcessCommand,
     time::Duration,
 };
 
@@ -57,6 +58,7 @@ pub struct QueueSnapshot {
     pub active_runs: Vec<tasker_db::ActiveAgentRunStatus>,
     pub retry_holds: Vec<tasker_db::ActiveRetryHoldStatus>,
     pub ready_tasks: Vec<tasker_db::TaskStatusSummary>,
+    pub rework_tasks: Vec<tasker_db::TaskStatusSummary>,
     pub integrating_tasks: Vec<tasker_db::TaskStatusSummary>,
     pub integration_retries: Vec<tasker_db::IntegrationRetryStatus>,
     pub repo_operation_lock: Option<String>,
@@ -354,6 +356,28 @@ fn attention_lines(snapshot: &MonitorSnapshot) -> Vec<Line<'static>> {
                 ));
             }
         }
+        for task in &queue.rework_tasks {
+            lines.push(attention_line(
+                "↻",
+                "rework",
+                format!(
+                    "{} code={} local_worktree={}{}",
+                    compact_task_label(&task.identifier, &task.title, 44),
+                    task.latest_rework_reason_code
+                        .as_deref()
+                        .unwrap_or("unknown_legacy"),
+                    local_worktree_status(
+                        task.local_worktree.as_deref(),
+                        task.task_branch.as_deref(),
+                        &task.main_branch,
+                    ),
+                    task.latest_rework_reason
+                        .as_deref()
+                        .map(|reason| format!(" — {reason}"))
+                        .unwrap_or_default()
+                ),
+            ));
+        }
         for hold in &queue.retry_holds {
             lines.push(attention_line(
                 "⏸",
@@ -436,6 +460,24 @@ fn attention_texts(snapshot: &MonitorSnapshot) -> Vec<String> {
                 ));
             }
         }
+        for task in &queue.rework_tasks {
+            lines.push(format!(
+                "rework: {} code={} local_worktree={}{}",
+                compact_task_label(&task.identifier, &task.title, 64),
+                task.latest_rework_reason_code
+                    .as_deref()
+                    .unwrap_or("unknown_legacy"),
+                local_worktree_status(
+                    task.local_worktree.as_deref(),
+                    task.task_branch.as_deref(),
+                    &task.main_branch,
+                ),
+                task.latest_rework_reason
+                    .as_deref()
+                    .map(|reason| format!(" — {reason}"))
+                    .unwrap_or_default()
+            ));
+        }
         for hold in &queue.retry_holds {
             lines.push(format!(
                 "retry hold: {} until {} — {}",
@@ -484,6 +526,73 @@ fn attention_texts(snapshot: &MonitorSnapshot) -> Vec<String> {
         }
     }
     lines
+}
+
+fn local_worktree_status(
+    local_worktree: Option<&str>,
+    task_branch: Option<&str>,
+    main_branch: &str,
+) -> String {
+    let Some(path) = local_worktree else {
+        return "missing Task Link".to_string();
+    };
+    let worktree = Path::new(path);
+    if !worktree.exists() {
+        return format!("missing ({path})");
+    }
+
+    let cleanliness = match git_output(worktree, &["status", "--porcelain"]) {
+        Ok(status) if status.trim().is_empty() => "clean".to_string(),
+        Ok(_) => "dirty".to_string(),
+        Err(_) => "exists, git status unavailable".to_string(),
+    };
+    let branch = git_output(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .ok()
+        .map(|branch| branch.trim().to_string());
+    let branch_note = match (branch.as_deref(), task_branch) {
+        (Some(actual), Some(expected)) if actual != expected => {
+            format!(" branch={actual} expected={expected}")
+        }
+        (Some(actual), _) => format!(" branch={actual}"),
+        (None, Some(expected)) => format!(" branch=unknown expected={expected}"),
+        (None, None) => " branch=unknown".to_string(),
+    };
+    let includes_main = match git_status(
+        worktree,
+        &["merge-base", "--is-ancestor", main_branch, "HEAD"],
+    ) {
+        Ok(status) if status.success() => "yes",
+        Ok(_) => "no",
+        Err(_) => "unknown",
+    };
+
+    format!("{cleanliness}{branch_note} includes_main={includes_main} ({path})")
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run git {:?} in {}", args, repo.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn git_status(repo: &Path, args: &[&str]) -> Result<std::process::ExitStatus> {
+    ProcessCommand::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to run git {:?} in {}", args, repo.display()))
 }
 
 fn integration_recovery_hint(reason_code: &str) -> &'static str {
@@ -577,7 +686,7 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
     let mut active_runs = tasker_db::active_agent_runs_for_status(pool).await?;
     let mut retry_holds = tasker_db::active_retry_holds_for_status(pool).await?;
     let mut status_tasks =
-        tasker_db::tasks_for_status_by_states(pool, &["ready", "integrating"]).await?;
+        tasker_db::tasks_for_status_by_states(pool, &["ready", "rework", "integrating"]).await?;
     let recent_runs = recent_agent_runs(pool, options.queue.as_deref()).await?;
     let mut integration_retries = tasker_db::integration_retries_for_status(pool).await?;
 
@@ -607,6 +716,7 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
                 active_runs: Vec::new(),
                 retry_holds: Vec::new(),
                 ready_tasks: Vec::new(),
+                rework_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
                 integration_retries: Vec::new(),
                 repo_operation_lock: None,
@@ -629,6 +739,7 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
         if let Some(queue) = by_queue.get_mut(&task.queue_key) {
             match task.state.as_str() {
                 "ready" => queue.ready_tasks.push(task),
+                "rework" => queue.rework_tasks.push(task),
                 "integrating" => queue.integrating_tasks.push(task),
                 _ => {}
             }
@@ -766,6 +877,33 @@ pub fn write_snapshot(mut writer: impl Write, snapshot: &MonitorSnapshot) -> io:
         writeln!(writer, "  (none)")?;
     }
 
+    writeln!(writer, "\nRework:")?;
+    let mut rework_count = 0;
+    for queue in &snapshot.queues {
+        for task in &queue.rework_tasks {
+            rework_count += 1;
+            writeln!(
+                writer,
+                "  ↻ {}\treason_code={}\tlocal_worktree={}",
+                compact_task_label(&task.identifier, &task.title, 64),
+                task.latest_rework_reason_code
+                    .as_deref()
+                    .unwrap_or("unknown_legacy"),
+                local_worktree_status(
+                    task.local_worktree.as_deref(),
+                    task.task_branch.as_deref(),
+                    &task.main_branch,
+                )
+            )?;
+            if let Some(reason) = &task.latest_rework_reason {
+                writeln!(writer, "    reason: {reason}")?;
+            }
+        }
+    }
+    if rework_count == 0 {
+        writeln!(writer, "  (none)")?;
+    }
+
     writeln!(writer, "\nNext:")?;
     let mut next = 0;
     for queue in &snapshot.queues {
@@ -818,6 +956,17 @@ pub fn write_snapshot(mut writer: impl Write, snapshot: &MonitorSnapshot) -> io:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let status = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {:?} failed", args);
+    }
 
     async fn temp_pool() -> SqlitePool {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1132,7 +1281,13 @@ mod tests {
                     title: "Prepare monitor titles".to_string(),
                     state: "ready".to_string(),
                     priority: "normal".to_string(),
+                    local_worktree: None,
+                    task_branch: None,
+                    main_branch: "main".to_string(),
+                    latest_rework_reason_code: None,
+                    latest_rework_reason: None,
                 }],
+                rework_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
                 integration_retries: Vec::new(),
                 repo_operation_lock: None,
@@ -1171,6 +1326,36 @@ mod tests {
     }
 
     #[test]
+    fn local_worktree_status_reports_dirty_branch_and_stale_main() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo dir");
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "tester@example.com"]);
+        run_git(&repo, &["config", "user.name", "Tester"]);
+        fs::write(repo.join("file.txt"), "base\n").expect("write base");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "base"]);
+        run_git(&repo, &["checkout", "-b", "tasker/TASK-1"]);
+        run_git(&repo, &["checkout", "main"]);
+        fs::write(repo.join("main.txt"), "main\n").expect("write main");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "main advances"]);
+        run_git(&repo, &["checkout", "tasker/TASK-1"]);
+        fs::write(repo.join("dirty.txt"), "dirty\n").expect("write dirty");
+
+        let status = local_worktree_status(
+            Some(repo.to_str().expect("utf8 path")),
+            Some("tasker/TASK-1"),
+            "main",
+        );
+
+        assert!(status.contains("dirty"), "{status}");
+        assert!(status.contains("branch=tasker/TASK-1"), "{status}");
+        assert!(status.contains("includes_main=no"), "{status}");
+    }
+
+    #[test]
     fn raw_terminal_snapshot_output_normalizes_all_newlines_to_crlf() {
         let snapshot = MonitorSnapshot {
             config_path: PathBuf::from("/repo/.tasker/config.toml"),
@@ -1187,6 +1372,7 @@ mod tests {
                 active_runs: Vec::new(),
                 retry_holds: Vec::new(),
                 ready_tasks: Vec::new(),
+                rework_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
                 integration_retries: Vec::new(),
                 repo_operation_lock: None,
@@ -1213,6 +1399,11 @@ mod tests {
                 title: format!("Ready task with a deliberately long title number {index}"),
                 state: "ready".to_string(),
                 priority: "normal".to_string(),
+                local_worktree: None,
+                task_branch: None,
+                main_branch: "main".to_string(),
+                latest_rework_reason_code: None,
+                latest_rework_reason: None,
             })
             .collect();
         let snapshot = MonitorSnapshot {
@@ -1236,6 +1427,7 @@ mod tests {
                     failure_reason_code: Some("agent_run_failed".to_string()),
                 }],
                 ready_tasks,
+                rework_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
                 integration_retries: Vec::new(),
                 repo_operation_lock: None,
@@ -1286,12 +1478,18 @@ mod tests {
                     failure_reason_code: Some("launcher_timeout".to_string()),
                 }],
                 ready_tasks: Vec::new(),
+                rework_tasks: Vec::new(),
                 integrating_tasks: vec![tasker_db::TaskStatusSummary {
                     queue_key: "TASK".to_string(),
                     identifier: "TASK-3".to_string(),
                     title: "Waiting integration".to_string(),
                     state: "integrating".to_string(),
                     priority: "normal".to_string(),
+                    local_worktree: None,
+                    task_branch: None,
+                    main_branch: "main".to_string(),
+                    latest_rework_reason_code: None,
+                    latest_rework_reason: None,
                 }],
                 integration_retries: vec![tasker_db::IntegrationRetryStatus {
                     queue_key: "TASK".to_string(),
@@ -1358,6 +1556,7 @@ mod tests {
                 }],
                 retry_holds: Vec::new(),
                 ready_tasks: Vec::new(),
+                rework_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
                 integration_retries: Vec::new(),
                 repo_operation_lock: None,

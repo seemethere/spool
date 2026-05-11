@@ -2,6 +2,7 @@ use std::{
     fs,
     io::{Result, Write},
     path::Path,
+    process::Command as ProcessCommand,
 };
 
 use serde::Serialize;
@@ -62,6 +63,55 @@ pub fn write_task_detail(mut writer: impl Write, detail: &tasker_db::TaskDetail)
             )?;
         }
     }
+    writeln!(writer, "\nLocal Worktree Status:")?;
+    if let Some(worktree) = primary_task_link_target(&detail.task_links, "local_worktree") {
+        let path = Path::new(worktree);
+        writeln!(writer, "  path: {worktree}")?;
+        writeln!(
+            writer,
+            "  exists: {}",
+            if path.exists() { "yes" } else { "no" }
+        )?;
+        if path.exists() {
+            match git_output(path, &["status", "--porcelain"]) {
+                Ok(status) if status.trim().is_empty() => writeln!(writer, "  clean: yes")?,
+                Ok(status) => {
+                    writeln!(writer, "  clean: no")?;
+                    let changed = status.lines().count();
+                    writeln!(writer, "  uncommitted paths: {changed}")?;
+                }
+                Err(error) => writeln!(writer, "  clean: unknown ({error})")?,
+            }
+            match git_output(path, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+                Ok(branch) => writeln!(writer, "  checked-out branch: {}", branch.trim())?,
+                Err(error) => writeln!(writer, "  checked-out branch: unknown ({error})")?,
+            }
+        }
+    } else {
+        writeln!(writer, "  path: missing Task Link")?;
+        writeln!(writer, "  exists: unknown")?;
+    }
+    if let Some(branch) = primary_task_link_target(&detail.task_links, "task_branch") {
+        writeln!(writer, "  Task Branch: {branch}")?;
+    } else {
+        writeln!(writer, "  Task Branch: missing Task Link")?;
+    }
+    writeln!(writer, "\nLatest Rework Reason:")?;
+    if detail.latest_rework_reason_code.is_none() && detail.latest_rework_reason.is_none() {
+        writeln!(writer, "(none)")?;
+    } else {
+        writeln!(
+            writer,
+            "  code: {}",
+            detail
+                .latest_rework_reason_code
+                .as_deref()
+                .unwrap_or("unknown_legacy")
+        )?;
+        if let Some(reason) = &detail.latest_rework_reason {
+            writeln!(writer, "  reason: {reason}")?;
+        }
+    }
     writeln!(writer, "\nTask Conflict Hints:")?;
     if detail.conflict_hints.is_empty() {
         writeln!(writer, "(none)")?;
@@ -116,6 +166,30 @@ pub fn write_queue(mut writer: impl Write, queue: &tasker_db::TaskQueue) -> Resu
 
 pub fn print_task_detail(detail: &tasker_db::TaskDetail) -> Result<()> {
     write_task_detail(std::io::stdout(), detail)
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn primary_task_link_target<'a>(links: &'a [tasker_db::TaskLink], kind: &str) -> Option<&'a str> {
+    links
+        .iter()
+        .find(|link| link.kind == kind && link.is_primary)
+        .or_else(|| links.iter().find(|link| link.kind == kind))
+        .map(|link| link.target.as_str())
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -592,6 +666,8 @@ mod tests {
                 task_links: Vec::new(),
                 conflict_hints: Vec::new(),
                 conflict_overlaps: Vec::new(),
+                latest_rework_reason_code: None,
+                latest_rework_reason: None,
             },
             launcher_session_data: Some(tasker_db::LauncherSessionData {
                 agent_run_id: "run-1".to_string(),

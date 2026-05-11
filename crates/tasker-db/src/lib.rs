@@ -656,6 +656,8 @@ pub struct TaskDetail {
     pub task_links: Vec<TaskLink>,
     pub conflict_hints: Vec<TaskConflictHint>,
     pub conflict_overlaps: Vec<TaskConflictOverlap>,
+    pub latest_rework_reason_code: Option<String>,
+    pub latest_rework_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -766,6 +768,11 @@ pub struct TaskStatusSummary {
     pub title: String,
     pub state: String,
     pub priority: String,
+    pub local_worktree: Option<String>,
+    pub task_branch: Option<String>,
+    pub main_branch: String,
+    pub latest_rework_reason_code: Option<String>,
+    pub latest_rework_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
@@ -1457,6 +1464,72 @@ pub async fn get_task_detail(pool: &SqlitePool, identifier: &str) -> Result<Opti
     .await
     .context("failed to load Task Conflict overlaps")?;
 
+    let latest_rework_outcome = sqlx::query_as::<_, TaskContextIntegrationOutcome>(
+        r#"
+        SELECT
+            id,
+            agent_run_id,
+            outcome_kind,
+            reason_code,
+            final_commit,
+            pre_merge_head,
+            message,
+            retryable,
+            retry_attempt,
+            next_retry_at,
+            created_at
+        FROM integration_outcomes
+        WHERE task_id = ?
+          AND outcome_kind != 'success'
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(&task.id)
+    .fetch_optional(pool)
+    .await
+    .context("failed to load latest Rework Integration Outcome")?;
+    let latest_rework_run = if latest_rework_outcome.is_none() {
+        sqlx::query_as::<_, TaskContextRunFailure>(
+            r#"
+            SELECT
+                id AS agent_run_id,
+                outcome AS outcome,
+                failure_reason,
+                failure_reason_code,
+                finished_at
+            FROM agent_runs
+            WHERE task_id = ?
+              AND outcome IS NOT NULL
+              AND outcome != 'completed'
+            ORDER BY finished_at DESC, created_at DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(&task.id)
+        .fetch_optional(pool)
+        .await
+        .context("failed to load latest Rework Agent Run failure")?
+    } else {
+        None
+    };
+    let latest_rework_reason_code = latest_rework_outcome
+        .as_ref()
+        .and_then(|outcome| outcome.reason_code.clone())
+        .or_else(|| {
+            latest_rework_run
+                .as_ref()
+                .and_then(|run| run.failure_reason_code.clone())
+        });
+    let latest_rework_reason = latest_rework_outcome
+        .as_ref()
+        .and_then(|outcome| outcome.message.clone())
+        .or_else(|| {
+            latest_rework_run
+                .as_ref()
+                .and_then(|run| run.failure_reason.clone())
+        });
+
     Ok(Some(TaskDetail {
         task,
         acceptance_criteria,
@@ -1466,6 +1539,8 @@ pub async fn get_task_detail(pool: &SqlitePool, identifier: &str) -> Result<Opti
         task_links,
         conflict_hints,
         conflict_overlaps,
+        latest_rework_reason_code,
+        latest_rework_reason,
     }))
 }
 
@@ -2160,7 +2235,54 @@ pub async fn tasks_for_status_by_states(
             tasks.identifier AS identifier,
             tasks.title AS title,
             tasks.state AS state,
-            tasks.priority AS priority
+            tasks.priority AS priority,
+            task_queues.main_branch AS main_branch,
+            (
+                SELECT task_links.target FROM task_links
+                WHERE task_links.task_id = tasks.id AND task_links.kind = 'local_worktree'
+                ORDER BY task_links.is_primary DESC, task_links.created_at DESC, task_links.id DESC
+                LIMIT 1
+            ) AS local_worktree,
+            (
+                SELECT task_links.target FROM task_links
+                WHERE task_links.task_id = tasks.id AND task_links.kind = 'task_branch'
+                ORDER BY task_links.is_primary DESC, task_links.created_at DESC, task_links.id DESC
+                LIMIT 1
+            ) AS task_branch,
+            COALESCE(
+                (
+                    SELECT integration_outcomes.reason_code FROM integration_outcomes
+                    WHERE integration_outcomes.task_id = tasks.id
+                      AND integration_outcomes.outcome_kind != 'success'
+                    ORDER BY integration_outcomes.created_at DESC, integration_outcomes.rowid DESC
+                    LIMIT 1
+                ),
+                (
+                    SELECT agent_runs.failure_reason_code FROM agent_runs
+                    WHERE agent_runs.task_id = tasks.id
+                      AND agent_runs.outcome IS NOT NULL
+                      AND agent_runs.outcome != 'completed'
+                    ORDER BY agent_runs.finished_at DESC, agent_runs.created_at DESC, agent_runs.id DESC
+                    LIMIT 1
+                )
+            ) AS latest_rework_reason_code,
+            COALESCE(
+                (
+                    SELECT integration_outcomes.message FROM integration_outcomes
+                    WHERE integration_outcomes.task_id = tasks.id
+                      AND integration_outcomes.outcome_kind != 'success'
+                    ORDER BY integration_outcomes.created_at DESC, integration_outcomes.rowid DESC
+                    LIMIT 1
+                ),
+                (
+                    SELECT agent_runs.failure_reason FROM agent_runs
+                    WHERE agent_runs.task_id = tasks.id
+                      AND agent_runs.outcome IS NOT NULL
+                      AND agent_runs.outcome != 'completed'
+                    ORDER BY agent_runs.finished_at DESC, agent_runs.created_at DESC, agent_runs.id DESC
+                    LIMIT 1
+                )
+            ) AS latest_rework_reason
         FROM tasks
         JOIN task_queues ON task_queues.id = tasks.task_queue_id
         WHERE tasks.state IN (
