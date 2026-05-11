@@ -84,6 +84,10 @@ _Avoid_: Anonymous mutation, bearer token identity
 An **Actor** that executes an **Agent Run** for a **Task**.
 _Avoid_: Delegating Agent, Review Agent
 
+**Worker Agent Contribution Surface**:
+The repository-facing instructions, module boundaries, and deterministic checks that let **Worker Agents** complete Tasker development **Tasks** with minimal rediscovery.
+_Avoid_: General code cleanup, feature deletion as simplification, pre-dogfooding-only ergonomics
+
 **Agent Launcher**:
 A pluggable runner-side integration that starts and communicates with a coding agent for an **Agent Run**.
 _Avoid_: Tasker-owned agent protocol
@@ -489,6 +493,8 @@ _Avoid_: Separate progress comment
 - A **Managed Source Repository Operation Lock** records pid, operation, queue, optional Task context, and whether it is a manual lock; stale automatic locks whose recorded process has exited may be removed safely, while manual locks require explicit release.
 - Supervisors and Worker Loops check the **Managed Source Repository Operation Lock** before spawning workers or claiming Tasks; watch-mode supervisors pause and poll while the lock is held, and bounded batches report the blocked condition clearly.
 - Every Tasker mutation is attributed to an **Actor** or the system.
+- The **Worker Agent Contribution Surface** is optimized for **Worker Agents** after **Dogfooding Cutover**, while preserving the **Pre-Dogfooding Development Loop**.
+- Simplifying the **Worker Agent Contribution Surface** means making Tasker development changes easier to locate, validate, and hand off, not reducing domain scope by default.
 - Authentication identifies the API client; **Actor** identifies the source of the domain change.
 - Every Tasker domain mutation produces an **Audit Event**.
 - Current Tasker state is read from current records, not reconstructed from **Audit Events**.
@@ -692,6 +698,7 @@ _Avoid_: Separate progress comment
 - "grill-me-with-docs" refers to the existing grill-with-docs-style interaction — resolved: call the Tasker intake flow a **Delegation Interview**.
 - "documentation-aware delegation" could imply editing docs on the main repository during intake — resolved: delegation reads docs and creates Tasker work; repo edits happen in Worker Agent worktrees.
 - "agent" could mean creator, executor, or reviewer — resolved: use **Delegating Agent**, **Worker Agent**, and **Review Agent** as distinct **Actor** roles.
+- "future agents" in codebase simplification could mean pre-dogfooding coding assistants or post-cutover **Worker Agents** — resolved: optimize the **Worker Agent Contribution Surface** for post-cutover **Worker Agents** first.
 - "identity" could mean API authentication or domain attribution — resolved: bearer tokens authenticate clients, while **Actor** records domain attribution.
 - "human review" could imply humans operate Tasker directly — resolved: humans review through a **Review Session** or another external channel, and a **Review Agent** records the **Review Decision** in Tasker.
 - "review required" could imply every Task blocks on a human — resolved: local-first queues default to **Agent-Gated Integration**, and **Human Review** is required only by **Review Policy** or explicit agent request.

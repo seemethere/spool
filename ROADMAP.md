@@ -24,6 +24,8 @@ Tasker should become useful enough to build Tasker with Tasker as quickly as pos
 
 Once this milestone works, create real dogfood tasks for later milestones.
 
+Early dogfooding task chain: simplify the **Worker Agent Contribution Surface** by extracting runner-side execution and delivery behavior into `tasker-runner`, following `docs/RUNNER_EXTRACTION_PLAN.md`. This should be managed as dependency-chained Tasker Tasks after the minimum dogfooding cutover point, not as a prerequisite for cutover.
+
 ### Milestone 3: Claim and run lifecycle
 
 - Claim-next
