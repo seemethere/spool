@@ -928,43 +928,6 @@ fn has_shell_invocation(tokens: &[String], commands: &[&str]) -> bool {
         .any(|token| commands.contains(&token.as_str()))
 }
 
-#[cfg(test)]
-mod shell_command_category_tests {
-    use super::shell_command_category;
-
-    #[test]
-    fn classifies_common_dogfood_shell_commands_without_raw_command_storage() {
-        let cases = [
-            ("bin/tasker-local task show TASKER-86", "tasker_cli"),
-            ("cargo test -p tasker-db agent_run_metrics", "cargo"),
-            (
-                "cargo clippy -p tasker-cli --all-targets -- -D warnings",
-                "cargo",
-            ),
-            ("git status --short", "git"),
-            ("rg telemetry crates", "search"),
-            ("find crates -name '*.rs'", "search"),
-            ("ls -la && stat Cargo.toml", "filesystem"),
-            (
-                "sqlite3 .tasker/data/tasker.db 'select count(*) from tasks'",
-                "sqlite",
-            ),
-            ("ps aux | grep tasker", "process"),
-            ("pgrep -fl tasker", "process"),
-            ("jq '.efficiency' summary.json", "text_processing"),
-            ("sed -n '1,20p' CONTEXT.md", "text_processing"),
-            ("awk '{print $1}' counts.txt", "text_processing"),
-            ("pnpm build", "package_build"),
-            ("make test", "package_build"),
-            ("python scripts/one_off.py", "miscellaneous"),
-        ];
-
-        for (command, expected) in cases {
-            assert_eq!(shell_command_category(command), expected, "{command}");
-        }
-    }
-}
-
 fn tasker_context_fetch_signature(command: &str) -> Option<String> {
     let lowered = command.to_ascii_lowercase();
     let normalized = lowered.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1091,4 +1054,41 @@ async fn agent_run_detail_for_run(pool: &SqlitePool, run: AgentRun) -> Result<Ag
         launcher_session_data,
         metrics,
     })
+}
+
+#[cfg(test)]
+mod shell_command_category_tests {
+    use super::shell_command_category;
+
+    #[test]
+    fn classifies_common_dogfood_shell_commands_without_raw_command_storage() {
+        let cases = [
+            ("bin/tasker-local task show TASKER-86", "tasker_cli"),
+            ("cargo test -p tasker-db agent_run_metrics", "cargo"),
+            (
+                "cargo clippy -p tasker-cli --all-targets -- -D warnings",
+                "cargo",
+            ),
+            ("git status --short", "git"),
+            ("rg telemetry crates", "search"),
+            ("find crates -name '*.rs'", "search"),
+            ("ls -la && stat Cargo.toml", "filesystem"),
+            (
+                "sqlite3 .tasker/data/tasker.db 'select count(*) from tasks'",
+                "sqlite",
+            ),
+            ("ps aux | grep tasker", "process"),
+            ("pgrep -fl tasker", "process"),
+            ("jq '.efficiency' summary.json", "text_processing"),
+            ("sed -n '1,20p' CONTEXT.md", "text_processing"),
+            ("awk '{print $1}' counts.txt", "text_processing"),
+            ("pnpm build", "package_build"),
+            ("make test", "package_build"),
+            ("python scripts/one_off.py", "miscellaneous"),
+        ];
+
+        for (command, expected) in cases {
+            assert_eq!(shell_command_category(command), expected, "{command}");
+        }
+    }
 }
