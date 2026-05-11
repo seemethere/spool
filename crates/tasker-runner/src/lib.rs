@@ -8,4 +8,5 @@ pub mod commit_metadata;
 pub mod local_worktree_delivery;
 pub mod repo_lock;
 
+pub mod supervisor;
 pub mod worker;

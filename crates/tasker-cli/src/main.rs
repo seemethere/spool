@@ -23,7 +23,6 @@ mod run_cmd;
 mod serve_cmd;
 mod status_cmd;
 mod supervise_cmd;
-mod supervisor;
 mod task_cmd;
 mod telemetry;
 mod telemetry_cmd;

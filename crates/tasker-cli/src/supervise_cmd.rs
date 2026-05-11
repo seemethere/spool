@@ -32,9 +32,9 @@ pub(crate) async fn supervise(
         database_path.display()
     );
 
-    let outcome = supervisor::supervise_batch(
+    let outcome = tasker_runner::supervisor::supervise_batch(
         &pool,
-        supervisor::SupervisorOptions {
+        tasker_runner::supervisor::SupervisorOptions {
             queue: options.queue,
             concurrency: options.concurrency,
             timeout_seconds: options.timeout_seconds,
@@ -44,8 +44,6 @@ pub(crate) async fn supervise(
             data_dir: paths.data_dir.clone(),
             allow_overlap: options.allow_overlap,
             watch: options.watch,
-            #[cfg(test)]
-            run_prefix: None,
         },
     )
     .await?;

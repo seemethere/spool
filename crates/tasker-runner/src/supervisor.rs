@@ -13,8 +13,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 use tokio::time::sleep;
 
-use crate::display;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupervisorOptions {
     pub queue: String,
@@ -145,12 +143,8 @@ pub async fn supervise_batch(
         let target_starts = worker_start_target(&options, &outcome, &active, &unblock);
         let mut preflight_ready = true;
         if active.len() < options.concurrency && outcome.started_workers < target_starts {
-            if let Err(error) = tasker_runner::worker::preflight_worker_claim(
-                pool,
-                &options.queue,
-                &options.data_dir,
-            )
-            .await
+            if let Err(error) =
+                crate::worker::preflight_worker_claim(pool, &options.queue, &options.data_dir).await
             {
                 preflight_ready = false;
                 let message = format!("{error:#}");
@@ -251,7 +245,7 @@ pub async fn supervise_batch(
                     println!(
                         "stuck Agent Run {} for Task {} remains active after worker {} exited; suggested recovery: tasker run fail {} --reason <reason>",
                         run.agent_run_id,
-                        display::task_label(&run.task_identifier, &run.task_title, 64),
+                        task_label(&run.task_identifier, &run.task_title, 64),
                         run.worker_id,
                         run.agent_run_id
                     );
@@ -419,7 +413,7 @@ impl SupervisorReports {
                     *self.by_status.get("retryable_failure").unwrap_or(&0);
                 let task_label = task_titles
                     .get(&task_identifier)
-                    .map(|title| display::task_label(&task_identifier, title, 64))
+                    .map(|title| task_label(&task_identifier, title, 64))
                     .unwrap_or(task_identifier);
                 println!(
                     "worker status report Task {} status={}{}",
@@ -618,11 +612,11 @@ async fn retry_due_integrations(
     for retry in retries {
         println!(
             "retrying Integrating Task {} after operational Delivery Failure attempt={} next_retry_at={}",
-            display::task_label(&retry.task_identifier, &retry.task_title, 64),
+            task_label(&retry.task_identifier, &retry.task_title, 64),
             retry.retry_attempt.unwrap_or_default(),
             retry.next_retry_at.as_deref().unwrap_or("due")
         );
-        let outcome = tasker_runner::worker::integrate_local_worktree_for_run(
+        let outcome = crate::worker::integrate_local_worktree_for_run(
             pool,
             &retry.task_identifier,
             None,
@@ -753,7 +747,7 @@ async fn unblocking_state(
         for task in &unclaimed_eligible {
             println!(
                 "unblocked Task {} is reported by Worker Agent and left in {}",
-                display::task_label(&task.identifier, &task.title, 64),
+                task_label(&task.identifier, &task.title, 64),
                 task.state
             );
         }
@@ -783,6 +777,25 @@ fn active_run_progress_message(run: &tasker_db::ActiveAgentRunStatus) -> String 
         "active Agent Run {} Task {} worker={} lease_expires_at={}",
         run.agent_run_id, run.task_identifier, run.worker_id, run.lease_expires_at
     )
+}
+
+fn truncate_title(title: &str, max_chars: usize) -> String {
+    let mut chars = title.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        if max_chars <= 1 {
+            "…".to_string()
+        } else {
+            let keep = max_chars.saturating_sub(1);
+            format!("{}…", prefix.chars().take(keep).collect::<String>())
+        }
+    } else {
+        prefix
+    }
+}
+
+fn task_label(identifier: &str, title: &str, max_title_chars: usize) -> String {
+    format!("{} {}", identifier, truncate_title(title, max_title_chars))
 }
 
 fn concise_tail(text: &str) -> String {
@@ -913,7 +926,7 @@ mod tests {
         let pool = empty_pool(temp.path()).await;
         seed_task(&pool, "ready").await;
         let data_dir = temp.path().join("data");
-        let _lock = tasker_runner::repo_lock::acquire_manual(
+        let _lock = crate::repo_lock::acquire_manual(
             &data_dir,
             "TASK",
             "manual_integration",
@@ -947,7 +960,7 @@ mod tests {
             !count.exists(),
             "worker should not start while repo lock is held"
         );
-        tasker_runner::repo_lock::release_manual(&data_dir, "TASK")
+        crate::repo_lock::release_manual(&data_dir, "TASK")
             .expect("release lock")
             .expect("held lock");
         let outcome = handle.await.expect("join").expect("supervise");
