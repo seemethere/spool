@@ -178,6 +178,9 @@ pub async fn supervise_batch(
             reports.files.insert(status_path.clone());
             let worker = spawn_worker(&options.worker_command, &actor, status_path)
                 .with_context(|| format!("failed to start worker {actor}"))?;
+            if options.watch && outcome.started_workers > 0 {
+                println!("backfilling open supervisor slot with worker {actor}");
+            }
             println!("{}", started_worker_message(&actor));
             active.push(worker);
             outcome.started_workers += 1;
@@ -195,6 +198,17 @@ pub async fn supervise_batch(
                 unblock.unclaimed_eligible.len(),
                 unblock.active_runs
             );
+            if options.watch
+                && active.len() < options.concurrency
+                && unblock.unclaimed_eligible.is_empty()
+                && !unblock.has_only_reported_work
+            {
+                println!(
+                    "supervisor capacity available for Task Queue {}: open_slots={} but no eligible Task is claimable",
+                    options.queue,
+                    options.concurrency - active.len()
+                );
+            }
         }
         print_progress(pool, &options.queue).await?;
 
@@ -289,13 +303,18 @@ fn worker_start_target(
     if options.watch {
         let available = unblock.unclaimed_eligible.len();
         if available == 0 {
-            if outcome.started_workers == 0 && active.is_empty() {
+            if outcome.started_workers == 0 && active.is_empty() && unblock.active_runs == 0 {
                 return outcome.started_workers + 1;
             }
             return outcome.started_workers;
         }
-        let desired_active = available.min(options.concurrency);
-        return outcome.started_workers + desired_active.saturating_sub(active.len());
+        let open_supervisor_slots = options.concurrency.saturating_sub(active.len());
+        let queue_slots = unblock
+            .queue_concurrency_limit
+            .map(|limit| limit.saturating_sub(unblock.active_runs.max(active.len())))
+            .unwrap_or(open_supervisor_slots);
+        let starts = available.min(open_supervisor_slots).min(queue_slots);
+        return outcome.started_workers + starts;
     }
     if outcome.no_eligible_exits == 0 {
         outcome.started_workers + (options.concurrency - active.len())
@@ -659,6 +678,7 @@ async fn print_progress(pool: &SqlitePool, queue: &str) -> Result<()> {
 struct UnblockingState {
     unclaimed_eligible: Vec<EligibleTask>,
     active_runs: usize,
+    queue_concurrency_limit: Option<usize>,
     has_only_reported_work: bool,
 }
 
@@ -688,6 +708,15 @@ async fn unblocking_state(
     queue: &str,
     reports: &SupervisorReports,
 ) -> Result<UnblockingState> {
+    let queue_concurrency_limit = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT queue_concurrency_limit FROM task_queues WHERE key = ?",
+    )
+    .bind(queue)
+    .fetch_optional(pool)
+    .await
+    .context("failed to load supervisor Task Queue concurrency limit")?
+    .flatten()
+    .map(|limit| limit.max(0) as usize);
     let active_runs = tasker_db::active_agent_runs_for_status(pool)
         .await?
         .into_iter()
@@ -731,6 +760,7 @@ async fn unblocking_state(
     Ok(UnblockingState {
         unclaimed_eligible,
         active_runs,
+        queue_concurrency_limit,
         has_only_reported_work,
     })
 }
@@ -985,6 +1015,157 @@ mod tests {
             .await
             .expect("count runs");
         assert_eq!(active_runs, 0);
+    }
+
+    #[tokio::test]
+    async fn supervisor_watch_backfills_ready_task_while_worker_is_active() {
+        let temp = TempDir::new().expect("tempdir");
+        let count = temp.path().join("worker-count");
+        let db_path = temp.path().join("tasker.db");
+        let script = temp.path().join("worker.sh");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+actor="$2"
+echo "$actor" >> {count}
+if [ "$(wc -l < {count})" -eq 1 ]; then
+  python3 - "$actor" {db_path} <<'PY'
+import sqlite3, sys
+actor = sys.argv[1]
+db_path = sys.argv[2]
+conn = sqlite3.connect(db_path)
+conn.execute("UPDATE tasks SET state = 'in_progress' WHERE identifier = 'TASK-1'")
+conn.execute("INSERT INTO agent_runs (id, task_id, task_queue_id, worker_actor_kind, worker_actor_id, worker_actor_display_name, worker_id, launcher_kind, lease_expires_at) VALUES (?, 'task-1', 'queue-1', 'worker_agent', ?, ?, ?, 'fake', datetime('now', '+60 seconds'))", (actor + '-run', actor, actor, actor))
+conn.commit()
+PY
+fi
+sleep 3
+exit 0
+"#,
+                count = count.display(),
+                db_path = db_path.display()
+            ),
+        )
+        .expect("write script");
+        make_executable(&script);
+        let pool = empty_pool(temp.path()).await;
+        seed_task(&pool, "ready").await;
+        let supervise_pool = pool.clone();
+        let lock_dir = temp.path().join("supervisors");
+        let data_dir = temp.path().to_path_buf();
+        let handle = tokio::spawn(async move {
+            supervise_batch(
+                &supervise_pool,
+                SupervisorOptions {
+                    queue: "TASK".to_string(),
+                    concurrency: 2,
+                    timeout_seconds: 4,
+                    poll_seconds: 1,
+                    worker_command: vec![script.display().to_string()],
+                    lock_dir,
+                    data_dir,
+                    allow_overlap: false,
+                    watch: true,
+                    run_prefix: Some("supervisor-test-watch-backfill".to_string()),
+                },
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        seed_second_task(&pool, "ready").await;
+        let outcome = handle.await.expect("join").expect("supervise");
+
+        assert!(
+            outcome.started_workers >= 2,
+            "watch mode should backfill the second worker before the first exits"
+        );
+        assert!(outcome.timed_out);
+    }
+
+    #[tokio::test]
+    async fn supervisor_watch_respects_queue_concurrency_limit() {
+        let temp = TempDir::new().expect("tempdir");
+        let script = temp.path().join("worker.sh");
+        fs::write(&script, "#!/bin/sh\nsleep 5\nexit 0\n").expect("write script");
+        make_executable(&script);
+        let pool = empty_pool(temp.path()).await;
+        seed_task(&pool, "ready").await;
+        seed_second_task(&pool, "ready").await;
+        sqlx::query("UPDATE task_queues SET queue_concurrency_limit = 1 WHERE key = 'TASK'")
+            .execute(&pool)
+            .await
+            .expect("set queue limit");
+
+        let outcome = supervise_batch(
+            &pool,
+            SupervisorOptions {
+                queue: "TASK".to_string(),
+                concurrency: 3,
+                timeout_seconds: 2,
+                poll_seconds: 1,
+                worker_command: vec![script.display().to_string()],
+                lock_dir: temp.path().join("supervisors"),
+                data_dir: temp.path().to_path_buf(),
+                allow_overlap: false,
+                watch: true,
+                run_prefix: Some("supervisor-test-watch-queue-limit".to_string()),
+            },
+        )
+        .await
+        .expect("supervise");
+
+        assert_eq!(outcome.started_workers, 1);
+        assert!(outcome.timed_out);
+    }
+
+    #[tokio::test]
+    async fn supervisor_watch_does_not_spawn_when_migration_preflight_fails() {
+        let temp = TempDir::new().expect("tempdir");
+        let script = temp.path().join("worker.sh");
+        let count = temp.path().join("worker-count");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho run >> {count}\nexit 0\n",
+                count = count.display()
+            ),
+        )
+        .expect("write script");
+        make_executable(&script);
+        let pool = empty_pool(temp.path()).await;
+        seed_task(&pool, "ready").await;
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version = (SELECT MAX(version) FROM _sqlx_migrations)")
+            .execute(&pool)
+            .await
+            .expect("remove migration metadata");
+
+        let outcome = supervise_batch(
+            &pool,
+            SupervisorOptions {
+                queue: "TASK".to_string(),
+                concurrency: 1,
+                timeout_seconds: 2,
+                poll_seconds: 1,
+                worker_command: vec![script.display().to_string()],
+                lock_dir: temp.path().join("supervisors"),
+                data_dir: temp.path().to_path_buf(),
+                allow_overlap: false,
+                watch: true,
+                run_prefix: Some("supervisor-test-watch-migration-block".to_string()),
+            },
+        )
+        .await
+        .expect("supervise");
+
+        assert_eq!(outcome.started_workers, 0);
+        assert!(outcome.blocked_reports >= 1);
+        assert!(outcome.timed_out);
+        assert!(
+            !count.exists(),
+            "worker should not start while migrations are pending"
+        );
     }
 
     #[tokio::test]
