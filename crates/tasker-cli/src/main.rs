@@ -37,10 +37,7 @@ use db_cmd::{
 };
 use merge_cmd::{git_output, merge};
 #[cfg(test)]
-use merge_cmd::{
-    integrate_local_worktree, manual_squash_integration_guidance,
-    post_merge_batch_validation_guidance,
-};
+use merge_cmd::{manual_squash_integration_guidance, post_merge_batch_validation_guidance};
 use queue_cmd::queue;
 use run_cmd::run;
 use serve_cmd::serve;

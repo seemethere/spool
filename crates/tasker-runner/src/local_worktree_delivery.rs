@@ -845,3 +845,772 @@ fn git_output(repo: &Path, args: &[&str], action: &str) -> Result<String> {
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use std::fs;
+
+    #[tokio::test]
+    async fn local_worktree_integration_squash_merges_and_cleans_successful_task() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+
+        let result = integrate_local_worktree_for_run(
+            &pool,
+            "TASK-1",
+            None,
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
+
+        assert!(result.summary.contains("Final Commit"));
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "done");
+        assert!(git_output(
+            &repo,
+            &["show", "--stat", "--oneline", "HEAD"],
+            "show final commit"
+        )
+        .expect("show final commit")
+        .contains("feature.txt"));
+        let commit_message = git_output(
+            &repo,
+            &["log", "-1", "--pretty=%B"],
+            "show final commit message",
+        )
+        .expect("show final commit message");
+        assert!(commit_message.contains("Tasker-Task: TASK-1"));
+        assert!(commit_message.contains("Tasker-Queue: TASK"));
+        assert!(!commit_message.contains("Brief"));
+        assert!(!commit_message.contains("Workpad"));
+        assert_eq!(
+            commit_metadata::parse_tasker_commit_trailers(&commit_message),
+            commit_metadata::TaskerCommitTrailers {
+                task_identifier: Some("TASK-1".to_string()),
+                task_queue: Some("TASK".to_string()),
+                agent_run_id: None,
+            }
+        );
+        let message_file = temp.path().join("final-commit-message.txt");
+        fs::write(&message_file, &commit_message).expect("message file");
+        let parsed_by_git = git_output(
+            &repo,
+            &[
+                "interpret-trailers",
+                "--parse",
+                "--no-divider",
+                message_file.to_str().expect("utf8"),
+            ],
+            "parse trailers",
+        )
+        .expect("git interpret-trailers");
+        assert!(parsed_by_git.contains("Tasker-Task: TASK-1"));
+        assert!(parsed_by_git.contains("Tasker-Queue: TASK"));
+        assert!(!worktree.exists());
+        assert!(!Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/heads/tasker/TASK-1"
+            ])
+            .status()
+            .expect("branch status")
+            .success());
+        let outcomes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'success' AND reason_code = 'success'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("outcome count");
+        assert_eq!(outcomes, 1);
+    }
+
+    #[tokio::test]
+    async fn local_worktree_integration_records_no_change_without_commit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, _worktree) = seed_integrating_local_task(&pool, temp.path(), false, false).await;
+        let before = git_output(&repo, &["rev-parse", "HEAD"], "read HEAD").expect("head");
+
+        let result = integrate_local_worktree_for_run(
+            &pool,
+            "TASK-1",
+            None,
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
+
+        assert!(result.summary.contains("No-Change Integration"));
+        let after = git_output(&repo, &["rev-parse", "HEAD"], "read HEAD").expect("head");
+        assert_eq!(before, after);
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "done");
+        let outcomes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'no_changes' AND reason_code = 'no_changes'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("outcome count");
+        assert_eq!(outcomes, 1);
+    }
+
+    #[tokio::test]
+    async fn local_worktree_integration_dirty_managed_source_repository_stays_integrating() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, _worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        fs::write(repo.join("operator-scratch.txt"), "dirty\n").expect("dirty repo");
+
+        let result = integrate_local_worktree_for_run(
+            &pool,
+            "TASK-1",
+            None,
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
+
+        assert!(result.summary.contains("operational Delivery Failure"));
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "integrating");
+        let outcomes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'operational_failure' AND reason_code = 'dirty_managed_source_repository'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("outcome count");
+        assert_eq!(outcomes, 1);
+    }
+
+    #[tokio::test]
+    async fn local_worktree_integration_dirty_local_worktree_moves_to_rework() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (_repo, worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        fs::write(worktree.join("dirty.txt"), "dirty\n").expect("dirty worktree");
+
+        let result = integrate_local_worktree_for_run(
+            &pool,
+            "TASK-1",
+            None,
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
+
+        assert!(result.summary.contains("work-change Delivery Failure"));
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "rework");
+        let outcomes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'work_change_failure' AND reason_code = 'uncommitted_local_worktree'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("outcome count");
+        assert_eq!(outcomes, 1);
+    }
+
+    #[tokio::test]
+    async fn local_worktree_integration_allows_current_validated_base_without_branch_ancestry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, _worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        fs::write(repo.join("main-only.txt"), "main moved\n").expect("main change");
+        git(&repo, &["add", "main-only.txt"]);
+        git(&repo, &["commit", "-m", "move main"]);
+        let current_main = git_output(&repo, &["rev-parse", "main"], "read main head")
+            .expect("main head")
+            .trim()
+            .to_string();
+        tasker_db::update_validation_item_status(
+            &pool,
+            "TASK-1",
+            1,
+            &tasker_db::UpdateRequirementStatus {
+                status: "passed".to_string(),
+                waiver_reason: None,
+                validated_base_commit: Some(current_main.clone()),
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("record validated base");
+
+        let result = integrate_local_worktree_for_run(
+            &pool,
+            "TASK-1",
+            None,
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
+
+        assert!(result.summary.contains("Final Commit"));
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "done");
+        assert_eq!(
+            detail.task.validated_base_commit.as_deref(),
+            Some(current_main.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn local_worktree_integration_stale_validated_base_auto_refresh_succeeds_without_agent_run(
+    ) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, _worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        let old_main = git_output(&repo, &["rev-parse", "main"], "read main head")
+            .expect("main head")
+            .trim()
+            .to_string();
+        tasker_db::update_validation_item_status(
+            &pool,
+            "TASK-1",
+            1,
+            &tasker_db::UpdateRequirementStatus {
+                status: "passed".to_string(),
+                waiver_reason: None,
+                validated_base_commit: Some(old_main),
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("record stale base");
+        fs::create_dir_all(repo.join(".tasker")).expect("tasker dir");
+        fs::write(
+            repo.join(".tasker/validation-commands.txt"),
+            "test -f feature.txt\n",
+        )
+        .expect("validation commands");
+        fs::write(repo.join("main-only.txt"), "main moved\n").expect("main change");
+        git(
+            &repo,
+            &["add", ".tasker/validation-commands.txt", "main-only.txt"],
+        );
+        git(&repo, &["commit", "-m", "move main"]);
+        let current_main = git_output(&repo, &["rev-parse", "main"], "read main head")
+            .expect("main head")
+            .trim()
+            .to_string();
+        let runs_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(&pool)
+            .await
+            .expect("run count before");
+
+        let result = integrate_local_worktree_for_run(
+            &pool,
+            "TASK-1",
+            None,
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
+
+        assert!(result.summary.contains("Final Commit"));
+        let runs_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(&pool)
+            .await
+            .expect("run count after");
+        assert_eq!(runs_before, runs_after);
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "done");
+        assert_eq!(
+            detail.task.validated_base_commit.as_deref(),
+            Some(current_main.as_str())
+        );
+        let reason_code: String = sqlx::query_scalar(
+        "SELECT reason_code FROM integration_outcomes ORDER BY created_at DESC, rowid DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("reason code");
+        assert_eq!(reason_code, "auto_refresh_success");
+    }
+
+    #[tokio::test]
+    async fn local_worktree_integration_stale_validated_base_conflict_moves_to_rework() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, _worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        record_current_main_as_stale_base(&pool, &repo).await;
+        fs::create_dir_all(repo.join(".tasker")).expect("tasker dir");
+        fs::write(repo.join(".tasker/validation-commands.txt"), "true\n").expect("commands");
+        fs::write(repo.join("feature.txt"), "main feature\n").expect("conflict");
+        git(
+            &repo,
+            &["add", ".tasker/validation-commands.txt", "feature.txt"],
+        );
+        git(&repo, &["commit", "-m", "conflict on main"]);
+
+        let result = integrate_local_worktree_for_run(
+            &pool,
+            "TASK-1",
+            None,
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
+
+        assert!(result.summary.contains("auto-refresh conflict"));
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "rework");
+        let reason_code: String = sqlx::query_scalar(
+        "SELECT reason_code FROM integration_outcomes ORDER BY created_at DESC, rowid DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("reason code");
+        assert_eq!(reason_code, "auto_refresh_conflict");
+    }
+
+    #[tokio::test]
+    async fn local_worktree_integration_stale_validated_base_validation_failure_moves_to_rework() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, _worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        record_current_main_as_stale_base(&pool, &repo).await;
+        fs::create_dir_all(repo.join(".tasker")).expect("tasker dir");
+        fs::write(repo.join(".tasker/validation-commands.txt"), "false\n").expect("commands");
+        fs::write(repo.join("main-only.txt"), "main moved\n").expect("main change");
+        git(
+            &repo,
+            &["add", ".tasker/validation-commands.txt", "main-only.txt"],
+        );
+        git(&repo, &["commit", "-m", "move main"]);
+
+        let result = integrate_local_worktree_for_run(
+            &pool,
+            "TASK-1",
+            None,
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
+
+        assert!(result.summary.contains("auto-refresh validation failed"));
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "rework");
+        let reason_code: String = sqlx::query_scalar(
+        "SELECT reason_code FROM integration_outcomes ORDER BY created_at DESC, rowid DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("reason code");
+        assert_eq!(reason_code, "auto_refresh_validation_failed");
+    }
+
+    #[tokio::test]
+    async fn local_worktree_integration_stale_validated_base_missing_validation_declines_to_rework()
+    {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, _worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        record_current_main_as_stale_base(&pool, &repo).await;
+        fs::write(repo.join("main-only.txt"), "main moved\n").expect("main change");
+        git(&repo, &["add", "main-only.txt"]);
+        git(&repo, &["commit", "-m", "move main"]);
+
+        let result = integrate_local_worktree_for_run(
+            &pool,
+            "TASK-1",
+            None,
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
+
+        assert!(result.summary.contains("no validation command source"));
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "rework");
+        let reason_code: String = sqlx::query_scalar(
+        "SELECT reason_code FROM integration_outcomes ORDER BY created_at DESC, rowid DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("reason code");
+        assert_eq!(reason_code, "auto_refresh_declined_missing_validation");
+    }
+
+    #[tokio::test]
+    async fn local_worktree_integration_stale_validated_base_dirty_worktree_skips_auto_refresh() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        record_current_main_as_stale_base(&pool, &repo).await;
+        fs::create_dir_all(repo.join(".tasker")).expect("tasker dir");
+        fs::write(repo.join(".tasker/validation-commands.txt"), "true\n").expect("commands");
+        fs::write(repo.join("main-only.txt"), "main moved\n").expect("main change");
+        git(
+            &repo,
+            &["add", ".tasker/validation-commands.txt", "main-only.txt"],
+        );
+        git(&repo, &["commit", "-m", "move main"]);
+        fs::write(worktree.join("dirty.txt"), "dirty\n").expect("dirty worktree");
+
+        let result = integrate_local_worktree_for_run(
+            &pool,
+            "TASK-1",
+            None,
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
+
+        assert!(result
+            .summary
+            .contains("Local Worktree has uncommitted changes"));
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "rework");
+        assert!(worktree.join("dirty.txt").exists());
+        let reason_code: String = sqlx::query_scalar(
+        "SELECT reason_code FROM integration_outcomes ORDER BY created_at DESC, rowid DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("reason code");
+        assert_eq!(reason_code, "uncommitted_local_worktree");
+    }
+
+    #[tokio::test]
+    async fn local_worktree_integration_stale_task_branch_moves_to_rework() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, _worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        fs::write(repo.join("main-only.txt"), "main moved\n").expect("main change");
+        git(&repo, &["add", "main-only.txt"]);
+        git(&repo, &["commit", "-m", "move main"]);
+
+        let result = integrate_local_worktree_for_run(
+            &pool,
+            "TASK-1",
+            None,
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
+
+        assert!(result.summary.contains("work-change Delivery Failure"));
+        assert!(result
+            .summary
+            .contains("does not include current Main Branch"));
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "rework");
+        let reason_code: String = sqlx::query_scalar(
+        "SELECT reason_code FROM integration_outcomes ORDER BY created_at DESC, rowid DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("reason code");
+        assert_eq!(reason_code, "task_branch_missing_main");
+    }
+
+    #[tokio::test]
+    async fn local_worktree_integration_commit_failure_rolls_back_main_branch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let (repo, _worktree) = seed_integrating_local_task(&pool, temp.path(), true, false).await;
+        let pre_head = git_output(&repo, &["rev-parse", "HEAD"], "read HEAD").expect("head");
+        let hooks = repo.join(".git/hooks");
+        fs::write(hooks.join("pre-commit"), "#!/bin/sh\nexit 1\n").expect("hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(hooks.join("pre-commit"))
+                .expect("hook metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(hooks.join("pre-commit"), permissions).expect("chmod hook");
+        }
+
+        let result = integrate_local_worktree_for_run(
+            &pool,
+            "TASK-1",
+            None,
+            &tasker_db::Actor::operator("tester"),
+            temp.path(),
+        )
+        .await
+        .expect("integrate");
+
+        assert!(result.summary.contains("Final Commit failed"));
+        let after_head = git_output(&repo, &["rev-parse", "HEAD"], "read HEAD").expect("head");
+        assert_eq!(pre_head, after_head);
+        assert!(git_output(&repo, &["status", "--porcelain"], "status")
+            .expect("status")
+            .trim()
+            .is_empty());
+        let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+            .await
+            .expect("task")
+            .expect("task");
+        assert_eq!(detail.task.state, "rework");
+    }
+
+    async fn seed_integrating_local_task(
+        pool: &SqlitePool,
+        root: &Path,
+        with_feature_commit: bool,
+        done_worktree_retention: bool,
+    ) -> (PathBuf, PathBuf) {
+        let repo = root.join("repo");
+        let worktrees = root.join("worktrees");
+        let worktree = worktrees.join("TASK-1");
+        init_git_repo(&repo);
+        tasker_db::create_task_queue(
+            pool,
+            &tasker_db::CreateTaskQueue {
+                key: "TASK".to_string(),
+                name: "Tasker".to_string(),
+                managed_source_repository: repo.display().to_string(),
+                main_branch: "main".to_string(),
+                worktree_root: worktrees.display().to_string(),
+                branch_template: "tasker/{task_identifier}".to_string(),
+                done_worktree_retention,
+                queue_concurrency_limit: None,
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("queue");
+        tasker_db::create_task(
+            pool,
+            &tasker_db::CreateTask {
+                queue_key: "TASK".to_string(),
+                title: "Integrate me".to_string(),
+                brief: "Brief".to_string(),
+                priority: "normal".to_string(),
+                state: "ready".to_string(),
+                review_required: false,
+                acceptance_criteria: vec!["accepted".to_string()],
+                validation_items: vec!["validated".to_string()],
+                tags: vec![],
+                conflict_hints: vec![],
+                blocking_task_identifiers: vec![],
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("task");
+        run_git(
+            &repo,
+            &["branch", "tasker/TASK-1", "main"],
+            "create task branch",
+        )
+        .expect("branch");
+        fs::create_dir_all(&worktrees).expect("worktrees");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                worktree.to_str().expect("utf8"),
+                "tasker/TASK-1",
+            ],
+            "add worktree",
+        )
+        .expect("worktree");
+        if with_feature_commit {
+            fs::write(worktree.join("feature.txt"), "feature\n").expect("feature");
+            run_git(&worktree, &["add", "feature.txt"], "add feature").expect("add feature");
+            run_git(
+                &worktree,
+                &["commit", "-m", "add feature"],
+                "commit feature",
+            )
+            .expect("commit feature");
+        }
+        let actor = tasker_db::Actor::operator("tester");
+        tasker_db::upsert_task_link(
+            pool,
+            "TASK-1",
+            &tasker_db::UpsertTaskLink {
+                kind: "local_worktree".to_string(),
+                target: worktree.display().to_string(),
+                label: Some("Local Worktree".to_string()),
+                is_primary: true,
+            },
+            &actor,
+        )
+        .await
+        .expect("worktree link");
+        tasker_db::upsert_task_link(
+            pool,
+            "TASK-1",
+            &tasker_db::UpsertTaskLink {
+                kind: "task_branch".to_string(),
+                target: "tasker/TASK-1".to_string(),
+                label: Some("Task Branch".to_string()),
+                is_primary: false,
+            },
+            &actor,
+        )
+        .await
+        .expect("branch link");
+        tasker_db::update_acceptance_criterion_status(
+            pool,
+            "TASK-1",
+            1,
+            &tasker_db::UpdateRequirementStatus {
+                status: "satisfied".to_string(),
+                waiver_reason: None,
+                validated_base_commit: None,
+            },
+            &actor,
+        )
+        .await
+        .expect("criterion");
+        tasker_db::update_validation_item_status(
+            pool,
+            "TASK-1",
+            1,
+            &tasker_db::UpdateRequirementStatus {
+                status: "passed".to_string(),
+                waiver_reason: None,
+                validated_base_commit: None,
+            },
+            &actor,
+        )
+        .await
+        .expect("validation");
+        tasker_db::transition_task_state(
+            pool,
+            "TASK-1",
+            &tasker_db::TransitionTaskState {
+                to_state: "in_progress".to_string(),
+                agent_run_id: None,
+                repair_override: false,
+            },
+            &actor,
+        )
+        .await
+        .expect("in progress");
+        tasker_db::transition_task_state(
+            pool,
+            "TASK-1",
+            &tasker_db::TransitionTaskState {
+                to_state: "integrating".to_string(),
+                agent_run_id: None,
+                repair_override: false,
+            },
+            &actor,
+        )
+        .await
+        .expect("integrating");
+        (repo, worktree)
+    }
+
+    async fn record_current_main_as_stale_base(pool: &SqlitePool, repo: &Path) {
+        let old_main = git_output(repo, &["rev-parse", "main"], "read main head")
+            .expect("main head")
+            .trim()
+            .to_string();
+        tasker_db::update_validation_item_status(
+            pool,
+            "TASK-1",
+            1,
+            &tasker_db::UpdateRequirementStatus {
+                status: "passed".to_string(),
+                waiver_reason: None,
+                validated_base_commit: Some(old_main),
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("record stale base");
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        run_git(repo, args, "test git command").expect("git command");
+    }
+
+    fn init_git_repo(repo: &Path) {
+        fs::create_dir_all(repo).expect("repo dir");
+        run_git(repo, &["init", "-b", "main"], "init repo").expect("git init");
+        run_git(
+            repo,
+            &["config", "user.email", "tasker@example.test"],
+            "config email",
+        )
+        .expect("email");
+        run_git(repo, &["config", "user.name", "Tasker Test"], "config name").expect("name");
+        fs::write(repo.join("README.md"), "test repo\n").expect("readme");
+        run_git(repo, &["add", "README.md"], "add readme").expect("add readme");
+        run_git(repo, &["commit", "-m", "initial"], "initial commit").expect("initial commit");
+    }
+}

@@ -38,7 +38,7 @@ Suggested Implementation Slice sequence:
 2. Move Local Worktree Integration and wire `tasker merge retry` through `tasker-runner`.
 3. Move Agent Launcher pieces and Worker Loop behavior.
 4. Move supervisor orchestration.
-5. Clean up remaining CLI tests into CLI smoke tests and document targeted runner test commands.
+5. Clean up remaining CLI tests into CLI smoke tests and document targeted runner test commands. (Completed by moving remaining Local Worktree Delivery and commit metadata behavior tests into `tasker-runner` and adding `crates/tasker-runner/README.md` as the canonical targeted runner validation guide.)
 
 Stop between slices if public API shape, behavior, or test failures get messy.
 
@@ -148,6 +148,12 @@ Validation Items:
 - `cargo test -p tasker-runner`
 - Relevant `cargo test -p tasker-cli` targeted tests pass.
 - `cargo test --workspace`
+
+## Completed structure
+
+- `tasker-runner` owns runner-side behavior and behavior tests for Managed Source Repository operation locks, Local Worktree Delivery, Final Commit metadata, Worker Loop/Agent Launcher handling, and supervisor orchestration.
+- `tasker-cli` remains a command facade for parsing, command wiring, operator guidance, and output smoke tests.
+- Targeted runner validation commands are documented in `crates/tasker-runner/README.md`.
 
 ## Follow-up after extraction
 
