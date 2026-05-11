@@ -174,6 +174,42 @@ const RUN_DURATION_BUDGET: EfficiencyBudgetThreshold = EfficiencyBudgetThreshold
     severe: 2 * 60 * 60,
 };
 
+const WORKFLOW_REGRESSION_MULTIPLIER: f64 = 1.25;
+const WORKFLOW_REGRESSION_MIN_BASELINE_RUNS: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkflowRegressionThreshold {
+    metric: &'static str,
+    minimum_delta: i64,
+}
+
+const WORKFLOW_REGRESSION_THRESHOLDS: [WorkflowRegressionThreshold; 6] = [
+    WorkflowRegressionThreshold {
+        metric: "total_tokens",
+        minimum_delta: 10_000,
+    },
+    WorkflowRegressionThreshold {
+        metric: "tool_calls",
+        minimum_delta: 5,
+    },
+    WorkflowRegressionThreshold {
+        metric: "repeated_reads",
+        minimum_delta: 1,
+    },
+    WorkflowRegressionThreshold {
+        metric: "repeated_tasker_context_fetches",
+        minimum_delta: 1,
+    },
+    WorkflowRegressionThreshold {
+        metric: "duration_seconds",
+        minimum_delta: 60,
+    },
+    WorkflowRegressionThreshold {
+        metric: "transcript_bytes",
+        minimum_delta: 1024 * 1024,
+    },
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EfficiencyBudgetThresholdSet {
     tool_calls: EfficiencyBudgetThreshold,
@@ -406,7 +442,7 @@ pub struct EfficiencyTelemetrySummary {
     pub inefficient_runs: Vec<TelemetryRun>,
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug, Clone, FromRow)]
 struct TelemetryRunRow {
     task_identifier: String,
     task_title: String,
@@ -2121,6 +2157,27 @@ pub struct MetricSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkflowRegressionReport {
+    pub recent_run_count: usize,
+    pub baseline_run_count: usize,
+    pub minimum_baseline_run_count: usize,
+    pub threshold_multiplier: f64,
+    pub threshold_minimum_deltas: BTreeMap<String, i64>,
+    pub flags: Vec<WorkflowRegressionFlag>,
+    pub recommendations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkflowRegressionFlag {
+    pub metric: String,
+    pub recent_median: Option<f64>,
+    pub recent_p90: Option<i64>,
+    pub baseline_median: Option<f64>,
+    pub baseline_p90: Option<i64>,
+    pub trigger: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RecentEfficiencyDeltas {
     pub tool_calls_average: Option<f64>,
     pub repeated_reads_average: Option<f64>,
@@ -2172,6 +2229,7 @@ pub struct WorkflowMetricsSummary {
     pub repeated_tasker_context_fetch_count: i64,
     pub transcript_byte_summary: MetricSummary,
     pub efficiency_hint_frequencies: BTreeMap<String, i64>,
+    pub regression_report: WorkflowRegressionReport,
     pub cautions: Vec<String>,
 }
 
@@ -2764,6 +2822,30 @@ fn metric_summary(values: impl Iterator<Item = i64>) -> MetricSummary {
     }
 }
 
+fn metric_median(values: &[i64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    if sorted.len() % 2 == 0 {
+        Some((sorted[mid - 1] as f64 + sorted[mid] as f64) / 2.0)
+    } else {
+        Some(sorted[mid] as f64)
+    }
+}
+
+fn metric_p90(values: &[i64]) -> Option<i64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let index = ((sorted.len() * 9).div_ceil(10)).saturating_sub(1);
+    sorted.get(index).copied()
+}
+
 fn recent_efficiency_deltas(
     previous: &RecentEfficiencyWindow,
     recent: &RecentEfficiencyWindow,
@@ -2950,6 +3032,14 @@ pub async fn workflow_metrics_summary(
             .then_with(|| right.agent_run_id.cmp(&left.agent_run_id))
     });
     let uses_date_window = options.since.is_some() || options.until.is_some();
+    let baseline_runs = if !uses_date_window {
+        runs.iter()
+            .skip(options.recent.max(1))
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     if !uses_date_window {
         runs.truncate(options.recent.max(1));
     }
@@ -2971,11 +3061,28 @@ pub async fn workflow_metrics_summary(
             *hint_counts.entry(hint).or_insert(0) += 1;
         }
     }
+    let regression_report = build_workflow_regression_report(&runs, &baseline_runs, &hint_counts);
     let mut cautions = vec![
         "completed pi Agent Runs only; active, failed, fake, and non-pi runs are excluded".to_string(),
         "token and context metrics may be unavailable; unknown values are shown as unknown/null, not zero".to_string(),
         "report exports only sanitized numeric summaries; raw prompts, transcripts, Launcher Session Data payloads, tool arguments, Workpad Notes, shell commands, and shell output are omitted".to_string(),
+        format!(
+            "regression flags compare recent medians and p90s with historical completed pi baseline medians and p90s; a metric flags when it exceeds baseline by >= {:.0}% and at least the documented minimum delta",
+            (WORKFLOW_REGRESSION_MULTIPLIER - 1.0) * 100.0
+        ),
     ];
+    if uses_date_window {
+        cautions.push(
+            "regression baseline is disabled for date-window reports; use the recent-window report for local baseline comparison"
+                .to_string(),
+        );
+    } else if regression_report.baseline_run_count < regression_report.minimum_baseline_run_count {
+        cautions.push(format!(
+            "regression baseline has {} historical completed pi Agent Run(s), below recommended minimum {}; flags may be noisy",
+            regression_report.baseline_run_count,
+            regression_report.minimum_baseline_run_count
+        ));
+    }
     if window.runs_with_metrics < window.agent_runs {
         cautions.push(format!(
             "metric coverage: {}/{} completed pi Agent Run(s) have normalized metrics",
@@ -3030,8 +3137,170 @@ pub async fn workflow_metrics_summary(
             .sum(),
         transcript_byte_summary: window.transcript_bytes,
         efficiency_hint_frequencies: hint_counts,
+        regression_report,
         cautions,
     })
+}
+
+fn build_workflow_regression_report(
+    recent_runs: &[TelemetryRunRow],
+    baseline_runs: &[TelemetryRunRow],
+    hint_counts: &BTreeMap<String, i64>,
+) -> WorkflowRegressionReport {
+    let threshold_minimum_deltas = WORKFLOW_REGRESSION_THRESHOLDS
+        .iter()
+        .map(|threshold| (threshold.metric.to_string(), threshold.minimum_delta))
+        .collect::<BTreeMap<_, _>>();
+    let flags = WORKFLOW_REGRESSION_THRESHOLDS
+        .iter()
+        .filter_map(|threshold| workflow_regression_flag(threshold, recent_runs, baseline_runs))
+        .collect::<Vec<_>>();
+    let recommendations = workflow_regression_recommendations(&flags, hint_counts);
+    WorkflowRegressionReport {
+        recent_run_count: recent_runs.len(),
+        baseline_run_count: baseline_runs.len(),
+        minimum_baseline_run_count: WORKFLOW_REGRESSION_MIN_BASELINE_RUNS,
+        threshold_multiplier: WORKFLOW_REGRESSION_MULTIPLIER,
+        threshold_minimum_deltas,
+        flags,
+        recommendations,
+    }
+}
+
+fn workflow_regression_flag(
+    threshold: &WorkflowRegressionThreshold,
+    recent_runs: &[TelemetryRunRow],
+    baseline_runs: &[TelemetryRunRow],
+) -> Option<WorkflowRegressionFlag> {
+    if baseline_runs.is_empty() || recent_runs.is_empty() {
+        return None;
+    }
+    let recent_values = workflow_metric_values(recent_runs, threshold.metric);
+    let baseline_values = workflow_metric_values(baseline_runs, threshold.metric);
+    if recent_values.is_empty() || baseline_values.is_empty() {
+        return None;
+    }
+    let recent_median = metric_median(&recent_values)?;
+    let baseline_median = metric_median(&baseline_values)?;
+    let recent_p90 = metric_p90(&recent_values)?;
+    let baseline_p90 = metric_p90(&baseline_values)?;
+
+    let median_limit = regression_limit_f64(baseline_median, threshold.minimum_delta);
+    let p90_limit = regression_limit_i64(baseline_p90, threshold.minimum_delta);
+    let trigger = if recent_median >= median_limit {
+        format!(
+            "median {} >= baseline median {:.1} * {:.2} with minimum delta {}",
+            display_f64(recent_median),
+            baseline_median,
+            WORKFLOW_REGRESSION_MULTIPLIER,
+            threshold.minimum_delta
+        )
+    } else if recent_p90 >= p90_limit {
+        format!(
+            "p90 {recent_p90} >= baseline p90 {baseline_p90} * {:.2} with minimum delta {}",
+            WORKFLOW_REGRESSION_MULTIPLIER, threshold.minimum_delta
+        )
+    } else {
+        return None;
+    };
+
+    Some(WorkflowRegressionFlag {
+        metric: threshold.metric.to_string(),
+        recent_median: Some(recent_median),
+        recent_p90: Some(recent_p90),
+        baseline_median: Some(baseline_median),
+        baseline_p90: Some(baseline_p90),
+        trigger,
+    })
+}
+
+fn regression_limit_f64(baseline: f64, minimum_delta: i64) -> f64 {
+    (baseline * WORKFLOW_REGRESSION_MULTIPLIER).max(baseline + minimum_delta as f64)
+}
+
+fn regression_limit_i64(baseline: i64, minimum_delta: i64) -> i64 {
+    ((baseline as f64 * WORKFLOW_REGRESSION_MULTIPLIER).ceil() as i64).max(baseline + minimum_delta)
+}
+
+fn workflow_metric_values(runs: &[TelemetryRunRow], metric: &str) -> Vec<i64> {
+    runs.iter()
+        .filter_map(|run| match metric {
+            "total_tokens" => run.total_tokens,
+            "tool_calls" => run.tool_call_count,
+            "repeated_reads" => run.repeated_read_count,
+            "repeated_tasker_context_fetches" => run.repeated_tasker_context_fetch_count,
+            "duration_seconds" => run.duration_seconds,
+            "transcript_bytes" => run.transcript_byte_size,
+            _ => None,
+        })
+        .collect()
+}
+
+fn workflow_regression_recommendations(
+    flags: &[WorkflowRegressionFlag],
+    hint_counts: &BTreeMap<String, i64>,
+) -> Vec<String> {
+    let mut recommendations = Vec::new();
+    let flagged = |metric: &str| flags.iter().any(|flag| flag.metric == metric);
+    if flagged("total_tokens") {
+        recommendations.push(
+            "Reduce token growth by using the Task context bundle and targeted file reads instead of broad rediscovery."
+                .to_string(),
+        );
+    }
+    if flagged("tool_calls") {
+        recommendations.push(
+            "Batch independent shell/file discovery and prefer focused rg queries to lower tool-call count."
+                .to_string(),
+        );
+    }
+    if flagged("repeated_reads") {
+        recommendations.push(
+            "Avoid rereading unchanged files; keep a short local context plan and reread only before precise edits."
+                .to_string(),
+        );
+    }
+    if flagged("repeated_tasker_context_fetches") {
+        recommendations.push(
+            "Fetch Tasker context once at run start and use Workpad Notes for concise handoff instead of repeated Tasker context reads."
+                .to_string(),
+        );
+    }
+    if flagged("duration_seconds") {
+        recommendations.push(
+            "Shorten long runs with smaller implementation slices and targeted deterministic tests before final validation."
+                .to_string(),
+        );
+    }
+    if flagged("transcript_bytes") {
+        recommendations.push(
+            "Reduce transcript volume by avoiding large logs, raw transcript dumps, and repeated command output."
+                .to_string(),
+        );
+    }
+    let mut top_hints = hint_counts
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .collect::<Vec<_>>();
+    top_hints.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+    if !top_hints.is_empty() {
+        recommendations.push(format!(
+            "Review recurring efficiency hints: {}.",
+            top_hints
+                .into_iter()
+                .take(3)
+                .map(|(hint, count)| format!("{hint}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if recommendations.is_empty() {
+        recommendations.push(
+            "No local efficiency regression flags; continue monitoring recent completed pi Agent Runs."
+                .to_string(),
+        );
+    }
+    recommendations
 }
 
 async fn load_completed_pi_workflow_runs(
@@ -3183,11 +3452,47 @@ pub fn render_workflow_metrics_summary(summary: &WorkflowMetricsSummary) -> Stri
         render_counts(&summary.efficiency_hint_frequencies)
     )
     .expect("write string");
+    write_workflow_regression_report(&mut output, &summary.regression_report);
     writeln!(output, "cautions:").expect("write string");
     for caution in &summary.cautions {
         writeln!(output, "  - {caution}").expect("write string");
     }
     output
+}
+
+fn write_workflow_regression_report(output: &mut String, report: &WorkflowRegressionReport) {
+    writeln!(output, "regression report:").expect("write string");
+    writeln!(
+        output,
+        "  recent runs={} baseline runs={} threshold=baseline*{:.2} plus minimum deltas {}",
+        report.recent_run_count,
+        report.baseline_run_count,
+        report.threshold_multiplier,
+        render_counts(&report.threshold_minimum_deltas)
+    )
+    .expect("write string");
+    if report.flags.is_empty() {
+        writeln!(output, "  flags: none").expect("write string");
+    } else {
+        writeln!(output, "  flags:").expect("write string");
+        for flag in &report.flags {
+            writeln!(
+                output,
+                "    - {}: recent median={} p90={} vs baseline median={} p90={} ({})",
+                flag.metric,
+                display_avg(flag.recent_median),
+                display_opt(flag.recent_p90),
+                display_avg(flag.baseline_median),
+                display_opt(flag.baseline_p90),
+                flag.trigger,
+            )
+            .expect("write string");
+        }
+    }
+    writeln!(output, "  recommendations:").expect("write string");
+    for recommendation in &report.recommendations {
+        writeln!(output, "    - {recommendation}").expect("write string");
+    }
 }
 
 fn write_recent_efficiency_window(output: &mut String, window: &RecentEfficiencyWindow) {
@@ -3237,6 +3542,10 @@ fn display_avg(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.1}"))
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn display_f64(value: f64) -> String {
+    format!("{value:.1}")
 }
 
 fn display_delta_f64(value: Option<f64>) -> String {
@@ -4643,6 +4952,163 @@ mod tests {
         let json_text = serde_json::to_string(&window).expect("json");
         assert!(!json_text.contains("secret brief"));
         assert!(!json_text.contains("secret failure"));
+    }
+
+    #[tokio::test]
+    async fn telemetry_workflow_metrics_flags_regressions_against_local_baseline() {
+        let pool = memory_pool().await;
+        sqlx::query(
+            r#"
+            INSERT INTO task_queues (
+                id, key, name, managed_source_repository, main_branch, worktree_root, branch_template
+            ) VALUES ('queue-1', 'TASK', 'Tasker', '/repo', 'main', '/worktrees', 'tasker/{task_identifier}')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("queue");
+        for index in 1..=5 {
+            let identifier = format!("TASK-{index}");
+            sqlx::query(
+                "INSERT INTO tasks (id, task_queue_id, identifier, sequence, title, brief, priority, state) VALUES (?, 'queue-1', ?, ?, ?, 'secret brief', 'normal', 'done')",
+            )
+            .bind(&identifier)
+            .bind(&identifier)
+            .bind(index)
+            .bind(format!("Task {index}"))
+            .execute(&pool)
+            .await
+            .expect("task");
+        }
+        for (task_id, run_id, created_at, finished_at) in [
+            (
+                "TASK-1",
+                "base-1",
+                "2026-01-01 00:00:00",
+                "2026-01-01 00:10:00",
+            ),
+            (
+                "TASK-2",
+                "base-2",
+                "2026-01-01 01:00:00",
+                "2026-01-01 01:10:00",
+            ),
+            (
+                "TASK-3",
+                "base-3",
+                "2026-01-01 02:00:00",
+                "2026-01-01 02:10:00",
+            ),
+            (
+                "TASK-4",
+                "recent-1",
+                "2026-01-02 00:00:00",
+                "2026-01-02 02:30:00",
+            ),
+            (
+                "TASK-5",
+                "recent-2",
+                "2026-01-02 03:00:00",
+                "2026-01-02 05:30:00",
+            ),
+        ] {
+            insert_run(
+                &pool,
+                task_id,
+                "queue-1",
+                run_id,
+                created_at,
+                finished_at,
+                Some("completed"),
+                None,
+            )
+            .await;
+        }
+        for (run_id, tool_calls, reads, fetches, tokens, transcript, hints) in [
+            ("base-1", 10, 0, 0, 10_000, 1_000, r#"[]"#),
+            ("base-2", 12, 0, 0, 12_000, 1_100, r#"[]"#),
+            ("base-3", 14, 0, 0, 14_000, 1_200, r#"[]"#),
+            (
+                "recent-1",
+                40,
+                3,
+                2,
+                80_000,
+                3_000_000,
+                r#"["repeated file reads","large transcript/proxy output volume"]"#,
+            ),
+            (
+                "recent-2",
+                45,
+                4,
+                2,
+                90_000,
+                4_000_000,
+                r#"["repeated Tasker context fetches"]"#,
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO agent_run_metrics (
+                    agent_run_id, launcher_kind, final_status, transcript_byte_size,
+                    total_tokens, tool_call_count, tool_error_count, repeated_failed_tool_attempt_count,
+                    tool_call_counts_json, repeated_read_count, repeated_tasker_context_fetch_count,
+                    shell_command_counts_json, assistant_turn_count, user_turn_count,
+                    max_context_tokens, efficiency_hints_json
+                ) VALUES (?, 'pi', 'completed', ?, ?, ?, 0, 0, '{"read":1}', ?, ?, '{"tasker_cli":1}', 1, 1, 5000, ?)
+                "#,
+            )
+            .bind(run_id)
+            .bind(transcript)
+            .bind(tokens)
+            .bind(tool_calls)
+            .bind(reads)
+            .bind(fetches)
+            .bind(hints)
+            .execute(&pool)
+            .await
+            .expect("metrics");
+        }
+
+        let summary = workflow_metrics_summary(
+            &pool,
+            &WorkflowMetricsOptions {
+                queue: "TASK".to_string(),
+                recent: 2,
+                since: None,
+                until: None,
+            },
+        )
+        .await
+        .expect("workflow regression");
+
+        assert_eq!(summary.regression_report.recent_run_count, 2);
+        assert_eq!(summary.regression_report.baseline_run_count, 3);
+        let flagged_metrics = summary
+            .regression_report
+            .flags
+            .iter()
+            .map(|flag| flag.metric.as_str())
+            .collect::<Vec<_>>();
+        assert!(flagged_metrics.contains(&"total_tokens"));
+        assert!(flagged_metrics.contains(&"tool_calls"));
+        assert!(flagged_metrics.contains(&"repeated_reads"));
+        assert!(flagged_metrics.contains(&"repeated_tasker_context_fetches"));
+        assert!(flagged_metrics.contains(&"duration_seconds"));
+        assert!(flagged_metrics.contains(&"transcript_bytes"));
+        assert!(summary
+            .regression_report
+            .recommendations
+            .iter()
+            .any(|line| line.contains("Tasker context once")));
+        let rendered = render_workflow_metrics_summary(&summary);
+        assert!(rendered.contains("regression report:"));
+        assert!(rendered.contains("total_tokens"));
+        assert!(rendered.contains("Review recurring efficiency hints"));
+        assert!(!rendered.contains("secret brief"));
+        let json_text = serde_json::to_string(&summary).expect("json");
+        assert!(!json_text.contains("secret brief"));
+        assert!(!json_text.contains("transcript_path"));
     }
 
     #[tokio::test]
