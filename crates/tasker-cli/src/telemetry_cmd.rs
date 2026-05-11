@@ -95,6 +95,28 @@ pub(crate) async fn telemetry(
                 print!("{}", telemetry::render_trend_summary(&summary));
             }
         }
+        TelemetryCommand::Efficiency {
+            queue,
+            recent,
+            top_limit,
+            json,
+        } => {
+            let summary = telemetry::recent_efficiency_summary(
+                &pool,
+                &telemetry::RecentEfficiencyOptions {
+                    queue,
+                    recent,
+                    top_limit,
+                },
+            )
+            .await?;
+            if json {
+                serde_json::to_writer_pretty(std::io::stdout(), &summary)?;
+                println!();
+            } else {
+                print!("{}", telemetry::render_recent_efficiency_summary(&summary));
+            }
+        }
     }
     Ok(())
 }

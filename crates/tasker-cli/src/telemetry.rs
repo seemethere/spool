@@ -1722,6 +1722,85 @@ pub struct TrendDeltas {
     pub duplicate_agent_run_waste: isize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentEfficiencyOptions {
+    pub queue: String,
+    pub recent: usize,
+    pub top_limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RecentEfficiencySummary {
+    pub queue: String,
+    pub recent: usize,
+    pub top_limit: usize,
+    pub recent_window: RecentEfficiencyWindow,
+    pub previous_window: Option<RecentEfficiencyWindow>,
+    pub deltas: Option<RecentEfficiencyDeltas>,
+    pub top_offenders: Vec<RecentEfficiencyOffender>,
+    pub cautions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RecentEfficiencyWindow {
+    pub label: String,
+    pub agent_runs: usize,
+    pub runs_with_metrics: usize,
+    pub tool_calls: MetricSummary,
+    pub tool_errors: MetricSummary,
+    pub repeated_failed_tool_attempts: MetricSummary,
+    pub repeated_reads: MetricSummary,
+    pub repeated_tasker_context_fetches: MetricSummary,
+    pub input_tokens: MetricSummary,
+    pub output_tokens: MetricSummary,
+    pub total_tokens: MetricSummary,
+    pub cache_read_tokens: MetricSummary,
+    pub cache_write_tokens: MetricSummary,
+    pub max_context_tokens: MetricSummary,
+    pub transcript_bytes: MetricSummary,
+    pub duration_seconds: MetricSummary,
+    pub failed_runs: usize,
+    pub duplicate_agent_run_waste: usize,
+    pub duplicate_tasks: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MetricSummary {
+    pub average: Option<f64>,
+    pub high_water: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RecentEfficiencyDeltas {
+    pub tool_calls_average: Option<f64>,
+    pub repeated_reads_average: Option<f64>,
+    pub repeated_tasker_context_fetches_average: Option<f64>,
+    pub total_tokens_average: Option<f64>,
+    pub max_context_tokens_high_water: Option<i64>,
+    pub transcript_bytes_average: Option<f64>,
+    pub duration_seconds_average: Option<f64>,
+    pub failed_runs: isize,
+    pub duplicate_agent_run_waste: isize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecentEfficiencyOffender {
+    pub task_identifier: String,
+    pub task_title: String,
+    pub agent_run_id: String,
+    pub outcome: Option<String>,
+    pub tool_call_count: Option<i64>,
+    pub tool_error_count: Option<i64>,
+    pub repeated_failed_tool_attempt_count: Option<i64>,
+    pub repeated_read_count: Option<i64>,
+    pub repeated_tasker_context_fetch_count: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub max_context_tokens: Option<i64>,
+    pub transcript_byte_size: Option<i64>,
+    pub duration_seconds: Option<i64>,
+    pub budget_warning_count: usize,
+}
+
 #[derive(Debug, Clone, FromRow)]
 struct TrendOutcomeRow {
     created_epoch: i64,
@@ -2149,6 +2228,353 @@ fn write_trend_bucket(output: &mut String, label: &str, bucket: &TrendBucket) {
         render_counts(&bucket.integration_outcome_reason_counts)
     )
     .expect("write string");
+}
+
+pub async fn recent_efficiency_summary(
+    pool: &SqlitePool,
+    options: &RecentEfficiencyOptions,
+) -> Result<RecentEfficiencySummary> {
+    let mut runs = load_trend_runs(pool, &options.queue).await?;
+    runs.sort_by(|left, right| {
+        right
+            .created_epoch
+            .cmp(&left.created_epoch)
+            .then_with(|| right.agent_run_id.cmp(&left.agent_run_id))
+    });
+    let recent_limit = options.recent.max(1);
+    let top_limit = options.top_limit.max(1);
+    let recent_runs = runs.iter().take(recent_limit).collect::<Vec<_>>();
+    let previous_runs = runs
+        .iter()
+        .skip(recent_limit)
+        .take(recent_limit)
+        .collect::<Vec<_>>();
+    let recent_window = build_recent_efficiency_window("recent", &recent_runs);
+    let previous_window = (!previous_runs.is_empty())
+        .then(|| build_recent_efficiency_window("previous", &previous_runs));
+    let deltas = previous_window
+        .as_ref()
+        .map(|previous| recent_efficiency_deltas(previous, &recent_window));
+    let mut top_offenders = recent_runs
+        .iter()
+        .map(|run| recent_efficiency_offender(run))
+        .collect::<Vec<_>>();
+    top_offenders.sort_by(|left, right| {
+        offender_score(right)
+            .cmp(&offender_score(left))
+            .then_with(|| left.task_identifier.cmp(&right.task_identifier))
+            .then_with(|| left.agent_run_id.cmp(&right.agent_run_id))
+    });
+    top_offenders.truncate(top_limit);
+    let mut cautions = vec![
+        "token and context metrics may be unavailable; unknown values are shown as unknown/null, not zero".to_string(),
+        "report exports only sanitized numeric summaries; raw prompts, transcripts, tool arguments, Workpad Notes, shell commands, and shell output are omitted".to_string(),
+    ];
+    if recent_window.runs_with_metrics < recent_window.agent_runs {
+        cautions.push(format!(
+            "metric coverage: recent={}/{} Agent Run(s)",
+            recent_window.runs_with_metrics, recent_window.agent_runs
+        ));
+    }
+    Ok(RecentEfficiencySummary {
+        queue: options.queue.clone(),
+        recent: recent_limit,
+        top_limit,
+        recent_window,
+        previous_window,
+        deltas,
+        top_offenders,
+        cautions,
+    })
+}
+
+fn build_recent_efficiency_window(
+    label: &str,
+    runs: &[&TelemetryRunRow],
+) -> RecentEfficiencyWindow {
+    let mut task_counts = BTreeMap::<String, usize>::new();
+    for run in runs {
+        *task_counts.entry(run.task_identifier.clone()).or_default() += 1;
+    }
+    RecentEfficiencyWindow {
+        label: label.to_string(),
+        agent_runs: runs.len(),
+        runs_with_metrics: runs.iter().filter(|run| row_has_metrics(run)).count(),
+        tool_calls: metric_summary(runs.iter().filter_map(|run| run.tool_call_count)),
+        tool_errors: metric_summary(runs.iter().filter_map(|run| run.tool_error_count)),
+        repeated_failed_tool_attempts: metric_summary(
+            runs.iter()
+                .filter_map(|run| run.repeated_failed_tool_attempt_count),
+        ),
+        repeated_reads: metric_summary(runs.iter().filter_map(|run| run.repeated_read_count)),
+        repeated_tasker_context_fetches: metric_summary(
+            runs.iter()
+                .filter_map(|run| run.repeated_tasker_context_fetch_count),
+        ),
+        input_tokens: metric_summary(runs.iter().filter_map(|run| run.input_tokens)),
+        output_tokens: metric_summary(runs.iter().filter_map(|run| run.output_tokens)),
+        total_tokens: metric_summary(runs.iter().filter_map(|run| run.total_tokens)),
+        cache_read_tokens: metric_summary(runs.iter().filter_map(|run| run.cache_read_tokens)),
+        cache_write_tokens: metric_summary(runs.iter().filter_map(|run| run.cache_write_tokens)),
+        max_context_tokens: metric_summary(runs.iter().filter_map(|run| run.max_context_tokens)),
+        transcript_bytes: metric_summary(runs.iter().filter_map(|run| run.transcript_byte_size)),
+        duration_seconds: metric_summary(runs.iter().filter_map(|run| run.duration_seconds)),
+        failed_runs: runs
+            .iter()
+            .filter(|run| is_failed_or_timed_out(run))
+            .count(),
+        duplicate_agent_run_waste: task_counts
+            .values()
+            .map(|count| count.saturating_sub(1))
+            .sum(),
+        duplicate_tasks: task_counts.values().filter(|count| **count > 1).count(),
+    }
+}
+
+fn row_has_metrics(run: &TelemetryRunRow) -> bool {
+    run.tool_call_count.is_some()
+        || run.tool_error_count.is_some()
+        || run.repeated_failed_tool_attempt_count.is_some()
+        || run.repeated_read_count.is_some()
+        || run.repeated_tasker_context_fetch_count.is_some()
+        || run.input_tokens.is_some()
+        || run.output_tokens.is_some()
+        || run.total_tokens.is_some()
+        || run.cache_read_tokens.is_some()
+        || run.cache_write_tokens.is_some()
+        || run.max_context_tokens.is_some()
+        || run.transcript_byte_size.is_some()
+        || run.duration_seconds.is_some()
+}
+
+fn metric_summary(values: impl Iterator<Item = i64>) -> MetricSummary {
+    let values = values.collect::<Vec<_>>();
+    MetricSummary {
+        average: (!values.is_empty())
+            .then(|| values.iter().sum::<i64>() as f64 / values.len() as f64),
+        high_water: values.iter().max().copied(),
+    }
+}
+
+fn recent_efficiency_deltas(
+    previous: &RecentEfficiencyWindow,
+    recent: &RecentEfficiencyWindow,
+) -> RecentEfficiencyDeltas {
+    RecentEfficiencyDeltas {
+        tool_calls_average: delta_f64(previous.tool_calls.average, recent.tool_calls.average),
+        repeated_reads_average: delta_f64(
+            previous.repeated_reads.average,
+            recent.repeated_reads.average,
+        ),
+        repeated_tasker_context_fetches_average: delta_f64(
+            previous.repeated_tasker_context_fetches.average,
+            recent.repeated_tasker_context_fetches.average,
+        ),
+        total_tokens_average: delta_f64(previous.total_tokens.average, recent.total_tokens.average),
+        max_context_tokens_high_water: match (
+            previous.max_context_tokens.high_water,
+            recent.max_context_tokens.high_water,
+        ) {
+            (Some(previous), Some(recent)) => Some(recent - previous),
+            _ => None,
+        },
+        transcript_bytes_average: delta_f64(
+            previous.transcript_bytes.average,
+            recent.transcript_bytes.average,
+        ),
+        duration_seconds_average: delta_f64(
+            previous.duration_seconds.average,
+            recent.duration_seconds.average,
+        ),
+        failed_runs: recent.failed_runs as isize - previous.failed_runs as isize,
+        duplicate_agent_run_waste: recent.duplicate_agent_run_waste as isize
+            - previous.duplicate_agent_run_waste as isize,
+    }
+}
+
+fn delta_f64(previous: Option<f64>, recent: Option<f64>) -> Option<f64> {
+    Some(recent? - previous?)
+}
+
+fn recent_efficiency_offender(run: &TelemetryRunRow) -> RecentEfficiencyOffender {
+    RecentEfficiencyOffender {
+        task_identifier: run.task_identifier.clone(),
+        task_title: run.task_title.clone(),
+        agent_run_id: run.agent_run_id.clone(),
+        outcome: run.outcome.clone(),
+        tool_call_count: run.tool_call_count,
+        tool_error_count: run.tool_error_count,
+        repeated_failed_tool_attempt_count: run.repeated_failed_tool_attempt_count,
+        repeated_read_count: run.repeated_read_count,
+        repeated_tasker_context_fetch_count: run.repeated_tasker_context_fetch_count,
+        total_tokens: run.total_tokens,
+        max_context_tokens: run.max_context_tokens,
+        transcript_byte_size: run.transcript_byte_size,
+        duration_seconds: run.duration_seconds,
+        budget_warning_count: budget_status_for_row(run).warnings.len(),
+    }
+}
+
+fn offender_score(run: &RecentEfficiencyOffender) -> i64 {
+    run.tool_call_count.unwrap_or(0)
+        + run.tool_error_count.unwrap_or(0) * 10
+        + run.repeated_failed_tool_attempt_count.unwrap_or(0) * 25
+        + run.repeated_read_count.unwrap_or(0) * 25
+        + run.repeated_tasker_context_fetch_count.unwrap_or(0) * 25
+        + run.total_tokens.unwrap_or(0) / 1_000
+        + run.max_context_tokens.unwrap_or(0) / 1_000
+        + run.transcript_byte_size.unwrap_or(0) / 1_000_000
+        + run.duration_seconds.unwrap_or(0) / 60
+        + i64::try_from(run.budget_warning_count).unwrap_or(0) * 100
+        + if run
+            .outcome
+            .as_deref()
+            .is_some_and(|outcome| outcome != "completed")
+        {
+            50
+        } else {
+            0
+        }
+}
+
+fn is_failed_or_timed_out(run: &TelemetryRunRow) -> bool {
+    run.outcome.as_deref() == Some("failed")
+        || run.outcome.as_deref() == Some("expired")
+        || run
+            .failure_reason
+            .as_ref()
+            .is_some_and(|reason| reason.to_ascii_lowercase().contains("timeout"))
+        || run
+            .failure_reason
+            .as_ref()
+            .is_some_and(|reason| reason.to_ascii_lowercase().contains("timed out"))
+}
+
+pub fn render_recent_efficiency_summary(summary: &RecentEfficiencySummary) -> String {
+    let mut output = String::new();
+    writeln!(output, "Recent Agent Run efficiency report").expect("write string");
+    writeln!(output, "Task Queue: {}", summary.queue).expect("write string");
+    writeln!(
+        output,
+        "recent window: latest {} Agent Run(s)",
+        summary.recent
+    )
+    .expect("write string");
+    write_recent_efficiency_window(&mut output, &summary.recent_window);
+    if let Some(previous) = &summary.previous_window {
+        write_recent_efficiency_window(&mut output, previous);
+    } else {
+        writeln!(output, "previous: none").expect("write string");
+    }
+    if let Some(deltas) = &summary.deltas {
+        writeln!(output, "deltas recent-minus-previous:").expect("write string");
+        writeln!(
+            output,
+            "  avg tool_calls={} repeated_reads={} repeated_tasker_context_fetches={} total_tokens={} transcript_bytes={} duration={}",
+            display_delta_f64(deltas.tool_calls_average),
+            display_delta_f64(deltas.repeated_reads_average),
+            display_delta_f64(deltas.repeated_tasker_context_fetches_average),
+            display_delta_f64(deltas.total_tokens_average),
+            display_delta_f64(deltas.transcript_bytes_average),
+            display_delta_f64(deltas.duration_seconds_average),
+        )
+        .expect("write string");
+        writeln!(
+            output,
+            "  high_water max_context={} failed_runs={} duplicate_waste={}",
+            deltas
+                .max_context_tokens_high_water
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            deltas.failed_runs,
+            deltas.duplicate_agent_run_waste,
+        )
+        .expect("write string");
+    }
+    writeln!(output, "top offender Agent Runs:").expect("write string");
+    if summary.top_offenders.is_empty() {
+        writeln!(output, "  none").expect("write string");
+    } else {
+        for run in &summary.top_offenders {
+            writeln!(
+                output,
+                "  {} - {}: {} outcome={} tool_calls={} repeated_reads={} repeated_tasker_context_fetches={} total_tokens={} max_context={} transcript_bytes={} duration={} budget_warnings={}",
+                run.task_identifier,
+                run.task_title,
+                run.agent_run_id,
+                run.outcome.as_deref().unwrap_or("active"),
+                display_opt(run.tool_call_count),
+                display_opt(run.repeated_read_count),
+                display_opt(run.repeated_tasker_context_fetch_count),
+                display_opt(run.total_tokens),
+                display_opt(run.max_context_tokens),
+                display_opt(run.transcript_byte_size),
+                display_opt(run.duration_seconds),
+                run.budget_warning_count,
+            )
+            .expect("write string");
+        }
+    }
+    writeln!(output, "cautions:").expect("write string");
+    for caution in &summary.cautions {
+        writeln!(output, "  - {caution}").expect("write string");
+    }
+    output
+}
+
+fn write_recent_efficiency_window(output: &mut String, window: &RecentEfficiencyWindow) {
+    writeln!(
+        output,
+        "{}: Agent Runs={} metrics={}",
+        window.label, window.agent_runs, window.runs_with_metrics
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "  averages: tool_calls={} tool_errors={} repeated_failed_tools={} repeated_reads={} repeated_tasker_context_fetches={} total_tokens={} max_context={} transcript_bytes={} duration={}",
+        display_avg(window.tool_calls.average),
+        display_avg(window.tool_errors.average),
+        display_avg(window.repeated_failed_tool_attempts.average),
+        display_avg(window.repeated_reads.average),
+        display_avg(window.repeated_tasker_context_fetches.average),
+        display_avg(window.total_tokens.average),
+        display_avg(window.max_context_tokens.average),
+        display_avg(window.transcript_bytes.average),
+        display_avg(window.duration_seconds.average),
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "  high-water: tool_calls={} tool_errors={} repeated_failed_tools={} repeated_reads={} repeated_tasker_context_fetches={} total_tokens={} max_context={} transcript_bytes={} duration={}",
+        display_opt(window.tool_calls.high_water),
+        display_opt(window.tool_errors.high_water),
+        display_opt(window.repeated_failed_tool_attempts.high_water),
+        display_opt(window.repeated_reads.high_water),
+        display_opt(window.repeated_tasker_context_fetches.high_water),
+        display_opt(window.total_tokens.high_water),
+        display_opt(window.max_context_tokens.high_water),
+        display_opt(window.transcript_bytes.high_water),
+        display_opt(window.duration_seconds.high_water),
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "  failed_runs={} duplicate/wasted_runs={} duplicate_tasks={}",
+        window.failed_runs, window.duplicate_agent_run_waste, window.duplicate_tasks
+    )
+    .expect("write string");
+}
+
+fn display_avg(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.1}"))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn display_delta_f64(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:+.1}"))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 // Task lifecycle latency telemetry
@@ -3098,6 +3524,155 @@ mod tests {
         assert!(rendered.contains("cautions:"));
         assert!(rendered.contains("Integration Outcome reasons"));
         assert!(rendered.contains("other=2"));
+    }
+
+    #[tokio::test]
+    async fn telemetry_recent_efficiency_reports_windows_json_and_unknown_tokens() {
+        let pool = memory_pool().await;
+        sqlx::query(
+            r#"
+            INSERT INTO task_queues (
+                id, key, name, managed_source_repository, main_branch, worktree_root, branch_template
+            ) VALUES ('queue-1', 'TASK', 'Tasker', '/repo', 'main', '/worktrees', 'tasker/{task_identifier}')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("queue");
+        for (identifier, sequence, title) in [
+            ("TASK-1", 1, "Old duplicate"),
+            ("TASK-2", 2, "Recent clean"),
+            ("TASK-3", 3, "Recent waste"),
+        ] {
+            sqlx::query(
+                "INSERT INTO tasks (id, task_queue_id, identifier, sequence, title, brief, priority, state) VALUES (?, 'queue-1', ?, ?, ?, 'secret brief', 'normal', 'done')",
+            )
+            .bind(identifier)
+            .bind(identifier)
+            .bind(sequence)
+            .bind(title)
+            .execute(&pool)
+            .await
+            .expect("task");
+        }
+        for (task_id, run_id, created_at, finished_at, outcome, reason) in [
+            (
+                "TASK-1",
+                "old-1",
+                "2026-01-01 00:00:00",
+                "2026-01-01 00:10:00",
+                Some("completed"),
+                None,
+            ),
+            (
+                "TASK-1",
+                "old-2",
+                "2026-01-01 00:20:00",
+                "2026-01-01 00:40:00",
+                Some("completed"),
+                None,
+            ),
+            (
+                "TASK-2",
+                "recent-1",
+                "2026-01-01 01:00:00",
+                "2026-01-01 01:02:00",
+                Some("completed"),
+                None,
+            ),
+            (
+                "TASK-3",
+                "recent-2",
+                "2026-01-01 01:10:00",
+                "2026-01-01 02:20:00",
+                Some("failed"),
+                Some("timed out"),
+            ),
+        ] {
+            insert_run(
+                &pool,
+                task_id,
+                "queue-1",
+                run_id,
+                created_at,
+                finished_at,
+                outcome,
+                reason,
+            )
+            .await;
+        }
+        for (run_id, tool_calls, reads, tasker_fetches, tokens, max_context, transcript) in [
+            ("old-1", 20, 2, 1, Some(40_000), Some(45_000), 1_000),
+            ("old-2", 40, 4, 2, Some(80_000), Some(90_000), 2_000),
+            ("recent-1", 10, 0, 0, Some(20_000), Some(25_000), 500),
+            ("recent-2", 200, 12, 6, None, None, 3_000),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO agent_run_metrics (
+                    agent_run_id, launcher_kind, final_status, transcript_byte_size,
+                    total_tokens, tool_call_count, tool_error_count, repeated_failed_tool_attempt_count,
+                    tool_call_counts_json, repeated_read_count, repeated_tasker_context_fetch_count,
+                    shell_command_counts_json, assistant_turn_count, user_turn_count,
+                    max_context_tokens, efficiency_hints_json
+                ) VALUES (?, 'pi', 'completed', ?, ?, ?, 1, 0, '{}', ?, ?, '{}', 1, 1, ?, '[]')
+                "#,
+            )
+            .bind(run_id)
+            .bind(transcript)
+            .bind(tokens)
+            .bind(tool_calls)
+            .bind(reads)
+            .bind(tasker_fetches)
+            .bind(max_context)
+            .execute(&pool)
+            .await
+            .expect("metrics");
+        }
+
+        let summary = recent_efficiency_summary(
+            &pool,
+            &RecentEfficiencyOptions {
+                queue: "TASK".to_string(),
+                recent: 2,
+                top_limit: 2,
+            },
+        )
+        .await
+        .expect("recent efficiency");
+
+        assert_eq!(summary.recent_window.agent_runs, 2);
+        assert_eq!(summary.previous_window.as_ref().unwrap().agent_runs, 2);
+        assert_eq!(summary.recent_window.failed_runs, 1);
+        assert_eq!(
+            summary
+                .previous_window
+                .as_ref()
+                .unwrap()
+                .duplicate_agent_run_waste,
+            1
+        );
+        assert_eq!(summary.recent_window.total_tokens.high_water, Some(20_000));
+        assert_eq!(
+            summary.recent_window.max_context_tokens.high_water,
+            Some(25_000)
+        );
+        assert_eq!(summary.top_offenders[0].agent_run_id, "recent-2");
+        assert_eq!(summary.top_offenders[0].total_tokens, None);
+        assert!(summary.deltas.as_ref().unwrap().tool_calls_average.unwrap() > 0.0);
+        let rendered = render_recent_efficiency_summary(&summary);
+        assert!(rendered.contains("Recent Agent Run efficiency report"));
+        assert!(rendered.contains("deltas recent-minus-previous"));
+        assert!(rendered.contains("total_tokens=unknown"));
+        assert!(rendered.contains("TASK-3 - Recent waste"));
+        assert!(!rendered.contains("secret brief"));
+        assert!(!rendered.contains("timed out"));
+        let json = serde_json::to_value(&summary).expect("json");
+        assert_eq!(json["recent_window"]["failed_runs"], 1);
+        assert!(json["top_offenders"][0]["total_tokens"].is_null());
+        let json_text = json.to_string();
+        assert!(!json_text.contains("secret brief"));
+        assert!(!json_text.contains("timed out"));
     }
 
     #[tokio::test]

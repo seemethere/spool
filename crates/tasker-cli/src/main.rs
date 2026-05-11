@@ -477,6 +477,21 @@ enum TelemetryCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Compact recent Agent Run efficiency report for dogfood tuning.
+    Efficiency {
+        /// Task Queue Key to summarize.
+        #[arg(long)]
+        queue: String,
+        /// Number of latest Agent Runs to include in the recent window.
+        #[arg(long, default_value_t = 20)]
+        recent: usize,
+        /// Number of top offender Agent Runs to list.
+        #[arg(long, default_value_t = 5)]
+        top_limit: usize,
+        /// Emit machine-readable recent efficiency telemetry JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -964,7 +979,8 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
         Some(Command::Telemetry { command }) => match command {
             TelemetryCommand::Summary { queue, .. }
             | TelemetryCommand::Correlation { queue, .. }
-            | TelemetryCommand::Trend { queue, .. } => Some(queue.clone()),
+            | TelemetryCommand::Trend { queue, .. }
+            | TelemetryCommand::Efficiency { queue, .. } => Some(queue.clone()),
             TelemetryCommand::Lifecycle { queue, .. }
             | TelemetryCommand::BackfillMetrics { queue, .. } => queue.clone(),
         },
