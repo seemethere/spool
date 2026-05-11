@@ -510,6 +510,27 @@ async fn task_conflict_hints_are_stored_and_render_ready_in_progress_overlaps() 
     assert_eq!(groups[0].task_count, 2);
     assert!(groups[0].tasks.contains("TASK-1 (ready)"));
     assert!(groups[0].tasks.contains("TASK-2 (ready)"));
+
+    let claimed = claim_next(
+        &pool,
+        &ClaimNextInput {
+            queue_key: "TASK".to_string(),
+            worker_id: "worker".to_string(),
+            launcher_kind: "fake".to_string(),
+            lease_seconds: 60,
+        },
+        &Actor {
+            kind: "worker_agent".to_string(),
+            id: "worker".to_string(),
+            display_name: "Worker".to_string(),
+        },
+    )
+    .await
+    .expect("claim despite advisory Task Conflict Hints");
+    assert!(
+        claimed.is_some(),
+        "Task Conflict Hints must not block claims"
+    );
 }
 
 #[tokio::test]

@@ -3388,6 +3388,10 @@ mod tests {
             value["queues"][0]["ready_task_summaries"][0]["identifier"],
             "TASK-3"
         );
+        assert_eq!(
+            value["queues"][0]["advisory_conflict_hints"][0]["target"],
+            "crates/tasker-cli"
+        );
         assert_eq!(value["queues"][0]["retry_holds"][0]["reason"], "retry");
     }
 

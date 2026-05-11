@@ -60,6 +60,7 @@ pub struct QueueSnapshot {
     pub ready_tasks: Vec<tasker_db::TaskStatusSummary>,
     pub rework_tasks: Vec<tasker_db::TaskStatusSummary>,
     pub integrating_tasks: Vec<tasker_db::TaskStatusSummary>,
+    pub advisory_conflict_hints: Vec<tasker_db::TaskConflictGroup>,
     pub integration_retries: Vec<tasker_db::IntegrationRetryStatus>,
     pub repo_operation_lock: Option<String>,
 }
@@ -272,6 +273,12 @@ fn render_work_board(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapsh
                 "› {}  {}",
                 compact_task_label(&task.identifier, &task.title, 34),
                 task.priority
+            )));
+        }
+        for group in queue.advisory_conflict_hints.iter().take(3) {
+            next_lines.push(Line::from(format!(
+                "hotspot {}: {} Task(s)",
+                group.target, group.task_count
             )));
         }
         if queue.ready_tasks.len() > NEXT_TASK_LIMIT {
@@ -687,6 +694,7 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
     let mut retry_holds = tasker_db::active_retry_holds_for_status(pool).await?;
     let mut status_tasks =
         tasker_db::tasks_for_status_by_states(pool, &["ready", "rework", "integrating"]).await?;
+    let mut conflict_groups = tasker_db::task_conflict_groups_for_status(pool).await?;
     let recent_runs = recent_agent_runs(pool, options.queue.as_deref()).await?;
     let mut integration_retries = tasker_db::integration_retries_for_status(pool).await?;
 
@@ -695,6 +703,7 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
         active_runs.retain(|run| run.queue_key == *queue);
         retry_holds.retain(|hold| hold.queue_key == *queue);
         status_tasks.retain(|task| task.queue_key == *queue);
+        conflict_groups.retain(|group| group.queue_key == *queue);
         integration_retries.retain(|retry| retry.queue_key == *queue);
     }
 
@@ -718,6 +727,7 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
                 ready_tasks: Vec::new(),
                 rework_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
+                advisory_conflict_hints: Vec::new(),
                 integration_retries: Vec::new(),
                 repo_operation_lock: None,
             });
@@ -743,6 +753,11 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
                 "integrating" => queue.integrating_tasks.push(task),
                 _ => {}
             }
+        }
+    }
+    for group in conflict_groups {
+        if let Some(queue) = by_queue.get_mut(&group.queue_key) {
+            queue.advisory_conflict_hints.push(group);
         }
     }
     for retry in integration_retries {
@@ -926,6 +941,22 @@ pub fn write_snapshot(mut writer: impl Write, snapshot: &MonitorSnapshot) -> io:
         }
     }
     if next == 0 {
+        writeln!(writer, "  (none)")?;
+    }
+
+    writeln!(writer, "\nAdvisory Task Conflict Hints:")?;
+    let mut conflict_count = 0;
+    for queue in &snapshot.queues {
+        for group in &queue.advisory_conflict_hints {
+            conflict_count += 1;
+            writeln!(
+                writer,
+                "  {}\t{} Task(s): {}",
+                group.target, group.task_count, group.tasks
+            )?;
+        }
+    }
+    if conflict_count == 0 {
         writeln!(writer, "  (none)")?;
     }
 
@@ -1289,6 +1320,7 @@ mod tests {
                 }],
                 rework_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
+                advisory_conflict_hints: Vec::new(),
                 integration_retries: Vec::new(),
                 repo_operation_lock: None,
             }],
@@ -1374,6 +1406,7 @@ mod tests {
                 ready_tasks: Vec::new(),
                 rework_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
+                advisory_conflict_hints: Vec::new(),
                 integration_retries: Vec::new(),
                 repo_operation_lock: None,
             }],
@@ -1429,6 +1462,12 @@ mod tests {
                 ready_tasks,
                 rework_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
+                advisory_conflict_hints: vec![tasker_db::TaskConflictGroup {
+                    queue_key: "TASK".to_string(),
+                    target: "crates/tasker-cli".to_string(),
+                    task_count: 2,
+                    tasks: "TASK-1 (ready), TASK-2 (in_progress)".to_string(),
+                }],
                 integration_retries: Vec::new(),
                 repo_operation_lock: None,
             }],
@@ -1443,6 +1482,8 @@ mod tests {
         assert!(text.find("Running:").unwrap() < text.find("Next:").unwrap());
         assert!(text.contains("retry hold: TASK-99"));
         assert!(text.contains("… 2 more Ready Tasks in TASK"));
+        assert!(text.contains("Advisory Task Conflict Hints:"));
+        assert!(text.contains("crates/tasker-cli\t2 Task(s): TASK-1 (ready), TASK-2 (in_progress)"));
         assert!(!text.contains("Ready task with a deliberately long title number 6\t"));
     }
 
@@ -1491,6 +1532,7 @@ mod tests {
                     latest_rework_reason_code: None,
                     latest_rework_reason: None,
                 }],
+                advisory_conflict_hints: Vec::new(),
                 integration_retries: vec![tasker_db::IntegrationRetryStatus {
                     queue_key: "TASK".to_string(),
                     task_identifier: "TASK-4".to_string(),
@@ -1558,6 +1600,7 @@ mod tests {
                 ready_tasks: Vec::new(),
                 rework_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
+                advisory_conflict_hints: Vec::new(),
                 integration_retries: Vec::new(),
                 repo_operation_lock: None,
             }],

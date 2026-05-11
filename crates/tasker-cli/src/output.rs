@@ -116,7 +116,10 @@ pub fn write_task_detail(mut writer: impl Write, detail: &tasker_db::TaskDetail)
             writeln!(writer, "  reason: {reason}")?;
         }
     }
-    writeln!(writer, "\nTask Conflict Hints:")?;
+    writeln!(
+        writer,
+        "\nTask Conflict Hints (advisory scheduling/review):"
+    )?;
     if detail.conflict_hints.is_empty() {
         writeln!(writer, "(none)")?;
     } else {
@@ -124,7 +127,7 @@ pub fn write_task_detail(mut writer: impl Write, detail: &tasker_db::TaskDetail)
             writeln!(writer, "  {}. {}", hint.position, hint.target)?;
         }
     }
-    writeln!(writer, "\nPotential Overlaps:")?;
+    writeln!(writer, "\nPotential Overlaps (advisory):")?;
     if detail.conflict_overlaps.is_empty() {
         writeln!(writer, "(none)")?;
     } else {
