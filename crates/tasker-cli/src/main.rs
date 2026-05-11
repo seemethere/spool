@@ -157,6 +157,9 @@ enum Command {
         /// Intentionally bypass the per-Task Queue supervisor lock.
         #[arg(long)]
         allow_overlap: bool,
+        /// Apply pending SQLite migrations before polling only when idle and on trusted Main Branch.
+        #[arg(long)]
+        auto_migrate_when_idle: bool,
     },
     /// Inspect Agent Runs.
     Run {
@@ -586,6 +589,7 @@ struct SuperviseOptions {
     worker_command: Option<Vec<String>>,
     allow_overlap: bool,
     watch: bool,
+    auto_migrate_when_idle: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -675,6 +679,7 @@ async fn main() -> Result<()> {
             launcher,
             worker_command,
             allow_overlap,
+            auto_migrate_when_idle,
         }) => {
             supervise(
                 &paths,
@@ -693,6 +698,7 @@ async fn main() -> Result<()> {
                     worker_command,
                     allow_overlap,
                     watch,
+                    auto_migrate_when_idle,
                 },
             )
             .await
@@ -1045,6 +1051,137 @@ async fn guard_db_migrate_source_from(
                 "refusing to migrate the Task Backend from Git branch {branch}; Task Queue {} requires Managed Source Repository Main Branch {}. Switch to Main Branch and rerun `tasker db migrate`, or pass --allow-task-branch only after explicit operator verification.",
                 queue.key,
                 queue.main_branch
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn prepare_supervisor_migrations(
+    pool: &sqlx::SqlitePool,
+    options: &SuperviseOptions,
+    manual_command: &str,
+) -> Result<bool> {
+    let pending = tasker_db::pending_migration_versions(pool).await?;
+    if pending.is_empty() {
+        return Ok(true);
+    }
+
+    let active_runs = active_agent_run_count(pool).await?;
+    let safe = active_runs == 0;
+    println!(
+        "supervisor migration-required pause for Task Queue {}; no worker started and no Agent Run was created",
+        options.queue
+    );
+    println!("pending SQLite migrations: {pending:?}");
+    println!("active Agent Runs: {active_runs}");
+    println!("migration currently safe: {safe}");
+    println!("manual migration command: {manual_command}");
+
+    if !options.auto_migrate_when_idle {
+        println!(
+            "auto-migrate-when-idle: disabled; rerun from the trusted Managed Source Repository Main Branch with --auto-migrate-when-idle, or run `{manual_command}` manually"
+        );
+        return Ok(false);
+    }
+
+    if active_runs > 0 {
+        println!(
+            "auto-migrate-when-idle refused because active Agent Runs exist; wait for completion or inspect with `tasker status` before running `{manual_command}`"
+        );
+        return Ok(false);
+    }
+
+    guard_supervisor_auto_migrate_source(pool).await?;
+    println!("auto-migrate-when-idle: applying pending SQLite migrations {pending:?}");
+    tasker_db::run_migrations(pool).await?;
+    println!("auto-migrate-when-idle: Tasker database migrated");
+    Ok(true)
+}
+
+fn manual_migration_command(paths: &TaskerPaths, db_path_overridden: bool) -> String {
+    let mut parts = vec![
+        "tasker".to_string(),
+        "--config".to_string(),
+        paths.config_path.display().to_string(),
+        "--data-dir".to_string(),
+        paths.data_dir.display().to_string(),
+    ];
+    if db_path_overridden {
+        parts.push("--db-path".to_string());
+        parts.push(paths.db_path.display().to_string());
+    }
+    parts.push("db".to_string());
+    parts.push("migrate".to_string());
+    parts.join(" ")
+}
+
+async fn active_agent_run_count(pool: &sqlx::SqlitePool) -> Result<i64> {
+    let table_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'agent_runs'",
+    )
+    .fetch_one(pool)
+    .await
+    .context("failed to inspect Agent Run table")?;
+    if table_exists == 0 {
+        return Ok(0);
+    }
+
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_runs WHERE outcome IS NULL AND lease_expires_at > CURRENT_TIMESTAMP",
+    )
+    .fetch_one(pool)
+    .await
+    .context("failed to count active Agent Runs")
+}
+
+async fn guard_supervisor_auto_migrate_source(pool: &sqlx::SqlitePool) -> Result<()> {
+    let cwd = std::env::current_dir().context("failed to resolve current directory")?;
+    guard_supervisor_auto_migrate_source_from(pool, &cwd).await
+}
+
+async fn guard_supervisor_auto_migrate_source_from(
+    pool: &sqlx::SqlitePool,
+    cwd: &Path,
+) -> Result<()> {
+    let queues = tasker_db::list_task_queues(pool).await.unwrap_or_default();
+    if queues.is_empty() {
+        return Ok(());
+    }
+
+    let cwd_git_root = git_output(cwd, &["rev-parse", "--show-toplevel"])
+        .ok()
+        .map(|output| PathBuf::from(output.trim()));
+    for queue in queues {
+        let repo = PathBuf::from(&queue.managed_source_repository);
+        if !cwd_git_root
+            .as_ref()
+            .is_some_and(|root| paths_equivalent(root, &repo))
+        {
+            anyhow::bail!(
+                "auto-migrate-when-idle refused from {} because Task Queue {} is configured for Managed Source Repository {}. Switch to the trusted Managed Source Repository Main Branch and run `tasker db migrate`, or restart supervisor there with --auto-migrate-when-idle.",
+                cwd.display(),
+                queue.key,
+                repo.display()
+            );
+        }
+
+        let branch = git_output(&repo, &["branch", "--show-current"])?;
+        let branch = branch.trim();
+        if branch != queue.main_branch {
+            anyhow::bail!(
+                "auto-migrate-when-idle refused from Git branch {branch}; Task Queue {} requires Managed Source Repository Main Branch {}. Switch to Main Branch and run `tasker db migrate`, or restart supervisor there with --auto-migrate-when-idle.",
+                queue.key,
+                queue.main_branch
+            );
+        }
+
+        let status = git_output(&repo, &["status", "--porcelain"])?;
+        if !status.trim().is_empty() {
+            anyhow::bail!(
+                "auto-migrate-when-idle refused because Managed Source Repository {} is dirty or has unresolved changes. Clean or resolve the repository, then run `tasker db migrate` or restart supervisor with --auto-migrate-when-idle.",
+                repo.display()
             );
         }
     }
@@ -1834,7 +1971,16 @@ async fn supervise(
     path_forwarding: PathForwardingOptions,
     options: SuperviseOptions,
 ) -> Result<()> {
-    let pool = open_pool(paths, db_path_overridden).await?;
+    let mut config = TaskerConfig::load_or_default(paths)?;
+    if db_path_overridden {
+        config.database.path = paths.db_path.clone();
+    }
+    let pool = tasker_db::connect(&config.database.path).await?;
+    let manual_command = manual_migration_command(paths, db_path_overridden);
+    if !prepare_supervisor_migrations(&pool, &options, &manual_command).await? {
+        return Ok(());
+    }
+    tasker_db::check_migration_compatibility(&pool).await?;
     let database_path = resolved_database_path(paths, db_path_overridden)?;
     let command = if let Some(command) = options.worker_command {
         command
@@ -3772,6 +3918,204 @@ mod tests {
             .expect("explicit project config should allow mutation");
     }
 
+    #[tokio::test]
+    async fn supervisor_migration_pause_reports_pending_without_claiming_tasks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = TaskerPaths::resolve(temp.path().join("home"), PathOverrides::default());
+        init(&paths, false).await.expect("init");
+        let pool = open_pool(&paths, false).await.expect("pool");
+        let repo = temp.path().join("repo");
+        init_git_repo(&repo);
+        tasker_db::create_task_queue(
+            &pool,
+            &tasker_db::CreateTaskQueue {
+                key: "TASK".to_string(),
+                name: "Tasker".to_string(),
+                managed_source_repository: repo.display().to_string(),
+                main_branch: "main".to_string(),
+                worktree_root: temp.path().join("worktrees").display().to_string(),
+                branch_template: "tasker/{task_identifier}".to_string(),
+                done_worktree_retention: false,
+                queue_concurrency_limit: None,
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("queue");
+        tasker_db::create_task(
+            &pool,
+            &tasker_db::CreateTask {
+                queue_key: "TASK".to_string(),
+                title: "Do work".to_string(),
+                brief: "Brief".to_string(),
+                priority: "normal".to_string(),
+                state: "ready".to_string(),
+                review_required: false,
+                acceptance_criteria: vec!["accepted".to_string()],
+                validation_items: vec!["validated".to_string()],
+                tags: vec![],
+                conflict_hints: vec![],
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("task");
+        forget_applied_migrations(&pool).await;
+
+        let should_continue = prepare_supervisor_migrations(
+            &pool,
+            &SuperviseOptions {
+                queue: "TASK".to_string(),
+                concurrency: 1,
+                timeout_seconds: 60,
+                poll_seconds: 5,
+                launcher: "fake".to_string(),
+                worker_command: None,
+                allow_overlap: false,
+                watch: false,
+                auto_migrate_when_idle: false,
+            },
+            "tasker db migrate",
+        )
+        .await
+        .expect("migration pause");
+
+        assert!(!should_continue);
+        assert!(!tasker_db::pending_migration_versions(&pool)
+            .await
+            .expect("pending")
+            .is_empty());
+        let active_runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(&pool)
+            .await
+            .expect("active runs");
+        assert_eq!(active_runs, 0);
+    }
+
+    #[tokio::test]
+    async fn supervisor_auto_migrate_when_idle_applies_pending_migrations_with_zero_active_runs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        create_empty_migrations_table(&pool).await;
+
+        let should_continue = prepare_supervisor_migrations(
+            &pool,
+            &SuperviseOptions {
+                queue: "TASK".to_string(),
+                concurrency: 1,
+                timeout_seconds: 60,
+                poll_seconds: 5,
+                launcher: "fake".to_string(),
+                worker_command: None,
+                allow_overlap: false,
+                watch: false,
+                auto_migrate_when_idle: true,
+            },
+            "tasker db migrate",
+        )
+        .await
+        .expect("auto migrate");
+
+        assert!(should_continue);
+        assert!(tasker_db::pending_migration_versions(&pool)
+            .await
+            .expect("pending")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn supervisor_auto_migrate_when_idle_refuses_active_runs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = TaskerPaths::resolve(temp.path().join("home"), PathOverrides::default());
+        let (pool, _worktree, _run_id) =
+            seed_in_progress_local_task(&paths, temp.path(), true, false).await;
+        forget_applied_migrations(&pool).await;
+
+        let should_continue = prepare_supervisor_migrations(
+            &pool,
+            &SuperviseOptions {
+                queue: "TASK".to_string(),
+                concurrency: 1,
+                timeout_seconds: 60,
+                poll_seconds: 5,
+                launcher: "fake".to_string(),
+                worker_command: None,
+                allow_overlap: false,
+                watch: false,
+                auto_migrate_when_idle: true,
+            },
+            "tasker db migrate",
+        )
+        .await
+        .expect("active run refusal");
+
+        assert!(!should_continue);
+        assert!(!tasker_db::pending_migration_versions(&pool)
+            .await
+            .expect("pending")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn supervisor_auto_migrate_guard_refuses_untrusted_or_dirty_checkouts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        let repo = temp.path().join("repo");
+        let worktree = temp.path().join("worktree");
+        init_git_repo(&repo);
+        tasker_db::create_task_queue(
+            &pool,
+            &tasker_db::CreateTaskQueue {
+                key: "TASK".to_string(),
+                name: "Tasker".to_string(),
+                managed_source_repository: repo.display().to_string(),
+                main_branch: "main".to_string(),
+                worktree_root: temp.path().join("worktrees").display().to_string(),
+                branch_template: "tasker/{task_identifier}".to_string(),
+                done_worktree_retention: false,
+                queue_concurrency_limit: None,
+            },
+            &tasker_db::Actor::operator("tester"),
+        )
+        .await
+        .expect("queue");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "tasker/TASK-1",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let error = guard_supervisor_auto_migrate_source_from(&pool, &worktree)
+            .await
+            .expect_err("Local Worktree should be refused");
+        assert!(error.to_string().contains("auto-migrate-when-idle refused"));
+
+        git(&repo, &["checkout", "-b", "tasker/TASK-2"]);
+        let error = guard_supervisor_auto_migrate_source_from(&pool, &repo)
+            .await
+            .expect_err("Task Branch should be refused");
+        assert!(error.to_string().contains("requires Managed Source Repository Main Branch"));
+
+        git(&repo, &["checkout", "main"]);
+        fs::write(repo.join("dirty.txt"), "dirty\n").expect("dirty");
+        let error = guard_supervisor_auto_migrate_source_from(&pool, &repo)
+            .await
+            .expect_err("dirty repo should be refused");
+        assert!(error.to_string().contains("dirty or has unresolved changes"));
+        fs::remove_file(repo.join("dirty.txt")).expect("clean");
+
+        guard_supervisor_auto_migrate_source_from(&pool, &repo)
+            .await
+            .expect("clean Main Branch should be accepted");
+    }
+
     #[test]
     fn supervise_default_worker_command_forwards_project_config_and_child_infers_project_data_dir()
     {
@@ -3803,6 +4147,7 @@ mod tests {
                 worker_command: None,
                 allow_overlap: false,
                 watch: false,
+                auto_migrate_when_idle: false,
             },
         );
 
@@ -3847,6 +4192,7 @@ mod tests {
                 worker_command: None,
                 allow_overlap: false,
                 watch: false,
+                auto_migrate_when_idle: false,
             },
         );
 
@@ -3931,6 +4277,7 @@ mod tests {
             worker_command: None,
             allow_overlap: false,
             watch: false,
+            auto_migrate_when_idle: false,
         });
 
         let context = active_tasker_context(&command, &paths, true).expect("active context");
@@ -5239,6 +5586,31 @@ Implement Bootstrap Task Creation.
         .await
         .expect("integrating");
         (repo, worktree)
+    }
+
+    async fn forget_applied_migrations(pool: &sqlx::SqlitePool) {
+        sqlx::query("DELETE FROM _sqlx_migrations")
+            .execute(pool)
+            .await
+            .expect("forget migrations");
+    }
+
+    async fn create_empty_migrations_table(pool: &sqlx::SqlitePool) {
+        sqlx::query(
+            r#"
+            CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            )
+            "#,
+        )
+        .execute(pool)
+        .await
+        .expect("create migrations table");
     }
 
     fn init_git_repo(repo: &Path) {

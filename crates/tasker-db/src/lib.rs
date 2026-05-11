@@ -53,6 +53,18 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
 }
 
 pub async fn check_migration_compatibility(pool: &SqlitePool) -> Result<()> {
+    let pending = pending_migration_versions(pool).await?;
+    if !pending.is_empty() {
+        anyhow::bail!(
+            "Tasker database has pending SQLite migrations {:?}. Normal commands validate schema compatibility but do not apply migrations. Run `tasker db migrate` from the trusted Managed Source Repository Main Branch to upgrade the Task Backend.",
+            pending
+        );
+    }
+
+    Ok(())
+}
+
+pub async fn pending_migration_versions(pool: &SqlitePool) -> Result<Vec<i64>> {
     let migrations_table_exists: i64 = sqlx::query_scalar(
         r#"
         SELECT COUNT(*)
@@ -117,14 +129,7 @@ pub async fn check_migration_compatibility(pool: &SqlitePool) -> Result<()> {
         }
     }
 
-    if !pending.is_empty() {
-        anyhow::bail!(
-            "Tasker database has pending SQLite migrations {:?}. Normal commands validate schema compatibility but do not apply migrations. Run `tasker db migrate` from the trusted Managed Source Repository Main Branch to upgrade the Task Backend.",
-            pending
-        );
-    }
-
-    Ok(())
+    Ok(pending)
 }
 
 fn migration_source() -> sqlx::migrate::Migrator {
