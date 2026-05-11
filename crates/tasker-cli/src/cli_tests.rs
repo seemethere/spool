@@ -147,6 +147,56 @@ fn merge_inspect_guidance_prefers_squash_and_tasker_authority() {
 }
 
 #[test]
+fn tasker_commit_metadata_trailers_parse_complete_partial_and_unrelated_messages() {
+    let complete = "feat: deliver task\n\nTasker-Task: TASKER-92\nTasker-Queue: TASKER\nTasker-Agent-Run: run-123\n";
+    assert_eq!(
+        commit_metadata::parse_tasker_commit_trailers(complete),
+        commit_metadata::TaskerCommitTrailers {
+            task_identifier: Some("TASKER-92".to_string()),
+            task_queue: Some("TASKER".to_string()),
+            agent_run_id: Some("run-123".to_string()),
+        }
+    );
+
+    let partial = "fix: partial\n\nTasker-Task: TASKER-93\nReviewed-by: Operator\n";
+    assert_eq!(
+        commit_metadata::parse_tasker_commit_trailers(partial),
+        commit_metadata::TaskerCommitTrailers {
+            task_identifier: Some("TASKER-93".to_string()),
+            task_queue: None,
+            agent_run_id: None,
+        }
+    );
+
+    assert_eq!(
+        commit_metadata::parse_tasker_commit_trailers("docs: unrelated\n\nReviewed-by: Operator"),
+        commit_metadata::TaskerCommitTrailers::default()
+    );
+}
+
+#[test]
+fn generated_tasker_commit_metadata_is_trailer_compatible_and_minimal() {
+    let message = commit_metadata::final_commit_message(
+        "TASKER-92",
+        "Add structured Tasker metadata trailers to Final Commit messages",
+        "TASKER",
+        Some("5d019294-398e-4f89-ad70-9b434b10dadb"),
+    );
+
+    assert!(message.starts_with("TASKER-92: Add structured Tasker metadata trailers"));
+    assert!(message.contains("\n\nTasker-Task: TASKER-92\n"));
+    assert!(message.contains("Tasker-Queue: TASKER\n"));
+    assert!(message.contains("Tasker-Agent-Run: 5d019294-398e-4f89-ad70-9b434b10dadb"));
+    assert!(!message.contains("Workpad"));
+    assert!(!message.contains("Run Transcript"));
+    assert!(!message.contains("prompt"));
+    assert_eq!(
+        commit_metadata::parse_tasker_commit_trailers(&message).task_identifier,
+        Some("TASKER-92".to_string())
+    );
+}
+
+#[test]
 fn status_json_exposes_lifecycle_telemetry_shape() {
     let rows = vec![
         tasker_db::QueueStatus {
@@ -1150,6 +1200,34 @@ async fn merge_integrate_squash_merges_and_cleans_successful_task() {
     assert!(git_output(&repo, &["show", "--stat", "--oneline", "HEAD"])
         .expect("show final commit")
         .contains("feature.txt"));
+    let commit_message =
+        git_output(&repo, &["log", "-1", "--pretty=%B"]).expect("show final commit message");
+    assert!(commit_message.contains("Tasker-Task: TASK-1"));
+    assert!(commit_message.contains("Tasker-Queue: TASK"));
+    assert!(!commit_message.contains("Brief"));
+    assert!(!commit_message.contains("Workpad"));
+    assert_eq!(
+        commit_metadata::parse_tasker_commit_trailers(&commit_message),
+        commit_metadata::TaskerCommitTrailers {
+            task_identifier: Some("TASK-1".to_string()),
+            task_queue: Some("TASK".to_string()),
+            agent_run_id: None,
+        }
+    );
+    let message_file = temp.path().join("final-commit-message.txt");
+    fs::write(&message_file, &commit_message).expect("message file");
+    let parsed_by_git = git_output(
+        &repo,
+        &[
+            "interpret-trailers",
+            "--parse",
+            "--no-divider",
+            message_file.to_str().expect("utf8"),
+        ],
+    )
+    .expect("git interpret-trailers");
+    assert!(parsed_by_git.contains("Tasker-Task: TASK-1"));
+    assert!(parsed_by_git.contains("Tasker-Queue: TASK"));
     assert!(!worktree.exists());
     assert!(!std::process::Command::new("git")
         .arg("-C")

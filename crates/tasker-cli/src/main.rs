@@ -13,6 +13,7 @@ use tasker_config::{ensure_data_dir, PathOverrides, TaskerConfig, TaskerPaths};
 mod bootstrap;
 mod cleanup;
 mod cleanup_cmd;
+mod commit_metadata;
 mod db_cmd;
 mod display;
 mod local_worktree_delivery;

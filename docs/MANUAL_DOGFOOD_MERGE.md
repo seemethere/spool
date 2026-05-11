@@ -133,17 +133,28 @@ cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data 
 
 Use `tasker task retry` instead when failed or stuck agent work should return to **Ready**. Use **Rework** for work-change failures unless an operator has explicitly verified a forced delivery retry is safe.
 
-For the remaining fully manual path, from the **Managed Source Repository**, inspect the **Task Branch** against the **Main Branch** and prefer the planned v1 shape: a squash-style **Local Merge** that produces one **Final Commit** containing Tasker metadata such as **Task Identifier**, title, and optionally run ID.
+For the remaining fully manual path, from the **Managed Source Repository**, inspect the **Task Branch** against the **Main Branch** and prefer the planned v1 shape: a squash-style **Local Merge** that produces one **Final Commit** with a concise Conventional Commit subject and canonical Tasker Git trailers:
+
+```text
+Tasker-Task: <task-identifier>
+Tasker-Queue: <task-queue-key>
+Tasker-Agent-Run: <agent-run-id>
+```
+
+`Tasker-Agent-Run` may be omitted when the relevant **Agent Run** is unknown. Do not paste raw **Workpad Notes**, **Run Transcripts**, prompt text, secrets, or large free-form **Task** data into the **Final Commit** message.
 
 Example operator-side squash integration:
 
 ```bash
 git switch <main-branch>
 git merge --squash <task-branch>
-git commit -m "docs: update manual merge guidance (TASKER-60)"
+git commit -m "docs: update manual merge guidance" \
+  -m "Tasker-Task: TASKER-60
+Tasker-Queue: TASKER
+Tasker-Agent-Run: 5d019294-398e-4f89-ad70-9b434b10dadb"
 ```
 
-Use a concise Conventional Commit subject and include the **Task Identifier** in the subject or body so the **Final Commit** can be traced back to Tasker. Avoid `git merge --no-ff` merge commits for routine Manual Dogfood Merge work unless an operator intentionally needs to preserve branch topology for an exceptional investigation.
+Use `git interpret-trailers --parse` to inspect the trailer block if needed. Avoid `git merge --no-ff` merge commits for routine Manual Dogfood Merge work unless an operator intentionally needs to preserve branch topology for an exceptional investigation.
 
 After a squash integration, the **Task Branch** is not an ancestor of the **Main Branch**. Do not use branch ancestry as completion proof in the manual path; Tasker database state, **Integration Outcomes**, **Audit Events**, and the **Final Commit** are authoritative for completion and delivery history. This matches the automatic runner-side **Squash Merge** behavior, which also produces one **Final Commit** rather than preserving every **Task Commit** on the **Main Branch**.
 

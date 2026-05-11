@@ -6,6 +6,8 @@ use std::{
 use anyhow::{Context, Result};
 use sqlx::{Row, SqlitePool};
 
+use crate::commit_metadata;
+
 const INTEGRATION_RETRY_MAX_ATTEMPTS: i64 = 3;
 const INTEGRATION_RETRY_INITIAL_DELAY_SECONDS: i64 = 30;
 
@@ -247,7 +249,21 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
             });
         }
 
-        let message = final_commit_message(self.task, self.agent_run_id);
+        let message = commit_metadata::final_commit_message(
+            &self.task.task.identifier,
+            &self.task.task.title,
+            &self.task.task.task_queue_key,
+            self.agent_run_id,
+        );
+        let parsed_trailers = commit_metadata::parse_tasker_commit_trailers(&message);
+        debug_assert_eq!(
+            parsed_trailers.task_identifier.as_deref(),
+            Some(self.task.task.identifier.as_str())
+        );
+        debug_assert_eq!(
+            parsed_trailers.task_queue.as_deref(),
+            Some(self.task.task.task_queue_key.as_str())
+        );
         if let Err(error) = run_git(self.repo, &["commit", "-m", &message], "Final Commit") {
             let _ = self.rollback_to(&pre_merge_head);
             self.record_outcome(
@@ -540,17 +556,6 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
         }
         Ok(())
     }
-}
-
-fn final_commit_message(detail: &tasker_db::TaskDetail, agent_run_id: Option<&str>) -> String {
-    let mut message = format!(
-        "{}: {}\n\nTask: {}",
-        detail.task.identifier, detail.task.title, detail.task.identifier
-    );
-    if let Some(run_id) = agent_run_id {
-        message.push_str(&format!("\nAgent Run: {run_id}"));
-    }
-    message
 }
 
 fn ensure_clean_git(repo: &Path, label: &str) -> Result<()> {
