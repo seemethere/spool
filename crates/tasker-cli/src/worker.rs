@@ -614,6 +614,10 @@ fn write_pi_transcript(
     })
 }
 
+const DEFAULT_WORKER_ROLE_PROMPT: &str = "You are a Tasker Worker Agent running unattended. Do not ask questions or open interactive UI. Use the Tasker Pi Extension tools to read and update Tasker state, Workpad Notes, requirements, child tasks, and transitions.";
+
+const WORKER_CONTEXT_BUNDLE_GUIDANCE: &str = "Run-start context discipline:\n- First call the Tasker Pi Extension tool `tasker_get_task_context_bundle` for this Task Identifier before broad file/context discovery, repeated Tasker CLI status/show reads, or Agent Run lookups.\n- Treat that bundle as the preferred source for the Task Brief, Acceptance Criteria, Validation Items, Workpad Note, Task Links, Task Conflict Hints, recent Agent Runs, Task Queue/local workflow context, latest failure summary, and latest Integration Outcome summary.\n- From the bundle, write a short context plan in your own reasoning before reading source files: identify the likely files/ADRs/docs to inspect, what you need from each, and any conflict/overlap risks. Then use targeted `rg`/narrow reads and avoid rereading unchanged files.\n- If the Tasker Pi Extension tool is unavailable, use narrow safe fallback reads only: prefer the repo-local `bin/tasker-local` wrapper from the Managed Source Repository root for `queue show <queue>` preflight and `task show <task>`; avoid bare `tasker`, broad status loops, repeated show commands, raw SQL, or transcript scraping unless the Task explicitly requires them.\n- Do not expose raw Run Transcript bodies, raw launcher payloads, prompt bodies, secrets, or unrelated queue data.";
+
 fn build_worker_prompt(
     task: &tasker_db::TaskDetail,
     run: &tasker_db::AgentRun,
@@ -625,10 +629,10 @@ fn build_worker_prompt(
         fs::read_to_string(path)
             .with_context(|| format!("failed to read Worker Role Prompt {}", path.display()))?
     } else {
-        "You are a Tasker Worker Agent running unattended. Do not ask questions or open interactive UI. Use the Tasker Pi Extension tools to read and update Tasker state, Workpad Notes, requirements, child tasks, and transitions. At run start, prefer the Tasker Pi Extension task context bundle tool before broad file/context discovery or repeated CLI status/show reads.".to_string()
+        DEFAULT_WORKER_ROLE_PROMPT.to_string()
     };
     Ok(format!(
-        "{base}\n\nTask Identifier: {}\nTask Title: {}\nTask State: {}\nAgent Run ID: {}\nLocal Worktree: {}\nShared Cargo Target Directory: {}\nCargo commands inherit CARGO_TARGET_DIR so Rust build artifacts are shared across Worker Agent Local Worktrees for this Managed Source Repository. This Tasker-managed directory is safe to delete when reclaiming space.\nBefore requesting Integrating, commit intended changes as Task Commits on the Task Branch and verify the Local Worktree is clean with git status.\nUse Tasker Pi Extension tools for Tasker mutations. When finished, update criteria/validation/workpad and request the appropriate Task State Transition.\n",
+        "{base}\n\nTask Identifier: {}\nTask Title: {}\nTask State: {}\nAgent Run ID: {}\nLocal Worktree: {}\nShared Cargo Target Directory: {}\nCargo commands inherit CARGO_TARGET_DIR so Rust build artifacts are shared across Worker Agent Local Worktrees for this Managed Source Repository. This Tasker-managed directory is safe to delete when reclaiming space.\n\n{WORKER_CONTEXT_BUNDLE_GUIDANCE}\n\nBefore requesting Integrating, commit intended changes as Task Commits on the Task Branch and verify the Local Worktree is clean with git status.\nUse Tasker Pi Extension tools for Tasker mutations. When finished, update criteria/validation/workpad and request the appropriate Task State Transition.\n",
         task.task.identifier,
         task.task.title,
         task.task.state,
@@ -1787,6 +1791,109 @@ mod tests {
         let mut permissions = fs::metadata(path).expect("metadata").permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).expect("chmod");
+    }
+
+    #[tokio::test]
+    async fn worker_prompt_requires_context_bundle_context_plan_and_safe_fallback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let worktrees = temp.path().join("worktrees");
+        init_git_repo(&repo);
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        seed_ready_task(&pool, &repo, &worktrees).await;
+        let claimed = tasker_db::claim_next(
+            &pool,
+            &tasker_db::ClaimNextInput {
+                queue_key: "TASK".to_string(),
+                worker_id: "worker".to_string(),
+                launcher_kind: "pi".to_string(),
+                lease_seconds: 90,
+            },
+            &tasker_db::Actor {
+                kind: "worker_agent".to_string(),
+                id: "worker".to_string(),
+                display_name: "Worker".to_string(),
+            },
+        )
+        .await
+        .expect("claim task")
+        .expect("claimed task");
+
+        let prompt = build_worker_prompt(
+            &claimed.task,
+            &claimed.run,
+            &worktrees.join("TASK-1"),
+            &temp.path().join("cargo-target"),
+            None,
+        )
+        .expect("build prompt");
+
+        assert!(prompt.contains("tasker_get_task_context_bundle"));
+        assert!(prompt.contains("Task Brief"));
+        assert!(prompt.contains("Acceptance Criteria"));
+        assert!(prompt.contains("Validation Items"));
+        assert!(prompt.contains("Workpad Note"));
+        assert!(prompt.contains("Task Links"));
+        assert!(prompt.contains("Task Conflict Hints"));
+        assert!(prompt.contains("recent Agent Runs"));
+        assert!(prompt.contains("Task Queue/local workflow context"));
+        assert!(prompt.contains("short context plan"));
+        assert!(prompt.contains("bin/tasker-local"));
+        assert!(prompt.contains("queue show <queue>"));
+        assert!(prompt.contains("preflight"));
+        assert!(prompt.contains("task show <task>"));
+        assert!(prompt.contains("avoid bare `tasker`"));
+        assert!(prompt.contains("Do not expose raw Run Transcript bodies"));
+        assert!(prompt.contains("raw launcher payloads"));
+        assert!(prompt.contains("secrets"));
+        assert!(prompt.contains("unrelated queue data"));
+    }
+
+    #[tokio::test]
+    async fn worker_prompt_appends_context_bundle_guidance_to_role_prompt_overrides() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let worktrees = temp.path().join("worktrees");
+        init_git_repo(&repo);
+        let db_path = temp.path().join("tasker.db");
+        let pool = tasker_db::connect(&db_path).await.expect("connect");
+        tasker_db::run_migrations(&pool).await.expect("migrate");
+        seed_ready_task(&pool, &repo, &worktrees).await;
+        let claimed = tasker_db::claim_next(
+            &pool,
+            &tasker_db::ClaimNextInput {
+                queue_key: "TASK".to_string(),
+                worker_id: "worker".to_string(),
+                launcher_kind: "pi".to_string(),
+                lease_seconds: 90,
+            },
+            &tasker_db::Actor {
+                kind: "worker_agent".to_string(),
+                id: "worker".to_string(),
+                display_name: "Worker".to_string(),
+            },
+        )
+        .await
+        .expect("claim task")
+        .expect("claimed task");
+        let override_prompt = temp.path().join("worker.md");
+        fs::write(&override_prompt, "Custom worker instructions.").expect("write override");
+
+        let prompt = build_worker_prompt(
+            &claimed.task,
+            &claimed.run,
+            &worktrees.join("TASK-1"),
+            &temp.path().join("cargo-target"),
+            Some(&override_prompt),
+        )
+        .expect("build prompt");
+
+        assert!(prompt.starts_with("Custom worker instructions."));
+        assert!(prompt.contains("tasker_get_task_context_bundle"));
+        assert!(prompt.contains("short context plan"));
+        assert!(prompt.contains("bin/tasker-local"));
     }
 
     #[tokio::test]
