@@ -38,7 +38,10 @@ pub use queues::{
     create_task_queue, get_task_queue, list_audit_events, list_task_queue_audit_events,
     list_task_queues, update_task_queue_concurrency_limit,
 };
-pub use requirements::{update_acceptance_criterion_status, update_validation_item_status};
+pub use requirements::{
+    record_task_validated_base_commit, update_acceptance_criterion_status,
+    update_validation_item_status,
+};
 pub use runs::{claim_next, finish_run, heartbeat_run, operator_fail_run, retry_task};
 pub use status::{
     active_agent_runs_for_status, active_retry_holds_for_status, due_integration_retries,

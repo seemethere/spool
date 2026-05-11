@@ -10,6 +10,7 @@ use crate::commit_metadata;
 
 const INTEGRATION_RETRY_MAX_ATTEMPTS: i64 = 3;
 const INTEGRATION_RETRY_INITIAL_DELAY_SECONDS: i64 = 30;
+const VALIDATION_COMMANDS_FILE: &str = ".tasker/validation-commands.txt";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalIntegrationResult {
@@ -53,6 +54,7 @@ pub async fn integrate_local_worktree_for_run(
         repo: Path::new(&queue.managed_source_repository),
         worktree: Path::new(&local_worktree),
         task_branch: &task_branch,
+        auto_refreshed: false,
     };
     adapter.integrate().await
 }
@@ -80,6 +82,13 @@ struct LocalWorktreeIntegrationAdapter<'a> {
     repo: &'a Path,
     worktree: &'a Path,
     task_branch: &'a str,
+    auto_refreshed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaleValidatedBase {
+    previous_base: String,
+    current_main: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -111,6 +120,12 @@ fn integration_reason_code(kind: &str, message: Option<&str>) -> &'static str {
     let message = message.unwrap_or_default();
     if message.contains("Local Worktree has uncommitted changes") {
         "uncommitted_local_worktree"
+    } else if message.contains("auto-refresh validation failed") {
+        "auto_refresh_validation_failed"
+    } else if message.contains("auto-refresh declined: no validation command source") {
+        "auto_refresh_declined_missing_validation"
+    } else if message.contains("auto-refresh conflict") {
+        "auto_refresh_conflict"
     } else if message.contains("stale Validated Base Commit") {
         "stale_validated_base_commit"
     } else if message.contains("does not include current Main Branch") {
@@ -130,6 +145,10 @@ fn integration_reason_code(kind: &str, message: Option<&str>) -> &'static str {
     } else {
         "unknown_operational_failure"
     }
+}
+
+fn is_stale_validated_base_error(error: &anyhow::Error) -> bool {
+    error.to_string().contains("stale Validated Base Commit")
 }
 
 impl<'a> LocalWorktreeIntegrationAdapter<'a> {
@@ -162,22 +181,57 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
             });
         }
         if let Err(error) = self.validate_work_change_safety() {
-            self.record_outcome(
-                "work_change_failure",
-                integration_reason_code("work_change_failure", Some(&error.to_string())),
-                None,
-                None,
-                Some(error.to_string()),
-                IntegrationOutcomeRetryFields::default(),
-            )
-            .await?;
-            self.transition("rework").await?;
-            return Ok(LocalIntegrationResult {
-                summary: format!(
-                    "work-change Delivery Failure for Task {}; moved to Rework: {error:#}",
-                    self.task.task.identifier
-                ),
-            });
+            let stale_candidate = if is_stale_validated_base_error(&error) {
+                self.stale_validated_base_candidate()?
+            } else {
+                None
+            };
+            if let Some(stale) = stale_candidate {
+                match self.auto_refresh_stale_validated_base(&stale).await {
+                    Ok(summary) => {
+                        self.auto_refreshed = true;
+                        self.validate_work_change_safety().with_context(|| {
+                            format!("auto-refresh completed but refreshed Task Branch still failed integration preflight: {summary}")
+                        })?;
+                    }
+                    Err(refresh_error) => {
+                        let message = refresh_error.to_string();
+                        self.record_outcome(
+                            "work_change_failure",
+                            integration_reason_code("work_change_failure", Some(&message)),
+                            None,
+                            Some(stale.current_main),
+                            Some(message.clone()),
+                            IntegrationOutcomeRetryFields::default(),
+                        )
+                        .await?;
+                        self.transition("rework").await?;
+                        return Ok(LocalIntegrationResult {
+                            summary: format!(
+                                "work-change Delivery Failure for Task {}; moved to Rework: {message}",
+                                self.task.task.identifier
+                            ),
+                        });
+                    }
+                }
+            } else {
+                self.record_outcome(
+                    "work_change_failure",
+                    integration_reason_code("work_change_failure", Some(&error.to_string())),
+                    None,
+                    None,
+                    Some(error.to_string()),
+                    IntegrationOutcomeRetryFields::default(),
+                )
+                .await?;
+                self.transition("rework").await?;
+                return Ok(LocalIntegrationResult {
+                    summary: format!(
+                        "work-change Delivery Failure for Task {}; moved to Rework: {error:#}",
+                        self.task.task.identifier
+                    ),
+                });
+            }
         }
 
         let pre_merge_head = git_output(
@@ -294,9 +348,16 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
             .map(|error| format!("cleanup needs operator repair: {error:#}"));
         self.record_outcome(
             "success",
-            cleanup_message
-                .as_ref()
-                .map_or("success", |_| "cleanup_failure"),
+            cleanup_message.as_ref().map_or_else(
+                || {
+                    if self.auto_refreshed {
+                        "auto_refresh_success"
+                    } else {
+                        "success"
+                    }
+                },
+                |_| "cleanup_failure",
+            ),
             Some(final_commit.clone()),
             Some(pre_merge_head),
             cleanup_message.clone(),
@@ -321,6 +382,125 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
             summary.push_str(&format!("; {message}"));
         }
         Ok(LocalIntegrationResult { summary })
+    }
+
+    fn stale_validated_base_candidate(&self) -> Result<Option<StaleValidatedBase>> {
+        let Some(previous_base) = self.task.task.validated_base_commit.clone() else {
+            return Ok(None);
+        };
+        ensure_clean_git(self.worktree, "Local Worktree")?;
+        let worktree_branch = git_output(
+            self.worktree,
+            &["branch", "--show-current"],
+            "read Local Worktree branch",
+        )?;
+        if worktree_branch.trim() != self.task_branch {
+            return Ok(None);
+        }
+        let current_main = git_output(
+            self.repo,
+            &["rev-parse", &self.queue.main_branch],
+            "read Main Branch commit",
+        )?
+        .trim()
+        .to_string();
+        if previous_base == current_main {
+            return Ok(None);
+        }
+        if git_status(
+            self.repo,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &self.queue.main_branch,
+                self.task_branch,
+            ],
+        )?
+        .success()
+        {
+            return Ok(None);
+        }
+        let task_commit_count: i64 = git_output(
+            self.repo,
+            &[
+                "rev-list",
+                "--count",
+                &format!("{}..{}", self.queue.main_branch, self.task_branch),
+            ],
+            "count Task Commits",
+        )?
+        .trim()
+        .parse()
+        .context("failed to parse Task Commit count")?;
+        if task_commit_count == 0 {
+            return Ok(None);
+        }
+        Ok(Some(StaleValidatedBase {
+            previous_base,
+            current_main,
+        }))
+    }
+
+    async fn auto_refresh_stale_validated_base(
+        &self,
+        stale: &StaleValidatedBase,
+    ) -> Result<String> {
+        let validation_commands = self.load_validation_commands()?;
+        if validation_commands.is_empty() {
+            anyhow::bail!(
+                "auto-refresh declined: no validation command source found at {}",
+                self.repo.join(VALIDATION_COMMANDS_FILE).display()
+            );
+        }
+        if let Err(error) = run_git(
+            self.worktree,
+            &["rebase", &self.queue.main_branch],
+            "auto-refresh Task Branch by rebasing onto Main Branch",
+        ) {
+            let _ = run_git(
+                self.worktree,
+                &["rebase", "--abort"],
+                "abort auto-refresh rebase",
+            );
+            anyhow::bail!(
+                "auto-refresh conflict while rebasing Task Branch {} from Validated Base Commit {} onto current Main Branch {}: {error:#}",
+                self.task_branch,
+                stale.previous_base,
+                stale.current_main
+            );
+        }
+        for command in &validation_commands {
+            run_shell_command(self.worktree, command).with_context(|| {
+                format!("auto-refresh validation failed for command `{command}`")
+            })?;
+        }
+        tasker_db::record_task_validated_base_commit(
+            self.pool,
+            &self.task.task.identifier,
+            &stale.current_main,
+            self.actor,
+        )
+        .await?;
+        Ok(format!(
+            "auto-refreshed stale Validated Base Commit {} to {}",
+            stale.previous_base, stale.current_main
+        ))
+    }
+
+    fn load_validation_commands(&self) -> Result<Vec<String>> {
+        let path = self.repo.join(VALIDATION_COMMANDS_FILE);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let text = std::fs::read_to_string(&path).with_context(|| {
+            format!("failed to read validation commands from {}", path.display())
+        })?;
+        Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(ToString::to_string)
+            .collect())
     }
 
     fn validate_operational_safety(&self) -> Result<()> {
@@ -618,6 +798,35 @@ fn git_common_dir(repo: &Path) -> Result<PathBuf> {
 
 fn run_git(repo: &Path, args: &[&str], action: &str) -> Result<()> {
     git_output(repo, args, action).map(|_| ())
+}
+
+fn run_shell_command(repo: &Path, command: &str) -> Result<()> {
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(repo)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run validation command `{command}` in {}",
+                repo.display()
+            )
+        })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "validation command `{}` failed with status {}: {}{}{}",
+            command,
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+            if output.stderr.is_empty() || output.stdout.is_empty() {
+                ""
+            } else {
+                "\n"
+            },
+            String::from_utf8_lossy(&output.stdout).trim()
+        );
+    }
+    Ok(())
 }
 
 fn git_output(repo: &Path, args: &[&str], action: &str) -> Result<String> {

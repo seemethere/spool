@@ -55,6 +55,62 @@ pub async fn update_validation_item_status(
     .await
 }
 
+pub async fn record_task_validated_base_commit(
+    pool: &SqlitePool,
+    identifier: &str,
+    validated_base_commit: &str,
+    actor: &Actor,
+) -> Result<TaskDetail> {
+    validate_actor(actor)?;
+    let validated_base_commit = validated_base_commit.trim();
+    if validated_base_commit.is_empty() {
+        anyhow::bail!("Validated Base Commit cannot be empty");
+    }
+    let mut tx = pool.begin().await.context("failed to begin transaction")?;
+    let task_id: String = sqlx::query_scalar("SELECT id FROM tasks WHERE identifier = ?")
+        .bind(identifier)
+        .fetch_optional(&mut *tx)
+        .await
+        .with_context(|| format!("failed to load Task {identifier}"))?
+        .with_context(|| format!("Task {identifier} not found"))?;
+
+    sqlx::query(
+        "UPDATE tasks SET validated_base_commit = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    )
+    .bind(validated_base_commit)
+    .bind(&task_id)
+    .execute(&mut *tx)
+    .await
+    .context("failed to update Validated Base Commit")?;
+
+    let payload_json = serde_json::json!({
+        "identifier": identifier,
+        "validated_base_commit": validated_base_commit,
+    })
+    .to_string();
+    sqlx::query(
+        r#"
+        INSERT INTO audit_events (
+            id, actor_kind, actor_id, actor_display_name, event_type, subject_type, subject_id, payload_json
+        ) VALUES (?, ?, ?, ?, 'task.validated_base_commit.recorded', 'task', ?, ?)
+        "#,
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&actor.kind)
+    .bind(&actor.id)
+    .bind(&actor.display_name)
+    .bind(&task_id)
+    .bind(payload_json)
+    .execute(&mut *tx)
+    .await
+    .context("failed to record audit event")?;
+
+    tx.commit().await.context("failed to commit transaction")?;
+    get_task_detail(pool, identifier)
+        .await?
+        .with_context(|| format!("Task {identifier} not found after update"))
+}
+
 struct RequirementKind {
     table: &'static str,
     event_type: &'static str,
