@@ -335,6 +335,7 @@ struct TelemetryRunRow {
     failure_reason: Option<String>,
     failure_reason_code: Option<String>,
     created_at: String,
+    created_epoch: i64,
     finished_at: Option<String>,
     integrating_at: Option<String>,
     duration_seconds: Option<i64>,
@@ -625,6 +626,7 @@ pub async fn summarize_agent_runs(
             agent_runs.failure_reason AS failure_reason,
             agent_runs.failure_reason_code AS failure_reason_code,
             agent_runs.created_at AS created_at,
+            unixepoch(agent_runs.created_at) AS created_epoch,
             agent_runs.finished_at AS finished_at,
             first_integrating.integrating_at AS integrating_at,
             CASE
@@ -1647,6 +1649,503 @@ fn write_bucket(output: &mut String, label: &str, bucket: &CorrelationBucket) {
     .expect("write string");
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrendOptions {
+    pub queue: String,
+    pub landing_tasks: Vec<String>,
+    pub landing_timestamps: Vec<String>,
+    pub before_runs: usize,
+    pub after_runs: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrendSummary {
+    pub queue: String,
+    pub before_runs: usize,
+    pub after_runs: usize,
+    pub landing_points: Vec<TrendLandingSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrendLandingSummary {
+    pub label: String,
+    pub source: String,
+    pub landed_at: String,
+    pub before: TrendBucket,
+    pub after: TrendBucket,
+    pub deltas: TrendDeltas,
+    pub conclusions: Vec<String>,
+    pub cautions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrendBucket {
+    pub agent_runs: usize,
+    pub runs_with_metrics: usize,
+    pub tool_calls: i64,
+    pub tool_errors: i64,
+    pub repeated_failed_tool_attempts: i64,
+    pub repeated_reads: i64,
+    pub repeated_tasker_context_fetches: i64,
+    pub shell_command_counts: BTreeMap<String, i64>,
+    pub top_shell_command_categories: Vec<CountSummary>,
+    pub assistant_turns: i64,
+    pub user_turns: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub max_context_tokens: Option<i64>,
+    pub transcript_bytes: i64,
+    pub completed_run_count: usize,
+    pub average_duration_seconds: Option<i64>,
+    pub duplicate_agent_run_waste: usize,
+    pub duplicate_tasks: usize,
+    pub integration_outcome_reason_counts: BTreeMap<String, i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrendDeltas {
+    pub tool_calls: i64,
+    pub repeated_reads: i64,
+    pub repeated_tasker_context_fetches: i64,
+    pub total_tokens: i64,
+    pub max_context_tokens: Option<i64>,
+    pub transcript_bytes: i64,
+    pub average_duration_seconds: Option<i64>,
+    pub duplicate_agent_run_waste: isize,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct TrendOutcomeRow {
+    created_epoch: i64,
+    reason_code: String,
+}
+
+pub async fn trend_summary(pool: &SqlitePool, options: &TrendOptions) -> Result<TrendSummary> {
+    let landing_options = CorrelationOptions {
+        queue: options.queue.clone(),
+        landing_tasks: options.landing_tasks.clone(),
+        landing_commits: Vec::new(),
+        landing_timestamps: options.landing_timestamps.clone(),
+    };
+    let landing_points = resolve_landing_points(pool, &landing_options).await?;
+    let runs = load_trend_runs(pool, &options.queue).await?;
+    let outcomes = load_trend_outcomes(pool, &options.queue).await?;
+    let landing_points = landing_points
+        .into_iter()
+        .map(|landing| {
+            let mut before_runs = runs
+                .iter()
+                .filter(|run| run.created_epoch < landing.landed_epoch)
+                .collect::<Vec<_>>();
+            before_runs.sort_by_key(|run| std::cmp::Reverse(run.created_epoch));
+            before_runs.truncate(options.before_runs);
+            before_runs.reverse();
+            let mut after_runs = runs
+                .iter()
+                .filter(|run| run.created_epoch >= landing.landed_epoch)
+                .collect::<Vec<_>>();
+            after_runs.sort_by_key(|run| run.created_epoch);
+            after_runs.truncate(options.after_runs);
+
+            let before_start = before_runs.first().map(|run| run.created_epoch);
+            let before_end = landing.landed_epoch - 1;
+            let after_end = after_runs.last().map(|run| run.created_epoch);
+            let before = build_trend_bucket(
+                &before_runs,
+                outcomes.iter().filter(|outcome| {
+                    before_start.is_some_and(|start| outcome.created_epoch >= start)
+                        && outcome.created_epoch <= before_end
+                }),
+            );
+            let after = build_trend_bucket(
+                &after_runs,
+                outcomes.iter().filter(|outcome| {
+                    outcome.created_epoch >= landing.landed_epoch
+                        && after_end.is_some_and(|end| outcome.created_epoch <= end)
+                }),
+            );
+            let deltas = trend_deltas(&before, &after);
+            let conclusions = trend_conclusions(&before, &after, &deltas);
+            let cautions = trend_cautions(&before, &after);
+            TrendLandingSummary {
+                label: landing.label,
+                source: landing.source,
+                landed_at: landing.landed_at,
+                before,
+                after,
+                deltas,
+                conclusions,
+                cautions,
+            }
+        })
+        .collect();
+    Ok(TrendSummary {
+        queue: options.queue.clone(),
+        before_runs: options.before_runs,
+        after_runs: options.after_runs,
+        landing_points,
+    })
+}
+
+async fn load_trend_runs(pool: &SqlitePool, queue: &str) -> Result<Vec<TelemetryRunRow>> {
+    sqlx::query_as::<_, TelemetryRunRow>(
+        r#"
+        WITH first_integrating AS (
+            SELECT subject_id AS task_id, MIN(created_at) AS integrating_at
+            FROM audit_events
+            WHERE subject_type = 'task'
+              AND event_type IN ('task.state_transitioned', 'task.state_changed')
+              AND json_extract(payload_json, '$.to') = 'integrating'
+            GROUP BY subject_id
+        )
+        SELECT
+            tasks.identifier AS task_identifier,
+            tasks.title AS task_title,
+            agent_runs.id AS agent_run_id,
+            agent_runs.outcome AS outcome,
+            agent_runs.failure_reason AS failure_reason,
+            agent_runs.failure_reason_code AS failure_reason_code,
+            agent_runs.created_at AS created_at,
+            unixepoch(agent_runs.created_at) AS created_epoch,
+            agent_runs.finished_at AS finished_at,
+            first_integrating.integrating_at AS integrating_at,
+            CASE
+                WHEN COALESCE(launcher_session_data.finished_at, agent_runs.finished_at) IS NOT NULL
+                 AND COALESCE(launcher_session_data.started_at, agent_runs.created_at) IS NOT NULL
+                THEN CAST(strftime('%s', COALESCE(launcher_session_data.finished_at, agent_runs.finished_at)) AS INTEGER)
+                   - CAST(strftime('%s', COALESCE(launcher_session_data.started_at, agent_runs.created_at)) AS INTEGER)
+                ELSE NULL
+            END AS duration_seconds,
+            agent_run_metrics.tool_call_count AS tool_call_count,
+            agent_run_metrics.tool_error_count AS tool_error_count,
+            agent_run_metrics.repeated_failed_tool_attempt_count AS repeated_failed_tool_attempt_count,
+            agent_run_metrics.tool_call_counts_json AS tool_call_counts_json,
+            agent_run_metrics.repeated_read_count AS repeated_read_count,
+            agent_run_metrics.repeated_tasker_context_fetch_count AS repeated_tasker_context_fetch_count,
+            agent_run_metrics.shell_command_counts_json AS shell_command_counts_json,
+            agent_run_metrics.assistant_turn_count AS assistant_turn_count,
+            agent_run_metrics.user_turn_count AS user_turn_count,
+            agent_run_metrics.input_tokens AS input_tokens,
+            agent_run_metrics.output_tokens AS output_tokens,
+            agent_run_metrics.total_tokens AS total_tokens,
+            agent_run_metrics.cache_read_tokens AS cache_read_tokens,
+            agent_run_metrics.cache_write_tokens AS cache_write_tokens,
+            agent_run_metrics.max_context_tokens AS max_context_tokens,
+            agent_run_metrics.transcript_byte_size AS transcript_byte_size,
+            agent_run_metrics.efficiency_hints_json AS efficiency_hints_json
+        FROM agent_runs
+        JOIN tasks ON tasks.id = agent_runs.task_id
+        JOIN task_queues ON task_queues.id = agent_runs.task_queue_id
+        LEFT JOIN launcher_session_data ON launcher_session_data.agent_run_id = agent_runs.id
+        LEFT JOIN agent_run_metrics ON agent_run_metrics.agent_run_id = agent_runs.id
+        LEFT JOIN first_integrating ON first_integrating.task_id = tasks.id
+        WHERE task_queues.key = ?
+        ORDER BY agent_runs.created_at, agent_runs.id
+        "#,
+    )
+    .bind(queue)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("failed to load efficiency trend Agent Runs for Task Queue {queue}"))
+}
+
+async fn load_trend_outcomes(pool: &SqlitePool, queue: &str) -> Result<Vec<TrendOutcomeRow>> {
+    sqlx::query_as::<_, TrendOutcomeRow>(
+        r#"
+        SELECT unixepoch(integration_outcomes.created_at) AS created_epoch,
+               COALESCE(integration_outcomes.reason_code, 'unknown_legacy') AS reason_code
+        FROM integration_outcomes
+        JOIN tasks ON tasks.id = integration_outcomes.task_id
+        JOIN task_queues ON task_queues.id = tasks.task_queue_id
+        WHERE task_queues.key = ?
+        ORDER BY integration_outcomes.created_at
+        "#,
+    )
+    .bind(queue)
+    .fetch_all(pool)
+    .await
+    .with_context(|| {
+        format!("failed to load efficiency trend Integration Outcomes for Task Queue {queue}")
+    })
+}
+
+fn build_trend_bucket<'a>(
+    runs: &[&TelemetryRunRow],
+    outcomes: impl Iterator<Item = &'a TrendOutcomeRow>,
+) -> TrendBucket {
+    let mut task_counts = BTreeMap::<String, usize>::new();
+    let mut shell_command_counts = BTreeMap::new();
+    let mut durations = Vec::new();
+    let mut integration_outcome_reason_counts = BTreeMap::new();
+    let mut bucket = TrendBucket {
+        agent_runs: runs.len(),
+        runs_with_metrics: 0,
+        tool_calls: 0,
+        tool_errors: 0,
+        repeated_failed_tool_attempts: 0,
+        repeated_reads: 0,
+        repeated_tasker_context_fetches: 0,
+        shell_command_counts: BTreeMap::new(),
+        top_shell_command_categories: Vec::new(),
+        assistant_turns: 0,
+        user_turns: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        max_context_tokens: None,
+        transcript_bytes: 0,
+        completed_run_count: 0,
+        average_duration_seconds: None,
+        duplicate_agent_run_waste: 0,
+        duplicate_tasks: 0,
+        integration_outcome_reason_counts: BTreeMap::new(),
+    };
+    for run in runs {
+        *task_counts.entry(run.task_identifier.clone()).or_default() += 1;
+        if run.tool_call_count.is_some()
+            || run.tool_call_counts_json.is_some()
+            || run.total_tokens.is_some()
+            || run.transcript_byte_size.is_some()
+        {
+            bucket.runs_with_metrics += 1;
+        }
+        bucket.tool_calls += run.tool_call_count.unwrap_or(0);
+        bucket.tool_errors += run.tool_error_count.unwrap_or(0);
+        bucket.repeated_failed_tool_attempts += run.repeated_failed_tool_attempt_count.unwrap_or(0);
+        bucket.repeated_reads += run.repeated_read_count.unwrap_or(0);
+        bucket.repeated_tasker_context_fetches +=
+            run.repeated_tasker_context_fetch_count.unwrap_or(0);
+        merge_counts(
+            &mut shell_command_counts,
+            json_counts(run.shell_command_counts_json.as_deref()),
+        );
+        bucket.assistant_turns += run.assistant_turn_count.unwrap_or(0);
+        bucket.user_turns += run.user_turn_count.unwrap_or(0);
+        bucket.input_tokens += run.input_tokens.unwrap_or(0);
+        bucket.output_tokens += run.output_tokens.unwrap_or(0);
+        bucket.total_tokens += run.total_tokens.unwrap_or(0);
+        bucket.cache_read_tokens += run.cache_read_tokens.unwrap_or(0);
+        bucket.cache_write_tokens += run.cache_write_tokens.unwrap_or(0);
+        if let Some(max_context) = run.max_context_tokens {
+            bucket.max_context_tokens =
+                Some(bucket.max_context_tokens.unwrap_or(0).max(max_context));
+        }
+        bucket.transcript_bytes += run.transcript_byte_size.unwrap_or(0);
+        if run.outcome.as_deref() == Some("completed") {
+            if let Some(duration) = run.duration_seconds {
+                durations.push(duration);
+            }
+        }
+    }
+    for outcome in outcomes {
+        *integration_outcome_reason_counts
+            .entry(outcome.reason_code.clone())
+            .or_insert(0) += 1;
+    }
+    bucket.duplicate_agent_run_waste = task_counts
+        .values()
+        .map(|count| count.saturating_sub(1))
+        .sum();
+    bucket.duplicate_tasks = task_counts.values().filter(|count| **count > 1).count();
+    bucket.completed_run_count = durations.len();
+    bucket.average_duration_seconds = average_i64(&durations);
+    bucket.top_shell_command_categories = top_counts(&shell_command_counts, 10);
+    bucket.shell_command_counts = shell_command_counts;
+    bucket.integration_outcome_reason_counts = integration_outcome_reason_counts;
+    bucket
+}
+
+fn trend_deltas(before: &TrendBucket, after: &TrendBucket) -> TrendDeltas {
+    TrendDeltas {
+        tool_calls: after.tool_calls - before.tool_calls,
+        repeated_reads: after.repeated_reads - before.repeated_reads,
+        repeated_tasker_context_fetches: after.repeated_tasker_context_fetches
+            - before.repeated_tasker_context_fetches,
+        total_tokens: after.total_tokens - before.total_tokens,
+        max_context_tokens: match (before.max_context_tokens, after.max_context_tokens) {
+            (Some(before), Some(after)) => Some(after - before),
+            _ => None,
+        },
+        transcript_bytes: after.transcript_bytes - before.transcript_bytes,
+        average_duration_seconds: match (
+            before.average_duration_seconds,
+            after.average_duration_seconds,
+        ) {
+            (Some(before), Some(after)) => Some(after - before),
+            _ => None,
+        },
+        duplicate_agent_run_waste: after.duplicate_agent_run_waste as isize
+            - before.duplicate_agent_run_waste as isize,
+    }
+}
+
+fn trend_conclusions(
+    before: &TrendBucket,
+    after: &TrendBucket,
+    deltas: &TrendDeltas,
+) -> Vec<String> {
+    vec![
+        trend_direction("tool calls", deltas.tool_calls),
+        trend_direction("repeated reads", deltas.repeated_reads),
+        trend_direction(
+            "repeated Tasker context fetches",
+            deltas.repeated_tasker_context_fetches,
+        ),
+        trend_direction("token totals", deltas.total_tokens),
+        match deltas.max_context_tokens {
+            Some(delta) => trend_direction("max context pressure", delta),
+            None => "max context pressure: insufficient exact-token coverage".to_string(),
+        },
+        match deltas.average_duration_seconds {
+            Some(delta) => trend_direction("run duration", delta),
+            None => "run duration: insufficient comparable completed runs".to_string(),
+        },
+        format!(
+            "duplicate/wasted runs: before={} after={} delta={}",
+            before.duplicate_agent_run_waste,
+            after.duplicate_agent_run_waste,
+            deltas.duplicate_agent_run_waste
+        ),
+    ]
+}
+
+fn trend_cautions(before: &TrendBucket, after: &TrendBucket) -> Vec<String> {
+    let mut cautions = vec![
+        format!(
+            "sample size: before={} Agent Run(s), after={} Agent Run(s); small windows can be noisy",
+            before.agent_runs, after.agent_runs
+        ),
+        "exact-token coverage may be partial; zero token totals can mean unavailable metrics, not zero usage".to_string(),
+        "tool-call, shell-category, transcript-byte, and context metrics are local proxies and should not be treated as billing or secret-bearing data".to_string(),
+    ];
+    if before.runs_with_metrics < before.agent_runs || after.runs_with_metrics < after.agent_runs {
+        cautions.push(format!(
+            "metric coverage: before={}/{} after={}/{} runs have normalized metrics",
+            before.runs_with_metrics, before.agent_runs, after.runs_with_metrics, after.agent_runs
+        ));
+    }
+    cautions
+}
+
+fn trend_direction(label: &str, delta: i64) -> String {
+    if delta < 0 {
+        format!("{label}: improved by {}", -delta)
+    } else if delta > 0 {
+        format!(
+            "{label}: increased by {delta}; investigate sample mix before calling it a regression"
+        )
+    } else {
+        format!("{label}: unchanged")
+    }
+}
+
+pub fn render_trend_summary(summary: &TrendSummary) -> String {
+    let mut output = String::new();
+    writeln!(output, "Efficiency trend telemetry").expect("write string");
+    writeln!(output, "Task Queue: {}", summary.queue).expect("write string");
+    if summary.landing_points.is_empty() {
+        writeln!(
+            output,
+            "No landing points supplied. Use --landing-task or --landing-at."
+        )
+        .expect("write string");
+        return output;
+    }
+    for landing in &summary.landing_points {
+        writeln!(
+            output,
+            "\nLanding point: {} ({}) at {}",
+            landing.label, landing.source, landing.landed_at
+        )
+        .expect("write string");
+        write_trend_bucket(&mut output, "before", &landing.before);
+        write_trend_bucket(&mut output, "after", &landing.after);
+        writeln!(
+            output,
+            "  deltas: tool_calls={} repeated_reads={} repeated_tasker_context_fetches={} total_tokens={} max_context={} transcript_bytes={} avg_duration={} duplicate_waste={}",
+            landing.deltas.tool_calls,
+            landing.deltas.repeated_reads,
+            landing.deltas.repeated_tasker_context_fetches,
+            landing.deltas.total_tokens,
+            landing.deltas.max_context_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+            landing.deltas.transcript_bytes,
+            landing.deltas.average_duration_seconds.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+            landing.deltas.duplicate_agent_run_waste,
+        )
+        .expect("write string");
+        writeln!(output, "  conclusions:").expect("write string");
+        for conclusion in &landing.conclusions {
+            writeln!(output, "    - {conclusion}").expect("write string");
+        }
+        writeln!(output, "  cautions:").expect("write string");
+        for caution in &landing.cautions {
+            writeln!(output, "    - {caution}").expect("write string");
+        }
+    }
+    output
+}
+
+fn write_trend_bucket(output: &mut String, label: &str, bucket: &TrendBucket) {
+    writeln!(output, "  {label}:").expect("write string");
+    writeln!(
+        output,
+        "    Agent Runs: {} (metrics on {})",
+        bucket.agent_runs, bucket.runs_with_metrics
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "    tool calls/errors: {}/{}; repeated reads={} repeated Tasker context fetches={}",
+        bucket.tool_calls,
+        bucket.tool_errors,
+        bucket.repeated_reads,
+        bucket.repeated_tasker_context_fetches
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "    shell categories: {}",
+        render_count_summaries(&bucket.top_shell_command_categories)
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "    token totals input/output/total/cache_read/cache_write: {}/{}/{}/{}/{}; max context={}",
+        bucket.input_tokens,
+        bucket.output_tokens,
+        bucket.total_tokens,
+        bucket.cache_read_tokens,
+        bucket.cache_write_tokens,
+        bucket.max_context_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string())
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "    transcript bytes: {}; avg completed duration: {} across {} run(s)",
+        bucket.transcript_bytes,
+        format_duration(bucket.average_duration_seconds),
+        bucket.completed_run_count
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "    duplicate/wasted runs: {} wasted across {} Task(s)",
+        bucket.duplicate_agent_run_waste, bucket.duplicate_tasks
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "    Integration Outcome reasons: {}",
+        render_counts(&bucket.integration_outcome_reason_counts)
+    )
+    .expect("write string");
+}
+
 // Task lifecycle latency telemetry
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LifecycleTelemetryOptions {
@@ -2374,6 +2873,218 @@ mod tests {
             .iter()
             .any(|point| point["before"]["duplicate_agent_run_waste"] == 1));
         assert!(render_correlation_summary(&summary).contains("Focus current work"));
+    }
+
+    #[tokio::test]
+    async fn telemetry_trend_compares_efficiency_windows_and_redacts_json() {
+        let pool = memory_pool().await;
+        sqlx::query(
+            r#"
+            INSERT INTO task_queues (
+                id, key, name, managed_source_repository, main_branch, worktree_root, branch_template
+            ) VALUES ('queue-1', 'TASK', 'Tasker', '/repo', 'main', '/worktrees', 'tasker/{task_identifier}')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("queue");
+        for (identifier, sequence, title) in [
+            ("TASK-1", 1, "Before work"),
+            ("TASK-2", 2, "Landing work"),
+            ("TASK-3", 3, "After work"),
+        ] {
+            sqlx::query(
+                "INSERT INTO tasks (id, task_queue_id, identifier, sequence, title, brief, priority, state) VALUES (?, 'queue-1', ?, ?, ?, 'brief', 'normal', 'done')",
+            )
+            .bind(identifier)
+            .bind(identifier)
+            .bind(sequence)
+            .bind(title)
+            .execute(&pool)
+            .await
+            .expect("task");
+        }
+        insert_run(
+            &pool,
+            "TASK-1",
+            "queue-1",
+            "before-1",
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:10:00",
+            Some("completed"),
+            None,
+        )
+        .await;
+        insert_run(
+            &pool,
+            "TASK-1",
+            "queue-1",
+            "before-2",
+            "2026-01-01 00:20:00",
+            "2026-01-01 00:40:00",
+            Some("completed"),
+            None,
+        )
+        .await;
+        insert_run(
+            &pool,
+            "TASK-3",
+            "queue-1",
+            "after-1",
+            "2026-01-01 02:00:00",
+            "2026-01-01 02:05:00",
+            Some("completed"),
+            None,
+        )
+        .await;
+        for (
+            run_id,
+            tool_calls,
+            reads,
+            tasker_fetches,
+            total_tokens,
+            max_context,
+            transcript,
+            shell_json,
+        ) in [
+            (
+                "before-1",
+                30,
+                3,
+                2,
+                90_000,
+                100_000,
+                2_000,
+                r#"{"tasker_cli":4,"search":3}"#,
+            ),
+            (
+                "before-2",
+                20,
+                1,
+                1,
+                70_000,
+                80_000,
+                1_000,
+                r#"{"tasker_cli":2,"cargo":1}"#,
+            ),
+            (
+                "after-1",
+                15,
+                0,
+                0,
+                40_000,
+                50_000,
+                500,
+                r#"{"tasker_cli":1,"search":1}"#,
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO agent_run_metrics (
+                    agent_run_id, launcher_kind, final_status, transcript_byte_size,
+                    input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
+                    tool_call_count, tool_error_count, repeated_failed_tool_attempt_count,
+                    tool_call_counts_json, repeated_read_count, repeated_tasker_context_fetch_count,
+                    shell_command_counts_json, assistant_turn_count, user_turn_count,
+                    max_context_tokens, efficiency_hints_json
+                ) VALUES (?, 'pi', 'completed', ?, 10, 5, ?, 1, 2, ?, 0, 0,
+                    '{"bash":1}', ?, ?, ?, 1, 1, ?, '[]')
+                "#,
+            )
+            .bind(run_id)
+            .bind(transcript)
+            .bind(total_tokens)
+            .bind(tool_calls)
+            .bind(reads)
+            .bind(tasker_fetches)
+            .bind(shell_json)
+            .bind(max_context)
+            .execute(&pool)
+            .await
+            .expect("metrics");
+        }
+        audit(
+            &pool,
+            "TASK-2",
+            "task.state_transitioned",
+            serde_json::json!({"from":"integrating","to":"done"}),
+            "2026-01-01 01:00:00",
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO integration_outcomes (id, task_id, outcome_kind, reason_code, created_at) VALUES ('before-outcome', 'TASK-1', 'work_change_failure', 'unknown_work_change_failure', '2026-01-01 00:30:00'), ('after-outcome', 'TASK-3', 'success', 'success', '2026-01-01 02:00:00')",
+        )
+        .execute(&pool)
+        .await
+        .expect("outcomes");
+
+        let summary = trend_summary(
+            &pool,
+            &TrendOptions {
+                queue: "TASK".to_string(),
+                landing_tasks: vec!["TASK-2".to_string()],
+                landing_timestamps: vec!["2026-01-01 01:00:00".to_string()],
+                before_runs: 10,
+                after_runs: 10,
+            },
+        )
+        .await
+        .expect("trend");
+
+        assert_eq!(summary.landing_points.len(), 2);
+        assert!(
+            summary
+                .landing_points
+                .iter()
+                .any(|landing| landing.source == "timestamp"
+                    && landing.label == "2026-01-01 01:00:00")
+        );
+        let landing = summary
+            .landing_points
+            .iter()
+            .find(|landing| landing.source == "task")
+            .expect("task landing");
+        assert_eq!(landing.before.tool_calls, 50);
+        assert_eq!(landing.after.tool_calls, 15);
+        assert_eq!(landing.deltas.tool_calls, -35);
+        assert_eq!(landing.before.repeated_tasker_context_fetches, 3);
+        assert_eq!(landing.after.repeated_tasker_context_fetches, 0);
+        assert_eq!(landing.deltas.total_tokens, -120_000);
+        assert_eq!(landing.deltas.max_context_tokens, Some(-50_000));
+        assert_eq!(landing.before.duplicate_agent_run_waste, 1);
+        assert_eq!(landing.after.duplicate_agent_run_waste, 0);
+        assert_eq!(
+            landing
+                .before
+                .integration_outcome_reason_counts
+                .get("unknown_work_change_failure"),
+            Some(&1)
+        );
+        assert_eq!(
+            landing
+                .after
+                .integration_outcome_reason_counts
+                .get("success"),
+            Some(&1)
+        );
+        assert!(landing
+            .conclusions
+            .iter()
+            .any(|line| line.contains("repeated Tasker context fetches: improved")));
+        assert!(landing
+            .cautions
+            .iter()
+            .any(|line| line.contains("exact-token coverage")));
+        let json = serde_json::to_value(&summary).expect("json");
+        assert_eq!(json["landing_points"][0]["before"]["tool_calls"], 50);
+        let json_text = json.to_string();
+        assert!(!json_text.contains("brief"));
+        assert!(!json_text.contains("transcript_path"));
+        assert!(!json_text.contains("prompt"));
+        let rendered = render_trend_summary(&summary);
+        assert!(rendered.contains("Efficiency trend telemetry"));
+        assert!(rendered.contains("cautions:"));
+        assert!(rendered.contains("Integration Outcome reasons"));
     }
 
     #[tokio::test]

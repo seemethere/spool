@@ -69,6 +69,32 @@ pub(crate) async fn telemetry(
                 print!("{}", telemetry::render_correlation_summary(&summary));
             }
         }
+        TelemetryCommand::Trend {
+            queue,
+            landing_tasks,
+            landing_timestamps,
+            before_runs,
+            after_runs,
+            json,
+        } => {
+            let summary = telemetry::trend_summary(
+                &pool,
+                &telemetry::TrendOptions {
+                    queue,
+                    landing_tasks,
+                    landing_timestamps,
+                    before_runs,
+                    after_runs,
+                },
+            )
+            .await?;
+            if json {
+                serde_json::to_writer_pretty(std::io::stdout(), &summary)?;
+                println!();
+            } else {
+                print!("{}", telemetry::render_trend_summary(&summary));
+            }
+        }
     }
     Ok(())
 }

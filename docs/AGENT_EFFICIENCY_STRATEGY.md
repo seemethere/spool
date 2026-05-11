@@ -144,7 +144,7 @@ Current defaults flag warning/severe overruns at 150/250 tool calls, 80k/100k to
 
 - Prefer small implementation Tasks with explicit relevant ADRs, likely files, and validation commands.
 - Treat Workpad Notes as handoff summaries, not authoritative requirement state; keep structured Acceptance Criteria and Validation Items current.
-- Continue using `tasker telemetry summary`, `tasker telemetry lifecycle`, `tasker run show`, and `.tasker/data/runs/<id>/pi.jsonl` as local evidence sources until extension/API equivalents exist.
+- Continue using `tasker telemetry summary`, `tasker telemetry lifecycle`, `tasker telemetry trend --queue TASKER --landing-task <TASK>`, `tasker run show`, and `.tasker/data/runs/<id>/pi.jsonl` as local evidence sources until extension/API equivalents exist. Use `telemetry trend` to compare bounded before/after Agent Run windows around dogfood landing Tasks or timestamps without exposing raw transcripts, prompts, command output, or secrets.
 - Prioritize reducing duplicate Agent Runs and local-state setup failures before optimizing model-level behavior; the current evidence shows workflow waste is more measurable than token/context waste.
 - Keep all telemetry local by default and derive Workflow Metrics from Audit Events, Agent Runs, Launcher Session Data, and Integration Outcomes.
 

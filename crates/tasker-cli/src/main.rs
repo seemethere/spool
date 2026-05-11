@@ -449,6 +449,27 @@ enum TelemetryCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Compare Agent Run efficiency trends around dogfood landing points.
+    Trend {
+        /// Task Queue Key to summarize.
+        #[arg(long)]
+        queue: String,
+        /// Landing point from a completed Task Identifier.
+        #[arg(long = "landing-task")]
+        landing_tasks: Vec<String>,
+        /// Explicit landing point timestamp (SQLite-compatible UTC string).
+        #[arg(long = "landing-at")]
+        landing_timestamps: Vec<String>,
+        /// Number of Agent Runs before each landing point to include.
+        #[arg(long, default_value_t = 10)]
+        before_runs: usize,
+        /// Number of Agent Runs after each landing point to include.
+        #[arg(long, default_value_t = 10)]
+        after_runs: usize,
+        /// Emit machine-readable trend telemetry JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -935,7 +956,8 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
         ) => Some(queue.clone()),
         Some(Command::Telemetry { command }) => match command {
             TelemetryCommand::Summary { queue, .. }
-            | TelemetryCommand::Correlation { queue, .. } => Some(queue.clone()),
+            | TelemetryCommand::Correlation { queue, .. }
+            | TelemetryCommand::Trend { queue, .. } => Some(queue.clone()),
             TelemetryCommand::Lifecycle { queue, .. }
             | TelemetryCommand::BackfillMetrics { queue, .. } => queue.clone(),
         },
