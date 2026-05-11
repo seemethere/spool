@@ -27,7 +27,11 @@ pub(crate) async fn task(
             if !bootstrap {
                 anyhow::bail!("task create currently requires --bootstrap");
             }
-            let input = bootstrap::parse_bootstrap_task_file(&queue, &file)?;
+            let parsed = bootstrap::parse_bootstrap_task_file_with_warnings(&queue, &file)?;
+            for warning in &parsed.warnings {
+                eprintln!("warning: {warning}");
+            }
+            let input = parsed.task;
             let detail =
                 tasker_db::create_task(&pool, &input, &tasker_db::Actor::operator(actor)).await?;
             println!("created Task: {}", detail.task.identifier);

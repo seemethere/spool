@@ -2159,6 +2159,68 @@ fn merge_inspection_git_commands_report_cleanliness_and_main_diff() {
         .contains("scratch.txt"));
 }
 
+#[tokio::test]
+async fn bootstrap_create_persists_canonical_priority_for_medium_alias() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = TaskerPaths::resolve(temp.path(), PathOverrides::default());
+    init(&paths, false).await.expect("init");
+    let repo = temp.path().join("repo");
+    init_git_repo(&repo);
+    queue(
+        &paths,
+        false,
+        QueueCommand::Create {
+            key: "TASK".to_string(),
+            name: "Tasker".to_string(),
+            managed_source_repository: repo,
+            main_branch: "main".to_string(),
+            worktree_root: temp.path().join("worktrees"),
+            branch_template: "tasker/{task_identifier}".to_string(),
+            done_worktree_retention: false,
+            queue_concurrency_limit: None,
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect("create queue");
+
+    let task_file = temp.path().join("task.md");
+    fs::write(
+        &task_file,
+        r#"---
+title: Normalize bootstrap priority
+priority: medium
+acceptance_criteria:
+  - Priority alias is accepted
+validation_items:
+  - Stored priority is canonical
+---
+Implement priority alias normalization.
+"#,
+    )
+    .expect("write task file");
+
+    task(
+        &paths,
+        false,
+        TaskCommand::Create {
+            bootstrap: true,
+            queue: "TASK".to_string(),
+            file: task_file,
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect("create task");
+
+    let pool = tasker_db::connect(&paths.db_path).await.expect("connect");
+    let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+        .await
+        .expect("get task")
+        .expect("task exists");
+    assert_eq!(detail.task.priority, "normal");
+}
+
 #[test]
 fn bootstrap_parser_defaults_to_ready_normal() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -2281,6 +2343,22 @@ async fn bootstrap_lint_does_not_create_task_or_audit_events() {
 
     assert_eq!(task_count, 0);
     assert_eq!(task_audit_count, 0);
+}
+
+#[test]
+fn bootstrap_parser_normalizes_medium_priority_alias() {
+    let parsed = bootstrap::parse_bootstrap_task_with_warnings(
+        "TASK",
+        "inline",
+        "---\ntitle: Test\npriority: medium\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\n---\nBrief\n",
+    )
+    .expect("parse");
+
+    assert_eq!(parsed.task.priority, "normal");
+    assert_eq!(
+        parsed.warnings,
+        vec!["normalized priority alias \"medium\" to canonical \"normal\"".to_string()]
+    );
 }
 
 #[test]

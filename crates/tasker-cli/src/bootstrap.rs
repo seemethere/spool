@@ -18,23 +18,46 @@ struct BootstrapFrontMatter {
     review_required: Option<bool>,
 }
 
+#[cfg(test)]
 pub fn parse_bootstrap_task_file(queue_key: &str, file: &Path) -> Result<tasker_db::CreateTask> {
-    let text =
-        fs::read_to_string(file).with_context(|| format!("failed to read {}", file.display()))?;
-    parse_bootstrap_task(queue_key, &file.display().to_string(), &text)
+    Ok(parse_bootstrap_task_file_with_warnings(queue_key, file)?.task)
 }
 
 pub fn lint_bootstrap_task_file(file: &Path) -> Result<tasker_db::CreateTask> {
-    let input = parse_bootstrap_task_file("__lint__", file)?;
+    let input = parse_bootstrap_task_file_with_warnings("__lint__", file)?.task;
     tasker_db::validate_create_task(&input)?;
     Ok(input)
 }
 
+pub fn parse_bootstrap_task_file_with_warnings(
+    queue_key: &str,
+    file: &Path,
+) -> Result<ParsedBootstrapTask> {
+    let text =
+        fs::read_to_string(file).with_context(|| format!("failed to read {}", file.display()))?;
+    parse_bootstrap_task_with_warnings(queue_key, &file.display().to_string(), &text)
+}
+
+#[cfg(test)]
 pub fn parse_bootstrap_task(
     queue_key: &str,
     source_name: &str,
     text: &str,
 ) -> Result<tasker_db::CreateTask> {
+    Ok(parse_bootstrap_task_with_warnings(queue_key, source_name, text)?.task)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ParsedBootstrapTask {
+    pub task: tasker_db::CreateTask,
+    pub warnings: Vec<String>,
+}
+
+pub fn parse_bootstrap_task_with_warnings(
+    queue_key: &str,
+    source_name: &str,
+    text: &str,
+) -> Result<ParsedBootstrapTask> {
     let (front_matter, brief) = split_front_matter(text)?;
     let front_matter_text = front_matter;
     let front_matter: BootstrapFrontMatter =
@@ -48,7 +71,7 @@ pub fn parse_bootstrap_task(
         "priority",
         front_matter.priority.as_deref().unwrap_or("normal"),
         &["urgent", "high", "normal", "low"],
-        Some(("medium", "normal")),
+        &[("medium", "normal")],
     )?;
     let state = validate_enum_front_matter_field(
         source_name,
@@ -56,22 +79,39 @@ pub fn parse_bootstrap_task(
         "state",
         front_matter.state.as_deref().unwrap_or("ready"),
         &["backlog", "ready"],
-        None,
+        &[],
     )?;
 
-    Ok(tasker_db::CreateTask {
-        queue_key: queue_key.to_string(),
-        title: front_matter.title,
-        brief: brief.trim().to_string(),
-        priority,
-        state,
-        review_required: front_matter.review_required.unwrap_or(false),
-        acceptance_criteria: front_matter.acceptance_criteria.unwrap_or_default(),
-        validation_items: front_matter.validation_items.unwrap_or_default(),
-        tags: front_matter.tags.unwrap_or_default(),
-        conflict_hints: front_matter.conflict_hints.unwrap_or_default(),
-        blocking_task_identifiers: front_matter.blocking_task_identifiers.unwrap_or_default(),
+    let mut warnings = Vec::new();
+    if let Some(alias) = &priority.alias {
+        warnings.push(format!(
+            "normalized priority alias \"{}\" to canonical \"{}\"",
+            alias, priority.value
+        ));
+    }
+
+    Ok(ParsedBootstrapTask {
+        task: tasker_db::CreateTask {
+            queue_key: queue_key.to_string(),
+            title: front_matter.title,
+            brief: brief.trim().to_string(),
+            priority: priority.value,
+            state: state.value,
+            review_required: front_matter.review_required.unwrap_or(false),
+            acceptance_criteria: front_matter.acceptance_criteria.unwrap_or_default(),
+            validation_items: front_matter.validation_items.unwrap_or_default(),
+            tags: front_matter.tags.unwrap_or_default(),
+            conflict_hints: front_matter.conflict_hints.unwrap_or_default(),
+            blocking_task_identifiers: front_matter.blocking_task_identifiers.unwrap_or_default(),
+        },
+        warnings,
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NormalizedEnumField {
+    value: String,
+    alias: Option<String>,
 }
 
 fn validate_enum_front_matter_field(
@@ -80,11 +120,23 @@ fn validate_enum_front_matter_field(
     field: &str,
     raw_value: &str,
     allowed_values: &[&str],
-    hint: Option<(&str, &str)>,
-) -> Result<String> {
+    aliases: &[(&str, &str)],
+) -> Result<NormalizedEnumField> {
     let normalized = normalize_label(raw_value);
     if allowed_values.contains(&normalized.as_str()) {
-        return Ok(normalized);
+        return Ok(NormalizedEnumField {
+            value: normalized,
+            alias: None,
+        });
+    }
+
+    for (alias, canonical) in aliases {
+        if normalized == *alias {
+            return Ok(NormalizedEnumField {
+                value: (*canonical).to_string(),
+                alias: Some(normalized),
+            });
+        }
     }
 
     let line = front_matter_field_line(front_matter, field)
@@ -94,9 +146,19 @@ fn validate_enum_front_matter_field(
     let rejected = raw_value.trim();
     let mut message =
         format!("{source_name}{line}: invalid {field} \"{rejected}\"; expected one of: {allowed}");
-    if let Some((from, to)) = hint {
-        if normalized == from {
-            message.push_str(&format!("\nhint: use \"{to}\" instead of \"{from}\""));
+    if !aliases.is_empty() {
+        let alias_list = aliases
+            .iter()
+            .map(|(alias, canonical)| format!("{alias} -> {canonical}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        message.push_str(&format!("; accepted aliases: {alias_list}"));
+        for (alias, canonical) in aliases {
+            if normalized == *alias {
+                message.push_str(&format!(
+                    "\nhint: use \"{canonical}\" instead of \"{alias}\""
+                ));
+            }
         }
     }
     anyhow::bail!(message)
@@ -212,15 +274,31 @@ mod tests {
         let error = parse_bootstrap_task(
             "TASK",
             ".tasker/bootstrap-tasks/foo.md",
-            "---\ntitle: Test\npriority: medium\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\n---\nBrief\n",
+            "---\ntitle: Test\npriority: moderate\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\n---\nBrief\n",
         )
         .expect_err("invalid priority fails");
         let message = error.to_string();
 
         assert!(message.contains(".tasker/bootstrap-tasks/foo.md:3"));
-        assert!(message.contains("invalid priority \"medium\""));
+        assert!(message.contains("invalid priority \"moderate\""));
         assert!(message.contains("expected one of: urgent, high, normal, low"));
-        assert!(message.contains("hint: use \"normal\" instead of \"medium\""));
+        assert!(message.contains("accepted aliases: medium -> normal"));
+    }
+
+    #[test]
+    fn parser_normalizes_medium_priority_alias_to_canonical_normal_with_warning() {
+        let parsed = parse_bootstrap_task_with_warnings(
+            "TASK",
+            "inline",
+            "---\ntitle: Test\npriority: medium\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\n---\nBrief\n",
+        )
+        .expect("parse");
+
+        assert_eq!(parsed.task.priority, "normal");
+        assert_eq!(
+            parsed.warnings,
+            vec!["normalized priority alias \"medium\" to canonical \"normal\"".to_string()]
+        );
     }
 
     #[test]

@@ -586,7 +586,7 @@ _Avoid_: Separate progress comment
 - **Dogfooding Readiness** uses single-worker execution only.
 - During dogfooding, active **Agent Runs** for **Integrating** **Tasks** share the same **Queue Concurrency Limit** as coding and rework runs; operators unblock saturation by waiting for completion or **Claim Lease** expiry, failing stuck runs, or raising/clearing the limit only if local resources permit.
 - **Bootstrap Task Creation** uses `tasker task create --bootstrap --queue <key> --file task.md`.
-- A bootstrap task file uses YAML front matter for title, acceptance criteria, validation items, priority, state, tags, review requirement, advisory conflict hints, and blocking Task identifiers, with the Markdown body as the **Task Brief**. The canonical example lives at `.tasker/bootstrap-tasks/TEMPLATE.md`.
+- A bootstrap task file uses YAML front matter for title, acceptance criteria, validation items, priority, state, tags, review requirement, advisory conflict hints, and blocking Task identifiers, with the Markdown body as the **Task Brief**. Priority values are stored canonically as **urgent**, **high**, **normal**, or **low**; Bootstrap Task Creation accepts the safe priority alias `medium` and normalizes it to **normal** with a CLI warning. The canonical example lives at `.tasker/bootstrap-tasks/TEMPLATE.md`.
 - **Bootstrap Task Creation** defaults to **Ready** when the task file does not specify state.
 - **Bootstrap Task Creation** does not replace long-term agent-mediated intake.
 - **Manual Dogfood Merge** may be used before automatic **Integrating** is implemented.
