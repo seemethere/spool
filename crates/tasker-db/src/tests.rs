@@ -36,6 +36,24 @@ async fn migrations_are_idempotent() {
 }
 
 #[tokio::test]
+async fn agent_run_metrics_derivation_version_migration_adds_legacy_default() {
+    let (_temp, pool) = migrated_pool().await;
+
+    let columns: Vec<(String, i64)> = sqlx::query_as(
+        r#"
+        SELECT name, dflt_value = '0' AS has_legacy_default
+        FROM pragma_table_info('agent_run_metrics')
+        WHERE name = 'derivation_version'
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("inspect metrics columns");
+
+    assert_eq!(columns, vec![("derivation_version".to_string(), 1)]);
+}
+
+#[tokio::test]
 async fn sqlite_write_retry_retries_busy_errors_with_bounded_backoff() {
     let temp = tempfile::tempdir().expect("tempdir");
     let db_path = temp.path().join("tasker.db");
@@ -2261,6 +2279,10 @@ async fn persists_agent_run_metrics_for_fake_launcher_outcome() {
         .await
         .expect("metrics")
         .expect("metrics recorded");
+    assert_eq!(
+        metrics.derivation_version,
+        CURRENT_AGENT_RUN_METRICS_DERIVATION_VERSION
+    );
     assert_eq!(metrics.launcher_kind, "fake");
     assert_eq!(metrics.final_status.as_deref(), Some("completed"));
     assert_eq!(metrics.transcript_jsonl_event_count, Some(1));
@@ -2349,6 +2371,10 @@ async fn persists_agent_run_metrics_for_pi_launcher_outcome() {
         .await
         .expect("metrics")
         .expect("metrics recorded");
+    assert_eq!(
+        metrics.derivation_version,
+        CURRENT_AGENT_RUN_METRICS_DERIVATION_VERSION
+    );
     assert_eq!(metrics.launcher_kind, "pi");
     assert_eq!(metrics.exit_code, Some(0));
     assert_eq!(metrics.timed_out, Some(0));

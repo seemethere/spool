@@ -423,6 +423,7 @@ pub struct LauncherSessionData {
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
 pub struct AgentRunMetrics {
     pub agent_run_id: String,
+    pub derivation_version: i64,
     pub duration_ms: Option<i64>,
     pub launcher_kind: String,
     pub final_status: Option<String>,
@@ -457,6 +458,7 @@ pub struct AgentRunMetrics {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ComputedAgentRunMetrics {
     pub agent_run_id: String,
+    pub derivation_version: i64,
     pub duration_ms: Option<i64>,
     pub launcher_kind: String,
     pub final_status: Option<String>,

@@ -31,7 +31,7 @@ pub use integration::{is_valid_integration_outcome_reason_code, record_integrati
 pub use metrics::{
     compute_agent_run_metrics, get_agent_run, get_agent_run_detail, get_agent_run_metrics,
     get_latest_agent_run_detail_for_task, get_launcher_session_data, refresh_agent_run_metrics,
-    upsert_launcher_session_data,
+    upsert_launcher_session_data, CURRENT_AGENT_RUN_METRICS_DERIVATION_VERSION,
 };
 pub use models::*;
 pub use queues::{

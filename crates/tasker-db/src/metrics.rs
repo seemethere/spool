@@ -11,6 +11,8 @@ use std::{fs, future::Future, path::Path, time::Duration};
 use tokio::time::sleep;
 use uuid::Uuid;
 
+pub const CURRENT_AGENT_RUN_METRICS_DERIVATION_VERSION: i64 = 1;
+
 pub async fn get_agent_run(pool: &SqlitePool, run_id: &str) -> Result<Option<AgentRun>> {
     let select_run_sql = agent_run_select_sql("WHERE id = ?");
     sqlx::query_as::<_, AgentRun>(&select_run_sql)
@@ -113,7 +115,7 @@ pub async fn get_agent_run_metrics(
 ) -> Result<Option<AgentRunMetrics>> {
     sqlx::query_as::<_, AgentRunMetrics>(
         r#"
-        SELECT agent_run_id, duration_ms, launcher_kind, final_status, exit_code, timed_out,
+        SELECT agent_run_id, derivation_version, duration_ms, launcher_kind, final_status, exit_code, timed_out,
                unattended_question_detected, blocking_ui_detected, transcript_path,
                transcript_byte_size, transcript_jsonl_event_count, input_tokens, output_tokens,
                total_tokens, cache_read_tokens, cache_write_tokens, tool_call_count, tool_error_count,
@@ -177,6 +179,7 @@ pub async fn compute_agent_run_metrics(
     let efficiency_hints_json = summary.efficiency_hints_json()?;
     Ok(Some(ComputedAgentRunMetrics {
         agent_run_id: agent_run_id.to_string(),
+        derivation_version: CURRENT_AGENT_RUN_METRICS_DERIVATION_VERSION,
         duration_ms,
         launcher_kind: summary.launcher_kind,
         final_status: summary.final_status,
@@ -217,7 +220,7 @@ pub async fn refresh_agent_run_metrics(
     sqlx::query(
         r#"
         INSERT INTO agent_run_metrics (
-            agent_run_id, duration_ms, launcher_kind, final_status, exit_code, timed_out,
+            agent_run_id, derivation_version, duration_ms, launcher_kind, final_status, exit_code, timed_out,
             unattended_question_detected, blocking_ui_detected, transcript_path,
             transcript_byte_size, transcript_jsonl_event_count, input_tokens, output_tokens,
             total_tokens, cache_read_tokens, cache_write_tokens, tool_call_count, tool_error_count,
@@ -227,10 +230,11 @@ pub async fn refresh_agent_run_metrics(
         )
         SELECT
             agent_runs.id,
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         FROM agent_runs
         WHERE agent_runs.id = ? AND agent_runs.outcome IS NOT NULL
         ON CONFLICT(agent_run_id) DO UPDATE SET
+            derivation_version = excluded.derivation_version,
             duration_ms = excluded.duration_ms,
             launcher_kind = excluded.launcher_kind,
             final_status = excluded.final_status,
@@ -261,6 +265,7 @@ pub async fn refresh_agent_run_metrics(
             updated_at = CURRENT_TIMESTAMP
         "#,
     )
+    .bind(metrics.derivation_version)
     .bind(metrics.duration_ms)
     .bind(&metrics.launcher_kind)
     .bind(&metrics.final_status)

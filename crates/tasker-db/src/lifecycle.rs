@@ -76,10 +76,11 @@ pub(crate) async fn expire_stale_agent_runs(
         sqlx::query(
             r#"
             INSERT INTO agent_run_metrics (
-                agent_run_id, duration_ms, launcher_kind, final_status, warnings_json
+                agent_run_id, derivation_version, duration_ms, launcher_kind, final_status, warnings_json
             )
             SELECT
                 id,
+                ?,
                 CAST((julianday(finished_at) - julianday(created_at)) * 86400000 AS INTEGER),
                 launcher_kind,
                 outcome,
@@ -87,6 +88,7 @@ pub(crate) async fn expire_stale_agent_runs(
             FROM agent_runs
             WHERE id = ?
             ON CONFLICT(agent_run_id) DO UPDATE SET
+                derivation_version = excluded.derivation_version,
                 duration_ms = excluded.duration_ms,
                 launcher_kind = excluded.launcher_kind,
                 final_status = excluded.final_status,
@@ -94,6 +96,7 @@ pub(crate) async fn expire_stale_agent_runs(
                 updated_at = CURRENT_TIMESTAMP
             "#,
         )
+        .bind(crate::CURRENT_AGENT_RUN_METRICS_DERIVATION_VERSION)
         .bind(&run.id)
         .execute(&mut **tx)
         .await

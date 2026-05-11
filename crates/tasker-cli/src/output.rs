@@ -965,6 +965,7 @@ mod tests {
         let mut detail = sample_run_detail(None, None);
         detail.metrics = Some(tasker_db::AgentRunMetrics {
             agent_run_id: "run-1".to_string(),
+            derivation_version: tasker_db::CURRENT_AGENT_RUN_METRICS_DERIVATION_VERSION,
             duration_ms: Some(7_200_000),
             launcher_kind: "pi".to_string(),
             final_status: Some("completed".to_string()),

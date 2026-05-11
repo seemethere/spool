@@ -19,6 +19,8 @@ pub struct BackfillSummary {
     pub written_runs: usize,
     pub missing_metric_rows: usize,
     pub changed_metric_rows: usize,
+    pub stale_derivation_rows: usize,
+    pub current_derivation_version: i64,
     pub exact_token_metric_runs: usize,
     pub proxy_only_metric_runs: usize,
     pub unknown_metric_runs: usize,
@@ -35,6 +37,9 @@ pub struct BackfillRunSummary {
     pub outcome: Option<String>,
     pub existing_metrics: bool,
     pub changed: bool,
+    pub stale_derivation: bool,
+    pub derivation_version: Option<i64>,
+    pub current_derivation_version: i64,
     pub token_metric_kind: String,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
@@ -475,6 +480,8 @@ pub async fn backfill_agent_run_metrics(
         written_runs: 0,
         missing_metric_rows: 0,
         changed_metric_rows: 0,
+        stale_derivation_rows: 0,
+        current_derivation_version: tasker_db::CURRENT_AGENT_RUN_METRICS_DERIVATION_VERSION,
         exact_token_metric_runs: 0,
         proxy_only_metric_runs: 0,
         unknown_metric_runs: 0,
@@ -495,6 +502,10 @@ pub async fn backfill_agent_run_metrics(
         };
         let existing = tasker_db::get_agent_run_metrics(pool, &row.agent_run_id).await?;
         let missing = existing.is_none();
+        let stale_derivation = existing
+            .as_ref()
+            .map(|existing| existing.derivation_version != computed.derivation_version)
+            .unwrap_or(false);
         let changed = existing
             .as_ref()
             .map(|existing| metrics_changed(existing, &computed))
@@ -503,6 +514,9 @@ pub async fn backfill_agent_run_metrics(
             summary.missing_metric_rows += 1;
         } else if changed {
             summary.changed_metric_rows += 1;
+        }
+        if stale_derivation {
+            summary.stale_derivation_rows += 1;
         }
         if changed {
             summary.would_write_runs += 1;
@@ -540,6 +554,9 @@ pub async fn backfill_agent_run_metrics(
             outcome: row.outcome,
             existing_metrics: !missing,
             changed,
+            stale_derivation,
+            derivation_version: existing.as_ref().map(|metrics| metrics.derivation_version),
+            current_derivation_version: computed.derivation_version,
             token_metric_kind: token_metric_kind.to_string(),
             input_tokens: computed.input_tokens,
             output_tokens: computed.output_tokens,
@@ -581,7 +598,8 @@ fn metrics_changed(
     existing: &tasker_db::AgentRunMetrics,
     computed: &tasker_db::ComputedAgentRunMetrics,
 ) -> bool {
-    existing.duration_ms != computed.duration_ms
+    existing.derivation_version != computed.derivation_version
+        || existing.duration_ms != computed.duration_ms
         || existing.launcher_kind != computed.launcher_kind
         || existing.final_status != computed.final_status
         || existing.exit_code != computed.exit_code
@@ -620,13 +638,15 @@ pub fn render_backfill_summary(summary: &BackfillSummary) -> String {
     }
     writeln!(
         output,
-        "runs: considered={} eligible_finished={} would_write={} written={} missing_rows={} changed_rows={}",
+        "runs: considered={} eligible_finished={} would_write={} written={} missing_rows={} changed_rows={} stale_derivation_rows={} current_derivation_version={}",
         summary.total_runs_considered,
         summary.eligible_finished_runs,
         summary.would_write_runs,
         summary.written_runs,
         summary.missing_metric_rows,
-        summary.changed_metric_rows
+        summary.changed_metric_rows,
+        summary.stale_derivation_rows,
+        summary.current_derivation_version
     )
     .expect("write string");
     writeln!(
@@ -654,11 +674,14 @@ pub fn render_backfill_summary(summary: &BackfillSummary) -> String {
         if run.changed || run.token_metric_kind != "unknown" || !run.warnings.is_empty() {
             writeln!(
                 output,
-                "  {} {} kind={} changed={} tokens input/output/total {}/{}/{} cache read/write {}/{} max_context={} warnings={}",
+                "  {} {} kind={} changed={} stale_derivation={} derivation_version={}/{} tokens input/output/total {}/{}/{} cache read/write {}/{} max_context={} warnings={}",
                 run.task_identifier,
                 run.agent_run_id,
                 run.token_metric_kind,
                 run.changed,
+                run.stale_derivation,
+                run.derivation_version.map(|value| value.to_string()).unwrap_or_else(|| "missing".to_string()),
+                run.current_derivation_version,
                 display_opt(run.input_tokens),
                 display_opt(run.output_tokens),
                 display_opt(run.total_tokens),
@@ -3840,8 +3863,8 @@ mod tests {
         .await;
         sqlx::query(
             r#"
-            INSERT INTO agent_run_metrics (agent_run_id, launcher_kind, final_status, input_tokens, efficiency_hints_json, warnings_json)
-            VALUES ('exact-run', 'pi', 'completed', 1, '[]', '[]')
+            INSERT INTO agent_run_metrics (agent_run_id, derivation_version, launcher_kind, final_status, input_tokens, efficiency_hints_json, warnings_json)
+            VALUES ('exact-run', 0, 'pi', 'completed', 1, '[]', '[]')
             "#,
         )
         .execute(&pool)
@@ -3862,6 +3885,11 @@ mod tests {
         assert_eq!(dry.would_write_runs, 3);
         assert_eq!(dry.written_runs, 0);
         assert_eq!(dry.missing_metric_rows, 2);
+        assert_eq!(dry.stale_derivation_rows, 1);
+        assert_eq!(
+            dry.current_derivation_version,
+            tasker_db::CURRENT_AGENT_RUN_METRICS_DERIVATION_VERSION
+        );
         assert_eq!(dry.exact_token_metric_runs, 1);
         assert_eq!(dry.proxy_only_metric_runs, 2);
         assert_eq!(dry.missing_transcript_runs, 1);
@@ -3877,6 +3905,8 @@ mod tests {
         let rendered = render_backfill_summary(&dry);
         assert!(rendered.contains("dry-run only; rerun with --write"));
         assert!(rendered.contains("token metric coverage: exact=1 proxy_only=2 unknown=0"));
+        assert!(rendered.contains("stale_derivation_rows=1"));
+        assert!(rendered.contains("derivation_version=0/1"));
 
         let written = backfill_agent_run_metrics(
             &pool,
@@ -3892,6 +3922,10 @@ mod tests {
             .await
             .expect("metrics")
             .expect("updated row");
+        assert_eq!(
+            exact.derivation_version,
+            tasker_db::CURRENT_AGENT_RUN_METRICS_DERIVATION_VERSION
+        );
         assert_eq!(exact.input_tokens, Some(45));
         assert_eq!(exact.output_tokens, Some(15));
         assert_eq!(exact.total_tokens, Some(60));
@@ -3902,6 +3936,25 @@ mod tests {
             .await
             .expect("metrics")
             .is_some());
+
+        sqlx::query(
+            "UPDATE agent_run_metrics SET derivation_version = 0 WHERE agent_run_id = 'exact-run'",
+        )
+        .execute(&pool)
+        .await
+        .expect("downgrade derivation version");
+        let stale_only = backfill_agent_run_metrics(
+            &pool,
+            &BackfillOptions {
+                queue: Some("TASK".to_string()),
+                write: false,
+            },
+        )
+        .await
+        .expect("stale dry run");
+        assert_eq!(stale_only.missing_metric_rows, 0);
+        assert_eq!(stale_only.stale_derivation_rows, 1);
+        assert_eq!(stale_only.would_write_runs, 1);
     }
 
     #[tokio::test]
