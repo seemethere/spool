@@ -60,6 +60,7 @@ pub struct QueueSnapshot {
     pub retry_holds: Vec<tasker_db::ActiveRetryHoldStatus>,
     pub ready_tasks: Vec<tasker_db::TaskStatusSummary>,
     pub rework_tasks: Vec<tasker_db::TaskStatusSummary>,
+    pub human_review_tasks: Vec<tasker_db::TaskStatusSummary>,
     pub integrating_tasks: Vec<tasker_db::TaskStatusSummary>,
     pub advisory_conflict_hints: Vec<tasker_db::TaskConflictGroup>,
     pub integration_retries: Vec<tasker_db::IntegrationRetryStatus>,
@@ -286,10 +287,17 @@ fn render_work_board(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapsh
     let mut next_lines = Vec::new();
     for queue in &snapshot.queues {
         for task in queue.ready_tasks.iter().take(NEXT_TASK_LIMIT) {
+            let blocked_by = task
+                .blocking_task_identifiers
+                .as_deref()
+                .filter(|_| task.unresolved_blocking_task_count > 0)
+                .map(|blocking| format!("  blocked_by={blocking}"))
+                .unwrap_or_default();
             next_lines.push(Line::from(format!(
-                "› {}  {}",
+                "› {}  {}{}",
                 compact_task_label(&task.identifier, &task.title, 34),
-                task.priority
+                task.priority,
+                blocked_by
             )));
         }
         if queue.ready_tasks.len() > NEXT_TASK_LIMIT {
@@ -480,6 +488,13 @@ fn attention_lines(snapshot: &MonitorSnapshot) -> Vec<Line<'static>> {
                 ),
             ));
         }
+        for task in &queue.human_review_tasks {
+            lines.push(attention_line(
+                "☞",
+                "human review",
+                human_review_attention_detail(queue, task, 44),
+            ));
+        }
         for hold in &queue.retry_holds {
             lines.push(attention_line(
                 "⏸",
@@ -576,6 +591,12 @@ fn attention_texts(snapshot: &MonitorSnapshot) -> Vec<String> {
                     .unwrap_or("unknown_legacy")
             ));
         }
+        for task in &queue.human_review_tasks {
+            lines.push(format!(
+                "human review: {}",
+                human_review_attention_detail(queue, task, 64)
+            ));
+        }
         for hold in &queue.retry_holds {
             lines.push(format!(
                 "retry hold: {} until {} — {}",
@@ -626,6 +647,50 @@ fn attention_texts(snapshot: &MonitorSnapshot) -> Vec<String> {
         }
     }
     lines
+}
+
+fn human_review_attention_detail(
+    queue: &QueueSnapshot,
+    task: &tasker_db::TaskStatusSummary,
+    width: usize,
+) -> String {
+    let mut detail = format!(
+        "{} waiting for Review Decision",
+        compact_task_label(&task.identifier, &task.title, width)
+    );
+    let blocked_ready = ready_tasks_blocked_by(queue, &task.identifier, width);
+    if !blocked_ready.is_empty() {
+        detail.push_str("; blocks Ready Tasks: ");
+        detail.push_str(&blocked_ready.join(", "));
+    }
+    detail
+}
+
+fn ready_tasks_blocked_by(
+    queue: &QueueSnapshot,
+    blocking_identifier: &str,
+    width: usize,
+) -> Vec<String> {
+    queue
+        .ready_tasks
+        .iter()
+        .filter(|task| task.unresolved_blocking_task_count > 0)
+        .filter(|task| {
+            task.blocking_task_identifiers
+                .as_deref()
+                .is_some_and(|blocking_tasks| {
+                    blocking_tasks.split(',').any(|entry| {
+                        let identifier = entry
+                            .trim()
+                            .split_once(':')
+                            .map(|(identifier, _)| identifier.trim())
+                            .unwrap_or_else(|| entry.trim());
+                        identifier == blocking_identifier
+                    })
+                })
+        })
+        .map(|task| compact_task_label(&task.identifier, &task.title, width))
+        .collect()
 }
 
 fn local_worktree_status(
@@ -792,8 +857,11 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
     let mut rows = tasker_db::status_by_queue_and_state(pool).await?;
     let mut active_runs = tasker_db::active_agent_runs_for_status(pool).await?;
     let mut retry_holds = tasker_db::active_retry_holds_for_status(pool).await?;
-    let mut status_tasks =
-        tasker_db::tasks_for_status_by_states(pool, &["ready", "rework", "integrating"]).await?;
+    let mut status_tasks = tasker_db::tasks_for_status_by_states(
+        pool,
+        &["ready", "human_review", "rework", "integrating"],
+    )
+    .await?;
     let mut conflict_groups = tasker_db::task_conflict_groups_for_status(pool).await?;
     let recent_runs = recent_agent_runs(pool, options.queue.as_deref()).await?;
     let mut integration_retries = tasker_db::integration_retries_for_status(pool).await?;
@@ -826,6 +894,7 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
                 retry_holds: Vec::new(),
                 ready_tasks: Vec::new(),
                 rework_tasks: Vec::new(),
+                human_review_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
                 advisory_conflict_hints: Vec::new(),
                 integration_retries: Vec::new(),
@@ -849,6 +918,7 @@ pub async fn load_snapshot(pool: &SqlitePool, options: &MonitorOptions) -> Resul
         if let Some(queue) = by_queue.get_mut(&task.queue_key) {
             match task.state.as_str() {
                 "ready" => queue.ready_tasks.push(task),
+                "human_review" => queue.human_review_tasks.push(task),
                 "rework" => queue.rework_tasks.push(task),
                 "integrating" => queue.integrating_tasks.push(task),
                 _ => {}
@@ -1016,6 +1086,22 @@ pub fn write_snapshot(mut writer: impl Write, snapshot: &MonitorSnapshot) -> io:
         }
     }
     if rework_count == 0 {
+        writeln!(writer, "  (none)")?;
+    }
+
+    writeln!(writer, "\nHuman Review:")?;
+    let mut human_review_count = 0;
+    for queue in &snapshot.queues {
+        for task in &queue.human_review_tasks {
+            human_review_count += 1;
+            writeln!(
+                writer,
+                "  ☞ {}",
+                human_review_attention_detail(queue, task, 64)
+            )?;
+        }
+    }
+    if human_review_count == 0 {
         writeln!(writer, "  (none)")?;
     }
 
@@ -1470,6 +1556,7 @@ mod tests {
                     blocking_task_identifiers: None,
                 }],
                 rework_tasks: Vec::new(),
+                human_review_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
                 advisory_conflict_hints: Vec::new(),
                 integration_retries: Vec::new(),
@@ -1559,6 +1646,7 @@ mod tests {
                 retry_holds: Vec::new(),
                 ready_tasks: Vec::new(),
                 rework_tasks: Vec::new(),
+                human_review_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
                 advisory_conflict_hints: Vec::new(),
                 integration_retries: Vec::new(),
@@ -1617,6 +1705,7 @@ mod tests {
                 }],
                 ready_tasks,
                 rework_tasks: Vec::new(),
+                human_review_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
                 advisory_conflict_hints: vec![tasker_db::TaskConflictGroup {
                     queue_key: "TASK".to_string(),
@@ -1636,7 +1725,8 @@ mod tests {
 
         assert!(text.find("Needs Attention:").unwrap() < text.find("Running:").unwrap());
         assert!(text.find("Running:").unwrap() < text.find("Rework:").unwrap());
-        assert!(text.find("Rework:").unwrap() < text.find("Next:").unwrap());
+        assert!(text.find("Rework:").unwrap() < text.find("Human Review:").unwrap());
+        assert!(text.find("Human Review:").unwrap() < text.find("Next:").unwrap());
         assert!(text.find("Next:").unwrap() < text.find("Advisory Task Conflict Hints:").unwrap());
         assert!(
             text.find("Advisory Task Conflict Hints:").unwrap()
@@ -1647,6 +1737,54 @@ mod tests {
         assert!(text.contains("Advisory Task Conflict Hints:"));
         assert!(text.contains("crates/tasker-cli\t2 Task(s): TASK-1 (ready), TASK-2 (in_progress)"));
         assert!(!text.contains("Ready task with a deliberately long title number 6\t"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_plain_output_include_human_review_blocking_ready_tasks() {
+        let pool = temp_pool().await;
+        let review_identifier = seed_queue_and_task(&pool).await;
+        sqlx::query(
+            "UPDATE tasks SET state = 'human_review', title = 'Review API boundary' WHERE identifier = ?",
+        )
+        .bind(&review_identifier)
+        .execute(&pool)
+        .await
+        .expect("mark human review");
+        let blocked = tasker_db::CreateTask {
+            queue_key: "TASK".to_string(),
+            title: "Continue runner extraction".to_string(),
+            brief: "brief".to_string(),
+            priority: "normal".to_string(),
+            state: "ready".to_string(),
+            review_required: false,
+            acceptance_criteria: vec!["criterion".to_string()],
+            validation_items: vec!["validation".to_string()],
+            tags: Vec::new(),
+            conflict_hints: Vec::new(),
+            blocking_task_identifiers: vec![review_identifier.clone()],
+        };
+        let blocked =
+            tasker_db::create_task(&pool, &blocked, &tasker_db::Actor::operator("tester"))
+                .await
+                .expect("create blocked ready task");
+
+        let snapshot = load_snapshot(&pool, &options()).await.expect("snapshot");
+        let queue = &snapshot.queues[0];
+        assert_eq!(queue.human_review_tasks.len(), 1);
+        assert_eq!(queue.ready_tasks.len(), 1);
+
+        let attention = attention_texts(&snapshot).join("\n");
+        assert!(attention.contains("human review:"));
+        assert!(attention.contains("Review API boundary"));
+        assert!(attention.contains("blocks Ready Tasks"));
+        assert!(attention.contains(&blocked.task.identifier));
+
+        let mut out = Vec::new();
+        write_snapshot(&mut out, &snapshot).expect("write");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("Human Review:"));
+        assert!(text.contains("waiting for Review Decision"));
+        assert!(text.contains(&format!("blocked_by={review_identifier}:human_review")));
     }
 
     #[test]
@@ -1682,6 +1820,7 @@ mod tests {
                 }],
                 ready_tasks: Vec::new(),
                 rework_tasks: Vec::new(),
+                human_review_tasks: Vec::new(),
                 integrating_tasks: vec![tasker_db::TaskStatusSummary {
                     queue_key: "TASK".to_string(),
                     identifier: "TASK-3".to_string(),
@@ -1763,6 +1902,7 @@ mod tests {
                 retry_holds: Vec::new(),
                 ready_tasks: Vec::new(),
                 rework_tasks: Vec::new(),
+                human_review_tasks: Vec::new(),
                 integrating_tasks: Vec::new(),
                 advisory_conflict_hints: Vec::new(),
                 integration_retries: Vec::new(),
@@ -1835,6 +1975,7 @@ mod tests {
             retry_holds: Vec::new(),
             ready_tasks: Vec::new(),
             rework_tasks: Vec::new(),
+            human_review_tasks: Vec::new(),
             integrating_tasks: Vec::new(),
             advisory_conflict_hints: Vec::new(),
             integration_retries: Vec::new(),
@@ -1904,6 +2045,33 @@ mod tests {
         assert!(rendered.contains("Advisory Task Conflict Hints"));
         assert!(rendered.contains("crates/tasker-cli"));
         assert!(!rendered.contains("hotspot"));
+    }
+
+    #[test]
+    fn ratatui_attention_shows_human_review_and_blocked_ready_task() {
+        let mut queue = empty_queue();
+        queue.human_review_tasks = vec![task_summary(
+            "TASK-11",
+            "Review public runner API",
+            "human_review",
+        )];
+        let mut ready = task_summary("TASK-12", "Continue extraction", "ready");
+        ready.unresolved_blocking_task_count = 1;
+        ready.blocking_task_identifiers = Some("TASK-11:human_review".to_string());
+        queue.ready_tasks = vec![ready];
+        let snapshot = snapshot_with_queue(queue);
+        let backend = ratatui::backend::TestBackend::new(140, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| render_snapshot(frame, &snapshot))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("human review"));
+        assert!(rendered.contains("Review public runner API"));
+        assert!(rendered.contains("blocks Ready Tasks"));
+        assert!(rendered.contains("blocked_by=TASK-11:human_review"));
     }
 
     #[test]
