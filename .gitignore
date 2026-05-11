@@ -1,6 +1,8 @@
 .ref
 /target/
-/.tasker/
+/.tasker/*
+!/.tasker/bootstrap-tasks/
+!/.tasker/bootstrap-tasks/TEMPLATE.md
 
 # extension deps
 /extensions/*/node_modules/

@@ -183,6 +183,23 @@ mod tests {
     }
 
     #[test]
+    fn canonical_bootstrap_template_parses() {
+        let parsed = parse_bootstrap_task(
+            "TASK",
+            ".tasker/bootstrap-tasks/TEMPLATE.md",
+            include_str!("../../../.tasker/bootstrap-tasks/TEMPLATE.md"),
+        )
+        .expect("canonical template parses");
+
+        assert_eq!(parsed.queue_key, "TASK");
+        assert_eq!(parsed.priority, "normal");
+        assert_eq!(parsed.state, "ready");
+        assert!(!parsed.acceptance_criteria.is_empty());
+        assert!(!parsed.validation_items.is_empty());
+        assert!(parsed.brief.contains("# Task Brief"));
+    }
+
+    #[test]
     fn parser_reports_invalid_priority_with_allowed_values_and_hint() {
         let error = parse_bootstrap_task(
             "TASK",

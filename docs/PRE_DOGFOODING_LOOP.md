@@ -27,6 +27,7 @@ For each **Implementation Slice**:
 - An **Approved Slice Sequence** may contain multiple low-risk slices that the agent implements and commits one-by-one without pausing after each slice.
 - Each slice should advance exactly one current roadmap milestone.
 - Each slice proposal should include intent, likely files touched, and proposed **Slice Acceptance Checks**.
+- For **Bootstrap Task Creation**, start from the canonical template at `.tasker/bootstrap-tasks/TEMPLATE.md` so front matter uses valid values for `priority`, `state`, **Acceptance Criteria**, **Validation Items**, tags, review requirement, blockers, and advisory `conflict_hints`.
 - During dogfooding, Delegating Agents should put likely file paths or documentation areas in structured bootstrap `conflict_hints` (aliases: `anticipated_touched_files`, `touched_files`) when creating parallel-ready Tasks. Recommended hotspot names include `crates/tasker-db`, `crates/tasker-cli`, `worker-loop`, `local-worktree-delivery`, `tasker-pi-extension`, `telemetry`, `monitor`, `docs`, and `migrations`; prefer concrete repository paths when known. Operators should inspect `tasker status`, `tasker monitor --plain`, or `tasker task show <task_identifier>` for advisory overlap before starting parallel batches. These hints are a coordination aid only; they do not block claims and are not a full dependency planner.
 - Prefer small, reviewable changes over whole-milestone batches.
 - Avoid using Tasker **Task** language for pre-dogfooding planning units; use **Implementation Slice** instead.
