@@ -354,6 +354,18 @@ enum WorkpadCommand {
 
 #[derive(Debug, Subcommand)]
 enum TelemetryCommand {
+    /// Refresh normalized Agent Run metrics from local Run Transcripts and Launcher Session Data.
+    BackfillMetrics {
+        /// Optional Task Queue Key to restrict the backfill.
+        #[arg(long)]
+        queue: Option<String>,
+        /// Persist refreshed metrics. Without this flag the command only reports planned changes.
+        #[arg(long)]
+        write: bool,
+        /// Emit machine-readable backfill telemetry JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Summarize Agent Run waste and latency for a Task Queue.
     Summary {
         /// Task Queue Key to summarize.
@@ -877,7 +889,8 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
         Some(Command::Telemetry { command }) => match command {
             TelemetryCommand::Summary { queue, .. }
             | TelemetryCommand::Correlation { queue, .. } => Some(queue.clone()),
-            TelemetryCommand::Lifecycle { queue, .. } => queue.clone(),
+            TelemetryCommand::Lifecycle { queue, .. }
+            | TelemetryCommand::BackfillMetrics { queue, .. } => queue.clone(),
         },
         Some(Command::Monitor { queue: None, .. } | Command::Cleanup { .. }) => None,
         Some(Command::Merge { command }) => match command {
@@ -1312,6 +1325,19 @@ async fn telemetry(
 ) -> Result<()> {
     let pool = open_pool(paths, db_path_overridden).await?;
     match command {
+        TelemetryCommand::BackfillMetrics { queue, write, json } => {
+            let summary = telemetry::backfill_agent_run_metrics(
+                &pool,
+                &telemetry::BackfillOptions { queue, write },
+            )
+            .await?;
+            if json {
+                serde_json::to_writer_pretty(std::io::stdout(), &summary)?;
+                println!();
+            } else {
+                print!("{}", telemetry::render_backfill_summary(&summary));
+            }
+        }
         TelemetryCommand::Summary {
             queue,
             slow_limit,

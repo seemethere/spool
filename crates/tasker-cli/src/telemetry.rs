@@ -4,6 +4,56 @@ use sqlx::{FromRow, SqlitePool};
 use std::{collections::BTreeMap, fmt::Write};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackfillOptions {
+    pub queue: Option<String>,
+    pub write: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BackfillSummary {
+    pub queue: Option<String>,
+    pub mode: String,
+    pub total_runs_considered: usize,
+    pub eligible_finished_runs: usize,
+    pub would_write_runs: usize,
+    pub written_runs: usize,
+    pub missing_metric_rows: usize,
+    pub changed_metric_rows: usize,
+    pub exact_token_metric_runs: usize,
+    pub proxy_only_metric_runs: usize,
+    pub unknown_metric_runs: usize,
+    pub missing_transcript_runs: usize,
+    pub malformed_artifact_runs: usize,
+    pub warning_runs: usize,
+    pub runs: Vec<BackfillRunSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BackfillRunSummary {
+    pub task_identifier: String,
+    pub agent_run_id: String,
+    pub outcome: Option<String>,
+    pub existing_metrics: bool,
+    pub changed: bool,
+    pub token_metric_kind: String,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub max_context_tokens: Option<i64>,
+    pub transcript_jsonl_event_count: Option<i64>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct BackfillRunRow {
+    task_identifier: String,
+    agent_run_id: String,
+    outcome: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetryOptions {
     pub queue: String,
     pub slow_limit: usize,
@@ -107,6 +157,252 @@ struct TelemetryRunRow {
     cache_write_tokens: Option<i64>,
     max_context_tokens: Option<i64>,
     efficiency_hints_json: Option<String>,
+}
+
+pub async fn backfill_agent_run_metrics(
+    pool: &SqlitePool,
+    options: &BackfillOptions,
+) -> Result<BackfillSummary> {
+    let rows = if let Some(queue) = &options.queue {
+        sqlx::query_as::<_, BackfillRunRow>(
+            r#"
+            SELECT tasks.identifier AS task_identifier, agent_runs.id AS agent_run_id, agent_runs.outcome AS outcome
+            FROM agent_runs
+            JOIN tasks ON tasks.id = agent_runs.task_id
+            JOIN task_queues ON task_queues.id = agent_runs.task_queue_id
+            WHERE task_queues.key = ?
+            ORDER BY tasks.sequence, agent_runs.created_at, agent_runs.id
+            "#,
+        )
+        .bind(queue)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("failed to load Agent Runs for Task Queue {queue}"))?
+    } else {
+        sqlx::query_as::<_, BackfillRunRow>(
+            r#"
+            SELECT tasks.identifier AS task_identifier, agent_runs.id AS agent_run_id, agent_runs.outcome AS outcome
+            FROM agent_runs
+            JOIN tasks ON tasks.id = agent_runs.task_id
+            ORDER BY tasks.identifier, agent_runs.created_at, agent_runs.id
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .context("failed to load Agent Runs")?
+    };
+
+    let mut summary = BackfillSummary {
+        queue: options.queue.clone(),
+        mode: if options.write { "write" } else { "dry-run" }.to_string(),
+        total_runs_considered: rows.len(),
+        eligible_finished_runs: 0,
+        would_write_runs: 0,
+        written_runs: 0,
+        missing_metric_rows: 0,
+        changed_metric_rows: 0,
+        exact_token_metric_runs: 0,
+        proxy_only_metric_runs: 0,
+        unknown_metric_runs: 0,
+        missing_transcript_runs: 0,
+        malformed_artifact_runs: 0,
+        warning_runs: 0,
+        runs: Vec::new(),
+    };
+
+    for row in rows {
+        if row.outcome.is_none() {
+            continue;
+        }
+        summary.eligible_finished_runs += 1;
+        let Some(computed) = tasker_db::compute_agent_run_metrics(pool, &row.agent_run_id).await?
+        else {
+            continue;
+        };
+        let existing = tasker_db::get_agent_run_metrics(pool, &row.agent_run_id).await?;
+        let missing = existing.is_none();
+        let changed = existing
+            .as_ref()
+            .map(|existing| metrics_changed(existing, &computed))
+            .unwrap_or(true);
+        if missing {
+            summary.missing_metric_rows += 1;
+        } else if changed {
+            summary.changed_metric_rows += 1;
+        }
+        if changed {
+            summary.would_write_runs += 1;
+            if options.write {
+                tasker_db::refresh_agent_run_metrics(pool, &row.agent_run_id).await?;
+                summary.written_runs += 1;
+            }
+        }
+
+        let warnings: Vec<String> = serde_json::from_str(&computed.warnings_json)
+            .unwrap_or_else(|_| vec!["could not parse normalized warning list".to_string()]);
+        let missing_transcript = warnings.iter().any(|warning| {
+            warning.contains("could not stat Run Transcript")
+                || warning.contains("could not read Run Transcript")
+        });
+        let malformed_artifact = warnings.iter().any(|warning| warning.contains("malformed"));
+        if missing_transcript {
+            summary.missing_transcript_runs += 1;
+        }
+        if malformed_artifact {
+            summary.malformed_artifact_runs += 1;
+        }
+        if !warnings.is_empty() {
+            summary.warning_runs += 1;
+        }
+        let token_metric_kind = token_metric_kind(&computed);
+        match token_metric_kind {
+            "exact" => summary.exact_token_metric_runs += 1,
+            "proxy_only" => summary.proxy_only_metric_runs += 1,
+            _ => summary.unknown_metric_runs += 1,
+        }
+        summary.runs.push(BackfillRunSummary {
+            task_identifier: row.task_identifier,
+            agent_run_id: row.agent_run_id,
+            outcome: row.outcome,
+            existing_metrics: !missing,
+            changed,
+            token_metric_kind: token_metric_kind.to_string(),
+            input_tokens: computed.input_tokens,
+            output_tokens: computed.output_tokens,
+            total_tokens: computed.total_tokens,
+            cache_read_tokens: computed.cache_read_tokens,
+            cache_write_tokens: computed.cache_write_tokens,
+            max_context_tokens: computed.max_context_tokens,
+            transcript_jsonl_event_count: computed.transcript_jsonl_event_count,
+            warnings,
+        });
+    }
+
+    Ok(summary)
+}
+
+fn token_metric_kind(metrics: &tasker_db::ComputedAgentRunMetrics) -> &'static str {
+    if metrics.input_tokens.is_some()
+        || metrics.output_tokens.is_some()
+        || metrics.total_tokens.is_some()
+        || metrics.cache_read_tokens.is_some()
+        || metrics.cache_write_tokens.is_some()
+        || metrics.max_context_tokens.is_some()
+    {
+        "exact"
+    } else if metrics.transcript_jsonl_event_count.is_some()
+        || metrics.transcript_byte_size.is_some()
+        || metrics.tool_call_count.is_some()
+        || metrics.assistant_turn_count.is_some()
+        || metrics.user_turn_count.is_some()
+        || metrics.duration_ms.is_some()
+    {
+        "proxy_only"
+    } else {
+        "unknown"
+    }
+}
+
+fn metrics_changed(
+    existing: &tasker_db::AgentRunMetrics,
+    computed: &tasker_db::ComputedAgentRunMetrics,
+) -> bool {
+    existing.duration_ms != computed.duration_ms
+        || existing.launcher_kind != computed.launcher_kind
+        || existing.final_status != computed.final_status
+        || existing.exit_code != computed.exit_code
+        || existing.timed_out != computed.timed_out
+        || existing.unattended_question_detected != computed.unattended_question_detected
+        || existing.blocking_ui_detected != computed.blocking_ui_detected
+        || existing.transcript_path != computed.transcript_path
+        || existing.transcript_byte_size != computed.transcript_byte_size
+        || existing.transcript_jsonl_event_count != computed.transcript_jsonl_event_count
+        || existing.input_tokens != computed.input_tokens
+        || existing.output_tokens != computed.output_tokens
+        || existing.total_tokens != computed.total_tokens
+        || existing.cache_read_tokens != computed.cache_read_tokens
+        || existing.cache_write_tokens != computed.cache_write_tokens
+        || existing.tool_call_count != computed.tool_call_count
+        || existing.tool_error_count != computed.tool_error_count
+        || existing.repeated_failed_tool_attempt_count
+            != computed.repeated_failed_tool_attempt_count
+        || existing.tool_call_counts_json != computed.tool_call_counts_json
+        || existing.repeated_read_count != computed.repeated_read_count
+        || existing.repeated_tasker_context_fetch_count
+            != computed.repeated_tasker_context_fetch_count
+        || existing.shell_command_counts_json != computed.shell_command_counts_json
+        || existing.assistant_turn_count != computed.assistant_turn_count
+        || existing.user_turn_count != computed.user_turn_count
+        || existing.max_context_tokens != computed.max_context_tokens
+        || existing.efficiency_hints_json != computed.efficiency_hints_json
+        || existing.warnings_json != computed.warnings_json
+}
+
+pub fn render_backfill_summary(summary: &BackfillSummary) -> String {
+    let mut output = String::new();
+    writeln!(output, "Agent Run metrics backfill ({})", summary.mode).expect("write string");
+    if let Some(queue) = &summary.queue {
+        writeln!(output, "Task Queue: {queue}").expect("write string");
+    }
+    writeln!(
+        output,
+        "runs: considered={} eligible_finished={} would_write={} written={} missing_rows={} changed_rows={}",
+        summary.total_runs_considered,
+        summary.eligible_finished_runs,
+        summary.would_write_runs,
+        summary.written_runs,
+        summary.missing_metric_rows,
+        summary.changed_metric_rows
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "token metric coverage: exact={} proxy_only={} unknown={}",
+        summary.exact_token_metric_runs,
+        summary.proxy_only_metric_runs,
+        summary.unknown_metric_runs
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "artifacts: missing_transcripts={} malformed_artifacts={} warning_runs={}",
+        summary.missing_transcript_runs, summary.malformed_artifact_runs, summary.warning_runs
+    )
+    .expect("write string");
+    if summary.mode == "dry-run" {
+        writeln!(
+            output,
+            "dry-run only; rerun with --write to persist refreshed metrics"
+        )
+        .expect("write string");
+    }
+    for run in &summary.runs {
+        if run.changed || run.token_metric_kind != "unknown" || !run.warnings.is_empty() {
+            writeln!(
+                output,
+                "  {} {} kind={} changed={} tokens input/output/total {}/{}/{} cache read/write {}/{} max_context={} warnings={}",
+                run.task_identifier,
+                run.agent_run_id,
+                run.token_metric_kind,
+                run.changed,
+                display_opt(run.input_tokens),
+                display_opt(run.output_tokens),
+                display_opt(run.total_tokens),
+                display_opt(run.cache_read_tokens),
+                display_opt(run.cache_write_tokens),
+                display_opt(run.max_context_tokens),
+                run.warnings.len()
+            )
+            .expect("write string");
+        }
+    }
+    output
+}
+
+fn display_opt(value: Option<i64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 pub async fn summarize_agent_runs(
@@ -1389,6 +1685,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn telemetry_backfill_dry_run_reports_without_writing_and_write_refreshes_metrics() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pool = memory_pool().await;
+        seed_queue_and_task(&pool, "TASK", "Backfill metrics")
+            .await
+            .expect("seed");
+        let (task_id, queue_id) = ids(&pool, "TASK-1").await;
+        insert_run(
+            &pool,
+            &task_id,
+            &queue_id,
+            "exact-run",
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:01:00",
+            Some("completed"),
+            None,
+        )
+        .await;
+        insert_run(
+            &pool,
+            &task_id,
+            &queue_id,
+            "proxy-run",
+            "2026-01-01 00:02:00",
+            "2026-01-01 00:03:00",
+            Some("completed"),
+            None,
+        )
+        .await;
+        insert_run(
+            &pool,
+            &task_id,
+            &queue_id,
+            "missing-run",
+            "2026-01-01 00:04:00",
+            "2026-01-01 00:05:00",
+            Some("completed"),
+            None,
+        )
+        .await;
+        let exact_path = temp.path().join("exact.jsonl");
+        std::fs::write(
+            &exact_path,
+            r#"{"stdout":"{\"role\":\"assistant\",\"content\":\"done\",\"usage\":{\"input\":45,\"output\":15,\"totalTokens\":60,\"cacheRead\":1000,\"cacheWrite\":50}}\n{bad json\n"}
+"#,
+        )
+        .expect("exact transcript");
+        let proxy_path = temp.path().join("proxy.jsonl");
+        std::fs::write(
+            &proxy_path,
+            r#"{"stdout":"{\"role\":\"assistant\",\"content\":\"done\"}\n{\"type\":\"tool_call\",\"tool_name\":\"read\"}\n"}
+"#,
+        )
+        .expect("proxy transcript");
+        insert_session(&pool, "exact-run", &exact_path, None).await;
+        insert_session(&pool, "proxy-run", &proxy_path, None).await;
+        insert_session(
+            &pool,
+            "missing-run",
+            &temp.path().join("missing.jsonl"),
+            None,
+        )
+        .await;
+        sqlx::query(
+            r#"
+            INSERT INTO agent_run_metrics (agent_run_id, launcher_kind, final_status, input_tokens, efficiency_hints_json, warnings_json)
+            VALUES ('exact-run', 'pi', 'completed', 1, '[]', '[]')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("old metrics");
+
+        let dry = backfill_agent_run_metrics(
+            &pool,
+            &BackfillOptions {
+                queue: Some("TASK".to_string()),
+                write: false,
+            },
+        )
+        .await
+        .expect("dry run");
+        assert_eq!(dry.mode, "dry-run");
+        assert_eq!(dry.eligible_finished_runs, 3);
+        assert_eq!(dry.would_write_runs, 3);
+        assert_eq!(dry.written_runs, 0);
+        assert_eq!(dry.missing_metric_rows, 2);
+        assert_eq!(dry.exact_token_metric_runs, 1);
+        assert_eq!(dry.proxy_only_metric_runs, 2);
+        assert_eq!(dry.missing_transcript_runs, 1);
+        assert_eq!(dry.malformed_artifact_runs, 1);
+        assert_eq!(
+            tasker_db::get_agent_run_metrics(&pool, "exact-run")
+                .await
+                .expect("metrics")
+                .expect("old row")
+                .input_tokens,
+            Some(1)
+        );
+        let rendered = render_backfill_summary(&dry);
+        assert!(rendered.contains("dry-run only; rerun with --write"));
+        assert!(rendered.contains("token metric coverage: exact=1 proxy_only=2 unknown=0"));
+
+        let written = backfill_agent_run_metrics(
+            &pool,
+            &BackfillOptions {
+                queue: Some("TASK".to_string()),
+                write: true,
+            },
+        )
+        .await
+        .expect("write run");
+        assert_eq!(written.written_runs, 3);
+        let exact = tasker_db::get_agent_run_metrics(&pool, "exact-run")
+            .await
+            .expect("metrics")
+            .expect("updated row");
+        assert_eq!(exact.input_tokens, Some(45));
+        assert_eq!(exact.output_tokens, Some(15));
+        assert_eq!(exact.total_tokens, Some(60));
+        assert_eq!(exact.cache_read_tokens, Some(1000));
+        assert_eq!(exact.cache_write_tokens, Some(50));
+        assert_eq!(exact.max_context_tokens, Some(60));
+        assert!(tasker_db::get_agent_run_metrics(&pool, "proxy-run")
+            .await
+            .expect("metrics")
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn telemetry_correlation_groups_before_and_after_landing_points() {
         let pool = memory_pool().await;
         sqlx::query(
@@ -1702,6 +2128,27 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert run");
+    }
+
+    async fn insert_session(
+        pool: &SqlitePool,
+        run_id: &str,
+        transcript_path: &std::path::Path,
+        raw_json: Option<&str>,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO launcher_session_data (
+                agent_run_id, launcher_kind, final_status, transcript_path, raw_json
+            ) VALUES (?, 'pi', 'completed', ?, ?)
+            "#,
+        )
+        .bind(run_id)
+        .bind(transcript_path.display().to_string())
+        .bind(raw_json)
+        .execute(pool)
+        .await
+        .expect("insert launcher session");
     }
 
     async fn insert_integrating_event(pool: &SqlitePool, task_id: &str, created_at: &str) {

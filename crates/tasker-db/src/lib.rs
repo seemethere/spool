@@ -874,6 +874,38 @@ pub struct AgentRunMetrics {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ComputedAgentRunMetrics {
+    pub agent_run_id: String,
+    pub duration_ms: Option<i64>,
+    pub launcher_kind: String,
+    pub final_status: Option<String>,
+    pub exit_code: Option<i64>,
+    pub timed_out: Option<i64>,
+    pub unattended_question_detected: Option<i64>,
+    pub blocking_ui_detected: Option<i64>,
+    pub transcript_path: Option<String>,
+    pub transcript_byte_size: Option<i64>,
+    pub transcript_jsonl_event_count: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub tool_call_count: Option<i64>,
+    pub tool_error_count: Option<i64>,
+    pub repeated_failed_tool_attempt_count: Option<i64>,
+    pub tool_call_counts_json: String,
+    pub repeated_read_count: Option<i64>,
+    pub repeated_tasker_context_fetch_count: Option<i64>,
+    pub shell_command_counts_json: String,
+    pub assistant_turn_count: Option<i64>,
+    pub user_turn_count: Option<i64>,
+    pub max_context_tokens: Option<i64>,
+    pub efficiency_hints_json: String,
+    pub warnings_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpsertLauncherSessionData {
     pub launcher_kind: String,
     pub session_id: Option<String>,
@@ -3080,10 +3112,10 @@ pub async fn get_agent_run_metrics(
     .with_context(|| format!("failed to load Agent Run metrics for Agent Run {agent_run_id}"))
 }
 
-pub async fn refresh_agent_run_metrics(
+pub async fn compute_agent_run_metrics(
     pool: &SqlitePool,
     agent_run_id: &str,
-) -> Result<Option<AgentRunMetrics>> {
+) -> Result<Option<ComputedAgentRunMetrics>> {
     let Some(run) = get_agent_run(pool, agent_run_id).await? else {
         anyhow::bail!("Agent Run {agent_run_id} not found");
     };
@@ -3109,6 +3141,60 @@ pub async fn refresh_agent_run_metrics(
     }
     let warnings_json = serde_json::to_string(&summary.warnings)
         .context("failed to serialize Agent Run metrics warnings")?;
+    let duration_ms: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT CAST((julianday(finished_at) - julianday(created_at)) * 86400000 AS INTEGER)
+        FROM agent_runs
+        WHERE id = ? AND finished_at IS NOT NULL
+        "#,
+    )
+    .bind(agent_run_id)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| format!("failed to compute Agent Run duration for Agent Run {agent_run_id}"))?
+    .flatten();
+    let tool_call_counts_json = summary.tool_call_counts_json()?;
+    let shell_command_counts_json = summary.shell_command_counts_json()?;
+    let efficiency_hints_json = summary.efficiency_hints_json()?;
+    Ok(Some(ComputedAgentRunMetrics {
+        agent_run_id: agent_run_id.to_string(),
+        duration_ms,
+        launcher_kind: summary.launcher_kind,
+        final_status: summary.final_status,
+        exit_code: summary.exit_code,
+        timed_out: summary.timed_out.map(bool_to_i64),
+        unattended_question_detected: summary.unattended_question_detected.map(bool_to_i64),
+        blocking_ui_detected: summary.blocking_ui_detected.map(bool_to_i64),
+        transcript_path: summary.transcript_path,
+        transcript_byte_size: summary.transcript_byte_size,
+        transcript_jsonl_event_count: summary.transcript_jsonl_event_count,
+        input_tokens: summary.input_tokens,
+        output_tokens: summary.output_tokens,
+        total_tokens: summary.total_tokens,
+        cache_read_tokens: summary.cache_read_tokens,
+        cache_write_tokens: summary.cache_write_tokens,
+        tool_call_count: summary.tool_call_count,
+        tool_error_count: summary.tool_error_count,
+        repeated_failed_tool_attempt_count: summary.repeated_failed_tool_attempt_count,
+        tool_call_counts_json,
+        repeated_read_count: summary.repeated_read_count,
+        repeated_tasker_context_fetch_count: summary.repeated_tasker_context_fetch_count,
+        shell_command_counts_json,
+        assistant_turn_count: summary.assistant_turn_count,
+        user_turn_count: summary.user_turn_count,
+        max_context_tokens: summary.max_context_tokens,
+        efficiency_hints_json,
+        warnings_json,
+    }))
+}
+
+pub async fn refresh_agent_run_metrics(
+    pool: &SqlitePool,
+    agent_run_id: &str,
+) -> Result<Option<AgentRunMetrics>> {
+    let Some(metrics) = compute_agent_run_metrics(pool, agent_run_id).await? else {
+        return Ok(None);
+    };
     sqlx::query(
         r#"
         INSERT INTO agent_run_metrics (
@@ -3122,8 +3208,7 @@ pub async fn refresh_agent_run_metrics(
         )
         SELECT
             agent_runs.id,
-            CAST((julianday(agent_runs.finished_at) - julianday(agent_runs.created_at)) * 86400000 AS INTEGER),
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         FROM agent_runs
         WHERE agent_runs.id = ? AND agent_runs.outcome IS NOT NULL
         ON CONFLICT(agent_run_id) DO UPDATE SET
@@ -3157,32 +3242,33 @@ pub async fn refresh_agent_run_metrics(
             updated_at = CURRENT_TIMESTAMP
         "#,
     )
-    .bind(&summary.launcher_kind)
-    .bind(&summary.final_status)
-    .bind(summary.exit_code)
-    .bind(summary.timed_out.map(bool_to_i64))
-    .bind(summary.unattended_question_detected.map(bool_to_i64))
-    .bind(summary.blocking_ui_detected.map(bool_to_i64))
-    .bind(&summary.transcript_path)
-    .bind(summary.transcript_byte_size)
-    .bind(summary.transcript_jsonl_event_count)
-    .bind(summary.input_tokens)
-    .bind(summary.output_tokens)
-    .bind(summary.total_tokens)
-    .bind(summary.cache_read_tokens)
-    .bind(summary.cache_write_tokens)
-    .bind(summary.tool_call_count)
-    .bind(summary.tool_error_count)
-    .bind(summary.repeated_failed_tool_attempt_count)
-    .bind(summary.tool_call_counts_json()?)
-    .bind(summary.repeated_read_count)
-    .bind(summary.repeated_tasker_context_fetch_count)
-    .bind(summary.shell_command_counts_json()?)
-    .bind(summary.assistant_turn_count)
-    .bind(summary.user_turn_count)
-    .bind(summary.max_context_tokens)
-    .bind(summary.efficiency_hints_json()?)
-    .bind(warnings_json)
+    .bind(metrics.duration_ms)
+    .bind(&metrics.launcher_kind)
+    .bind(&metrics.final_status)
+    .bind(metrics.exit_code)
+    .bind(metrics.timed_out)
+    .bind(metrics.unattended_question_detected)
+    .bind(metrics.blocking_ui_detected)
+    .bind(&metrics.transcript_path)
+    .bind(metrics.transcript_byte_size)
+    .bind(metrics.transcript_jsonl_event_count)
+    .bind(metrics.input_tokens)
+    .bind(metrics.output_tokens)
+    .bind(metrics.total_tokens)
+    .bind(metrics.cache_read_tokens)
+    .bind(metrics.cache_write_tokens)
+    .bind(metrics.tool_call_count)
+    .bind(metrics.tool_error_count)
+    .bind(metrics.repeated_failed_tool_attempt_count)
+    .bind(&metrics.tool_call_counts_json)
+    .bind(metrics.repeated_read_count)
+    .bind(metrics.repeated_tasker_context_fetch_count)
+    .bind(&metrics.shell_command_counts_json)
+    .bind(metrics.assistant_turn_count)
+    .bind(metrics.user_turn_count)
+    .bind(metrics.max_context_tokens)
+    .bind(&metrics.efficiency_hints_json)
+    .bind(&metrics.warnings_json)
     .bind(agent_run_id)
     .execute(pool)
     .await
