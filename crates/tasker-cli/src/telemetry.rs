@@ -4215,7 +4215,10 @@ mod tests {
         assert!(rendered.contains("dry-run only; rerun with --write"));
         assert!(rendered.contains("token metric coverage: exact=1 proxy_only=2 unknown=0"));
         assert!(rendered.contains("stale_derivation_rows=1"));
-        assert!(rendered.contains("derivation_version=0/1"));
+        assert!(rendered.contains(&format!(
+            "derivation_version=0/{}",
+            tasker_db::CURRENT_AGENT_RUN_METRICS_DERIVATION_VERSION
+        )));
 
         let written = backfill_agent_run_metrics(
             &pool,

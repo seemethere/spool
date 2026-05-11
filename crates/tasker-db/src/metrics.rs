@@ -11,7 +11,7 @@ use std::{fs, future::Future, path::Path, time::Duration};
 use tokio::time::sleep;
 use uuid::Uuid;
 
-pub const CURRENT_AGENT_RUN_METRICS_DERIVATION_VERSION: i64 = 1;
+pub const CURRENT_AGENT_RUN_METRICS_DERIVATION_VERSION: i64 = 2;
 
 pub async fn get_agent_run(pool: &SqlitePool, run_id: &str) -> Result<Option<AgentRun>> {
     let select_run_sql = agent_run_select_sql("WHERE id = ?");
@@ -881,11 +881,14 @@ fn shell_command_category(command: &str) -> &'static str {
         ],
     ) {
         "file_inspection"
+    } else if is_test_runner_invocation(&tokens) {
+        "test_runner"
     } else if has_shell_invocation(
         &tokens,
         &[
-            "npm", "pnpm", "yarn", "bun", "make", "just", "cmake", "ninja", "node", "tsc", "vite",
-            "webpack",
+            "npm", "pnpm", "yarn", "bun", "pip", "pip3", "pipx", "uv", "poetry", "make", "just",
+            "cmake", "ninja", "node", "tsc", "vite", "webpack", "mvn", "gradle", "gem", "bundle",
+            "composer",
         ],
     ) {
         "package_manager"
@@ -903,9 +906,44 @@ fn shell_command_category(command: &str) -> &'static str {
         ],
     ) {
         "text_processing"
+    } else if has_shell_invocation(
+        &tokens,
+        &[
+            "python", "python3", "py", "ruby", "perl", "bash", "sh", "zsh", "fish", "deno", "lua",
+            "php",
+        ],
+    ) {
+        "scripting"
     } else {
         "miscellaneous"
     }
+}
+
+fn is_test_runner_invocation(tokens: &[String]) -> bool {
+    has_shell_invocation(
+        tokens,
+        &[
+            "pytest", "tox", "nox", "unittest", "jest", "vitest", "mocha", "ctest", "bats", "prove",
+        ],
+    ) || token_followed_by(tokens, "python", "-m", &["pytest", "unittest"])
+        || token_followed_by(tokens, "python3", "-m", &["pytest", "unittest"])
+        || token_followed_by(tokens, "py", "-m", &["pytest", "unittest"])
+        || token_followed_by(tokens, "go", "test", &[])
+        || token_followed_by(tokens, "mvn", "test", &[])
+        || token_followed_by(tokens, "gradle", "test", &[])
+}
+
+fn token_followed_by(tokens: &[String], first: &str, second: &str, third: &[&str]) -> bool {
+    tokens.windows(2).any(|window| {
+        window[0] == first
+            && window[1] == second
+            && (third.is_empty()
+                || tokens
+                    .iter()
+                    .skip_while(|token| token.as_str() != second)
+                    .skip(1)
+                    .any(|token| third.contains(&token.as_str())))
+    })
 }
 
 fn is_direct_tasker_invocation(command: &str) -> bool {
@@ -1102,12 +1140,21 @@ mod shell_command_category_tests {
             ("sed -n '1,20p' CONTEXT.md", "text_processing"),
             ("awk '{print $1}' counts.txt", "text_processing"),
             ("pnpm build", "package_manager"),
+            ("npm install", "package_manager"),
+            ("pip install -r requirements.txt", "package_manager"),
             ("make test", "package_manager"),
-            ("python scripts/one_off.py", "miscellaneous"),
+            ("pytest tests/test_metrics.py", "test_runner"),
+            ("python -m pytest", "test_runner"),
+            ("go test ./...", "test_runner"),
+            ("bash scripts/check.sh", "scripting"),
+            ("python scripts/one_off.py", "scripting"),
+            ("date", "miscellaneous"),
         ];
 
         for (command, expected) in cases {
-            assert_eq!(shell_command_category(command), expected, "{command}");
+            let actual = shell_command_category(command);
+            assert_eq!(actual, expected, "{command}");
+            assert_ne!(actual, command, "category must not expose raw command text");
         }
     }
 }
