@@ -53,6 +53,193 @@ struct BackfillRunRow {
     outcome: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EfficiencyBudgetLevel {
+    Warning,
+    Severe,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EfficiencyBudgetWarning {
+    pub metric: String,
+    pub level: EfficiencyBudgetLevel,
+    pub value: i64,
+    pub warning_threshold: i64,
+    pub severe_threshold: i64,
+    pub token_metric_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EfficiencyBudgetUnknown {
+    pub metric: String,
+    pub reason: String,
+    pub token_metric_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EfficiencyBudgetStatus {
+    pub warnings: Vec<EfficiencyBudgetWarning>,
+    pub unknowns: Vec<EfficiencyBudgetUnknown>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EfficiencyBudgetThreshold {
+    metric: &'static str,
+    warning: i64,
+    severe: i64,
+}
+
+const TOOL_CALL_BUDGET: EfficiencyBudgetThreshold = EfficiencyBudgetThreshold {
+    metric: "tool_calls",
+    warning: 150,
+    severe: 250,
+};
+const TOTAL_TOKEN_BUDGET: EfficiencyBudgetThreshold = EfficiencyBudgetThreshold {
+    metric: "total_tokens",
+    warning: 80_000,
+    severe: 100_000,
+};
+const MAX_CONTEXT_BUDGET: EfficiencyBudgetThreshold = EfficiencyBudgetThreshold {
+    metric: "max_context_tokens",
+    warning: 80_000,
+    severe: 100_000,
+};
+const TRANSCRIPT_BYTE_BUDGET: EfficiencyBudgetThreshold = EfficiencyBudgetThreshold {
+    metric: "transcript_bytes",
+    warning: 100 * 1024 * 1024,
+    severe: 200 * 1024 * 1024,
+};
+const REPEATED_READ_BUDGET: EfficiencyBudgetThreshold = EfficiencyBudgetThreshold {
+    metric: "repeated_reads",
+    warning: 1,
+    severe: 10,
+};
+const REPEATED_TASKER_CONTEXT_BUDGET: EfficiencyBudgetThreshold = EfficiencyBudgetThreshold {
+    metric: "repeated_tasker_context_fetches",
+    warning: 1,
+    severe: 5,
+};
+const RUN_DURATION_BUDGET: EfficiencyBudgetThreshold = EfficiencyBudgetThreshold {
+    metric: "duration_seconds",
+    warning: 60 * 60,
+    severe: 2 * 60 * 60,
+};
+
+#[derive(Debug, Clone, Copy)]
+pub struct EfficiencyBudgetInput {
+    pub tool_call_count: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub max_context_tokens: Option<i64>,
+    pub transcript_byte_size: Option<i64>,
+    pub repeated_read_count: Option<i64>,
+    pub repeated_tasker_context_fetch_count: Option<i64>,
+    pub duration_seconds: Option<i64>,
+    pub has_proxy_metrics: bool,
+}
+
+pub fn evaluate_efficiency_budget(input: EfficiencyBudgetInput) -> EfficiencyBudgetStatus {
+    let mut status = EfficiencyBudgetStatus {
+        warnings: Vec::new(),
+        unknowns: Vec::new(),
+    };
+    push_budget(
+        &mut status.warnings,
+        TOOL_CALL_BUDGET,
+        input.tool_call_count,
+        None,
+    );
+    let total_token_kind = metric_kind(input.total_tokens, input.has_proxy_metrics);
+    push_budget(
+        &mut status.warnings,
+        TOTAL_TOKEN_BUDGET,
+        input.total_tokens,
+        Some(total_token_kind),
+    );
+    if input.total_tokens.is_none() {
+        status.unknowns.push(EfficiencyBudgetUnknown {
+            metric: "total_tokens".to_string(),
+            reason: "token metric unavailable; not treated as zero".to_string(),
+            token_metric_kind: Some(total_token_kind.to_string()),
+        });
+    }
+    let context_token_kind = metric_kind(input.max_context_tokens, input.has_proxy_metrics);
+    push_budget(
+        &mut status.warnings,
+        MAX_CONTEXT_BUDGET,
+        input.max_context_tokens,
+        Some(context_token_kind),
+    );
+    if input.max_context_tokens.is_none() {
+        status.unknowns.push(EfficiencyBudgetUnknown {
+            metric: "max_context_tokens".to_string(),
+            reason: "context metric unavailable; not treated as zero".to_string(),
+            token_metric_kind: Some(context_token_kind.to_string()),
+        });
+    }
+    push_budget(
+        &mut status.warnings,
+        TRANSCRIPT_BYTE_BUDGET,
+        input.transcript_byte_size,
+        None,
+    );
+    push_budget(
+        &mut status.warnings,
+        REPEATED_READ_BUDGET,
+        input.repeated_read_count,
+        None,
+    );
+    push_budget(
+        &mut status.warnings,
+        REPEATED_TASKER_CONTEXT_BUDGET,
+        input.repeated_tasker_context_fetch_count,
+        None,
+    );
+    push_budget(
+        &mut status.warnings,
+        RUN_DURATION_BUDGET,
+        input.duration_seconds,
+        None,
+    );
+    status
+}
+
+fn metric_kind(value: Option<i64>, has_proxy_metrics: bool) -> &'static str {
+    if value.is_some() {
+        "exact"
+    } else if has_proxy_metrics {
+        "proxy_only"
+    } else {
+        "unknown"
+    }
+}
+
+fn push_budget(
+    warnings: &mut Vec<EfficiencyBudgetWarning>,
+    threshold: EfficiencyBudgetThreshold,
+    value: Option<i64>,
+    token_metric_kind: Option<&str>,
+) {
+    let Some(value) = value else { return };
+    let level = if value >= threshold.severe {
+        Some(EfficiencyBudgetLevel::Severe)
+    } else if value >= threshold.warning {
+        Some(EfficiencyBudgetLevel::Warning)
+    } else {
+        None
+    };
+    if let Some(level) = level {
+        warnings.push(EfficiencyBudgetWarning {
+            metric: threshold.metric.to_string(),
+            level,
+            value,
+            warning_threshold: threshold.warning,
+            severe_threshold: threshold.severe,
+            token_metric_kind: token_metric_kind.map(str::to_string),
+        });
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetryOptions {
     pub queue: String,
@@ -106,7 +293,9 @@ pub struct TelemetryRun {
     pub cache_read_tokens: Option<i64>,
     pub cache_write_tokens: Option<i64>,
     pub max_context_tokens: Option<i64>,
+    pub transcript_byte_size: Option<i64>,
     pub efficiency_hints_json: Option<String>,
+    pub budget_status: EfficiencyBudgetStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -157,6 +346,7 @@ struct TelemetryRunRow {
     cache_read_tokens: Option<i64>,
     cache_write_tokens: Option<i64>,
     max_context_tokens: Option<i64>,
+    transcript_byte_size: Option<i64>,
     efficiency_hints_json: Option<String>,
 }
 
@@ -452,6 +642,7 @@ pub async fn summarize_agent_runs(
             agent_run_metrics.cache_read_tokens AS cache_read_tokens,
             agent_run_metrics.cache_write_tokens AS cache_write_tokens,
             agent_run_metrics.max_context_tokens AS max_context_tokens,
+            agent_run_metrics.transcript_byte_size AS transcript_byte_size,
             agent_run_metrics.efficiency_hints_json AS efficiency_hints_json
         FROM agent_runs
         JOIN tasks ON tasks.id = agent_runs.task_id
@@ -622,8 +813,27 @@ fn run_from_row(row: &TelemetryRunRow) -> TelemetryRun {
         cache_read_tokens: row.cache_read_tokens,
         cache_write_tokens: row.cache_write_tokens,
         max_context_tokens: row.max_context_tokens,
+        transcript_byte_size: row.transcript_byte_size,
         efficiency_hints_json: row.efficiency_hints_json.clone(),
+        budget_status: budget_status_for_row(row),
     }
+}
+
+fn budget_status_for_row(row: &TelemetryRunRow) -> EfficiencyBudgetStatus {
+    evaluate_efficiency_budget(EfficiencyBudgetInput {
+        tool_call_count: row.tool_call_count,
+        total_tokens: row.total_tokens,
+        max_context_tokens: row.max_context_tokens,
+        transcript_byte_size: row.transcript_byte_size,
+        repeated_read_count: row.repeated_read_count,
+        repeated_tasker_context_fetch_count: row.repeated_tasker_context_fetch_count,
+        duration_seconds: row.duration_seconds,
+        has_proxy_metrics: row.tool_call_count.is_some()
+            || row.transcript_byte_size.is_some()
+            || row.duration_seconds.is_some()
+            || row.assistant_turn_count.is_some()
+            || row.user_turn_count.is_some(),
+    })
 }
 
 fn json_counts(json: Option<&str>) -> BTreeMap<String, i64> {
@@ -635,6 +845,37 @@ fn merge_counts(target: &mut BTreeMap<String, i64>, source: BTreeMap<String, i64
     for (key, count) in source {
         *target.entry(key).or_insert(0) += count;
     }
+}
+
+fn render_budget_warnings(status: &EfficiencyBudgetStatus) -> String {
+    if status.warnings.is_empty() {
+        return "none".to_string();
+    }
+    status
+        .warnings
+        .iter()
+        .map(|warning| {
+            let level = match warning.level {
+                EfficiencyBudgetLevel::Warning => "warning",
+                EfficiencyBudgetLevel::Severe => "severe",
+            };
+            let token = warning
+                .token_metric_kind
+                .as_deref()
+                .map(|kind| format!(" token_metric_kind={kind}"))
+                .unwrap_or_default();
+            format!(
+                "{}:{} value={} warn={} severe={}{}",
+                warning.metric,
+                level,
+                warning.value,
+                warning.warning_threshold,
+                warning.severe_threshold,
+                token
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn render_counts(counts: &BTreeMap<String, i64>) -> String {
@@ -729,7 +970,9 @@ fn build_efficiency_summary(rows: &[TelemetryRunRow]) -> EfficiencyTelemetrySumm
             .as_deref()
             .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
             .unwrap_or_default();
+        let budget_status = budget_status_for_row(row);
         if !hints.is_empty()
+            || !budget_status.warnings.is_empty()
             || row.tool_call_count.unwrap_or(0) >= 30
             || row.repeated_failed_tool_attempt_count.unwrap_or(0) > 0
             || row.repeated_read_count.unwrap_or(0) > 0
@@ -870,12 +1113,12 @@ pub fn render_summary(summary: &TelemetrySummary) -> String {
     )
     .expect("write string");
     if !summary.efficiency.inefficient_runs.is_empty() {
-        writeln!(output, "optimization hints:").expect("write string");
+        writeln!(output, "optimization hints and budget warnings:").expect("write string");
         for run in &summary.efficiency.inefficient_runs {
             let hints = run.efficiency_hints_json.as_deref().unwrap_or("[]");
             writeln!(
                 output,
-                "  {} - {}: {} tool_calls={} tool_errors={} repeated_reads={} repeated_tasker_context_fetches={} hints={}",
+                "  {} - {}: {} tool_calls={} tool_errors={} repeated_reads={} repeated_tasker_context_fetches={} hints={} budget_warnings={}",
                 run.task_identifier,
                 run.task_title,
                 run.agent_run_id,
@@ -883,7 +1126,8 @@ pub fn render_summary(summary: &TelemetrySummary) -> String {
                 run.tool_error_count.unwrap_or(0),
                 run.repeated_read_count.unwrap_or(0),
                 run.repeated_tasker_context_fetch_count.unwrap_or(0),
-                hints
+                hints,
+                render_budget_warnings(&run.budget_status)
             )
             .expect("write string");
         }
@@ -1705,12 +1949,32 @@ mod tests {
         );
         assert_eq!(summary.efficiency.max_context_tokens, Some(123456));
         assert_eq!(summary.efficiency.inefficient_runs[0].agent_run_id, "run-2");
+        assert!(summary.efficiency.inefficient_runs[0]
+            .budget_status
+            .warnings
+            .iter()
+            .any(|warning| warning.metric == "max_context_tokens"
+                && warning.level == EfficiencyBudgetLevel::Severe
+                && warning.token_metric_kind.as_deref() == Some("exact")));
+        assert!(summary.efficiency.inefficient_runs[0]
+            .budget_status
+            .unknowns
+            .iter()
+            .any(|unknown| unknown.metric == "total_tokens"
+                && unknown.token_metric_kind.as_deref() == Some("proxy_only")));
         let json = serde_json::to_value(&summary).expect("json");
         assert_eq!(json["efficiency"]["total_tool_calls"], 42);
         assert_eq!(json["efficiency"]["tool_call_counts"]["bash"], 25);
         assert_eq!(json["efficiency"]["total_repeated_reads"], 3);
         assert_eq!(json["efficiency"]["shell_command_counts"]["search"], 8);
         assert!(json.to_string().contains("excessive tool calls"));
+        assert_eq!(
+            json["efficiency"]["inefficient_runs"][0]["budget_status"]["warnings"][0]["level"],
+            "severe"
+        );
+        assert!(json
+            .to_string()
+            .contains("token metric unavailable; not treated as zero"));
         assert!(!json.to_string().contains("brief"));
         let rendered = render_summary(&summary);
         assert!(rendered.contains("TASK-1 - Repeated work"));
@@ -1718,7 +1982,66 @@ mod tests {
         assert!(rendered.contains("tool calls by tool: bash=25"));
         assert!(rendered.contains("shell command categories:"));
         assert!(rendered.contains("repeated_reads=3"));
-        assert!(rendered.contains("optimization hints:"));
+        assert!(rendered.contains("optimization hints and budget warnings:"));
+        assert!(rendered.contains("max_context_tokens:severe"));
+    }
+
+    #[test]
+    fn efficiency_budget_thresholds_warn_without_defaulting_missing_tokens_to_zero() {
+        let status = evaluate_efficiency_budget(EfficiencyBudgetInput {
+            tool_call_count: Some(151),
+            total_tokens: Some(100_000),
+            max_context_tokens: None,
+            transcript_byte_size: Some(200 * 1024 * 1024),
+            repeated_read_count: Some(10),
+            repeated_tasker_context_fetch_count: Some(5),
+            duration_seconds: Some(2 * 60 * 60),
+            has_proxy_metrics: true,
+        });
+
+        assert!(status
+            .warnings
+            .iter()
+            .any(|warning| warning.metric == "tool_calls"
+                && warning.level == EfficiencyBudgetLevel::Warning));
+        for metric in [
+            "total_tokens",
+            "transcript_bytes",
+            "repeated_reads",
+            "repeated_tasker_context_fetches",
+            "duration_seconds",
+        ] {
+            assert!(
+                status
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.metric == metric
+                        && warning.level == EfficiencyBudgetLevel::Severe),
+                "missing severe warning for {metric}"
+            );
+        }
+        assert!(status
+            .unknowns
+            .iter()
+            .any(|unknown| unknown.metric == "max_context_tokens"
+                && unknown.token_metric_kind.as_deref() == Some("proxy_only")));
+
+        let missing_tokens = evaluate_efficiency_budget(EfficiencyBudgetInput {
+            tool_call_count: None,
+            total_tokens: None,
+            max_context_tokens: None,
+            transcript_byte_size: None,
+            repeated_read_count: None,
+            repeated_tasker_context_fetch_count: None,
+            duration_seconds: None,
+            has_proxy_metrics: false,
+        });
+        assert!(missing_tokens.warnings.is_empty());
+        assert!(missing_tokens
+            .unknowns
+            .iter()
+            .any(|unknown| unknown.metric == "total_tokens"
+                && unknown.token_metric_kind.as_deref() == Some("unknown")));
     }
 
     #[tokio::test]

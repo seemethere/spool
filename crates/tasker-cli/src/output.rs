@@ -5,6 +5,10 @@ use std::{
     process::Command as ProcessCommand,
 };
 
+use crate::telemetry::{
+    evaluate_efficiency_budget, EfficiencyBudgetInput, EfficiencyBudgetLevel,
+    EfficiencyBudgetStatus,
+};
 use serde::Serialize;
 
 pub fn write_task_detail(mut writer: impl Write, detail: &tasker_db::TaskDetail) -> Result<()> {
@@ -403,6 +407,7 @@ struct RunTelemetry<'a> {
     finished_at: Option<&'a str>,
     launcher_session_data: Option<LauncherSessionTelemetry<'a>>,
     normalized_metrics: Option<&'a tasker_db::AgentRunMetrics>,
+    efficiency_budget: Option<EfficiencyBudgetStatus>,
 }
 
 fn run_telemetry(detail: &tasker_db::AgentRunDetail) -> RunTelemetry<'_> {
@@ -438,6 +443,7 @@ fn run_telemetry(detail: &tasker_db::AgentRunDetail) -> RunTelemetry<'_> {
         finished_at: detail.run.finished_at.as_deref(),
         launcher_session_data,
         normalized_metrics: detail.metrics.as_ref(),
+        efficiency_budget: detail.metrics.as_ref().map(budget_status_for_metrics),
     }
 }
 
@@ -579,6 +585,8 @@ pub fn write_run_detail(mut writer: impl Write, detail: &tasker_db::AgentRunDeta
                 metrics.max_context_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string())
             )?;
         }
+        let budget_status = budget_status_for_metrics(metrics);
+        write_budget_status(&mut writer, &budget_status)?;
         if metrics.tool_call_counts_json != "{}" {
             writeln!(
                 writer,
@@ -605,6 +613,67 @@ pub fn write_run_detail(mut writer: impl Write, detail: &tasker_db::AgentRunDeta
         }
     } else {
         writeln!(writer, "  (not recorded)")?;
+    }
+    Ok(())
+}
+
+fn budget_status_for_metrics(metrics: &tasker_db::AgentRunMetrics) -> EfficiencyBudgetStatus {
+    evaluate_efficiency_budget(EfficiencyBudgetInput {
+        tool_call_count: metrics.tool_call_count,
+        total_tokens: metrics.total_tokens,
+        max_context_tokens: metrics.max_context_tokens,
+        transcript_byte_size: metrics.transcript_byte_size,
+        repeated_read_count: metrics.repeated_read_count,
+        repeated_tasker_context_fetch_count: metrics.repeated_tasker_context_fetch_count,
+        duration_seconds: metrics.duration_ms.map(|ms| ms / 1000),
+        has_proxy_metrics: metrics.tool_call_count.is_some()
+            || metrics.transcript_byte_size.is_some()
+            || metrics.duration_ms.is_some()
+            || metrics.assistant_turn_count.is_some()
+            || metrics.user_turn_count.is_some(),
+    })
+}
+
+fn write_budget_status(mut writer: impl Write, status: &EfficiencyBudgetStatus) -> Result<()> {
+    if status.warnings.is_empty() && status.unknowns.is_empty() {
+        writeln!(writer, "  efficiency budget: ok")?;
+        return Ok(());
+    }
+    if status.warnings.is_empty() {
+        writeln!(writer, "  efficiency budget: no overruns")?;
+    } else {
+        for warning in &status.warnings {
+            let level = match warning.level {
+                EfficiencyBudgetLevel::Warning => "warning",
+                EfficiencyBudgetLevel::Severe => "severe",
+            };
+            let token_kind = warning
+                .token_metric_kind
+                .as_deref()
+                .map(|kind| format!(" token_metric_kind={kind}"))
+                .unwrap_or_default();
+            writeln!(
+                writer,
+                "  efficiency budget {level}: {}={} (warning {}, severe {}){}",
+                warning.metric,
+                warning.value,
+                warning.warning_threshold,
+                warning.severe_threshold,
+                token_kind
+            )?;
+        }
+    }
+    for unknown in &status.unknowns {
+        let token_kind = unknown
+            .token_metric_kind
+            .as_deref()
+            .map(|kind| format!(" token_metric_kind={kind}"))
+            .unwrap_or_default();
+        writeln!(
+            writer,
+            "  efficiency budget unknown: {} ({}){}",
+            unknown.metric, unknown.reason, token_kind
+        )?;
     }
     Ok(())
 }
@@ -794,6 +863,61 @@ mod tests {
         assert!(!text.contains("secret-token"));
         assert!(!text.contains("very secret stderr"));
         assert!(!text.contains("raw-secret"));
+    }
+
+    #[test]
+    fn run_detail_includes_concise_efficiency_budget_status() {
+        let mut detail = sample_run_detail(None, None);
+        detail.metrics = Some(tasker_db::AgentRunMetrics {
+            agent_run_id: "run-1".to_string(),
+            duration_ms: Some(7_200_000),
+            launcher_kind: "pi".to_string(),
+            final_status: Some("completed".to_string()),
+            exit_code: Some(0),
+            timed_out: Some(0),
+            unattended_question_detected: Some(0),
+            blocking_ui_detected: Some(0),
+            transcript_path: None,
+            transcript_byte_size: Some(100 * 1024 * 1024),
+            transcript_jsonl_event_count: Some(1),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            tool_call_count: Some(250),
+            tool_error_count: Some(0),
+            repeated_failed_tool_attempt_count: Some(0),
+            tool_call_counts_json: "{}".to_string(),
+            repeated_read_count: Some(1),
+            repeated_tasker_context_fetch_count: Some(0),
+            shell_command_counts_json: "{}".to_string(),
+            assistant_turn_count: Some(1),
+            user_turn_count: Some(1),
+            max_context_tokens: None,
+            efficiency_hints_json: "[]".to_string(),
+            warnings_json: "[]".to_string(),
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
+        });
+        let mut out = Vec::new();
+
+        write_run_detail(&mut out, &detail).expect("write run");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(text.contains("efficiency budget severe: tool_calls=250"));
+        assert!(text.contains("efficiency budget warning: transcript_bytes=104857600"));
+        assert!(text.contains("efficiency budget unknown: total_tokens"));
+        assert!(text.contains("token_metric_kind=proxy_only"));
+
+        let mut json_out = Vec::new();
+        write_run_detail_json(&mut json_out, &detail).expect("write json");
+        let json: serde_json::Value = serde_json::from_slice(&json_out).expect("run detail json");
+        assert_eq!(json["efficiency_budget"]["warnings"][0]["level"], "severe");
+        assert_eq!(
+            json["efficiency_budget"]["unknowns"][0]["token_metric_kind"],
+            "proxy_only"
+        );
     }
 
     #[test]

@@ -4101,14 +4101,18 @@ mod tests {
         let error = guard_supervisor_auto_migrate_source_from(&pool, &repo)
             .await
             .expect_err("Task Branch should be refused");
-        assert!(error.to_string().contains("requires Managed Source Repository Main Branch"));
+        assert!(error
+            .to_string()
+            .contains("requires Managed Source Repository Main Branch"));
 
         git(&repo, &["checkout", "main"]);
         fs::write(repo.join("dirty.txt"), "dirty\n").expect("dirty");
         let error = guard_supervisor_auto_migrate_source_from(&pool, &repo)
             .await
             .expect_err("dirty repo should be refused");
-        assert!(error.to_string().contains("dirty or has unresolved changes"));
+        assert!(error
+            .to_string()
+            .contains("dirty or has unresolved changes"));
         fs::remove_file(repo.join("dirty.txt")).expect("clean");
 
         guard_supervisor_auto_migrate_source_from(&pool, &repo)

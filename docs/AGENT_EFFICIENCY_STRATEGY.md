@@ -134,6 +134,12 @@ Metrics still unavailable or approximate:
 
 Near-term dogfooding can continue, but broadening dogfooding should use the first-class proxy metrics to identify repeated file reads, repeated Tasker context fetches, broad shell/CLI inspection, duplicate Agent Runs, and local-state setup failures. Exact token telemetry and safe per-tool summaries now make these hypotheses testable on new Agent Runs.
 
+## Dogfood efficiency budget defaults
+
+Tasker surfaces local dogfood efficiency budget warnings in `tasker telemetry summary` and `tasker run show` so regressions are visible without inspecting raw Run Transcripts. These thresholds are dogfooding tuning defaults, not permanent product policy: operators should adjust them as Tasker improves and new baselines emerge.
+
+Current defaults flag warning/severe overruns at 150/250 tool calls, 80k/100k total tokens, 80k/100k max context tokens, 100 MiB/200 MiB Run Transcript byte size, 1/10 repeated file reads, 1/5 repeated Tasker context fetches, and 1h/2h run duration. Missing token and context metrics are reported as unknown rather than passing or failing as zero, and token budget output labels exact token metrics separately from proxy-only runs.
+
 ## Guidance for near-term dogfooding
 
 - Prefer small implementation Tasks with explicit relevant ADRs, likely files, and validation commands.
