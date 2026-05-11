@@ -112,6 +112,10 @@ _Avoid_: Pi-only metrics schema, automatic upload
 A measurement derived from **Audit Events**, **Agent Runs**, and **Integration Outcomes** to evaluate local workflow speed and reliability.
 _Avoid_: Separate metrics source of truth
 
+**Integration Outcome Reason Code**:
+A constrained structured code stored on an **Integration Outcome** to group Local Worktree Delivery success, no-change, work-change failure, operational failure, cleanup failure, and legacy unknown cases for local operator diagnosis. See `docs/integration-outcome-reason-codes.md`.
+_Avoid_: Parsing free-form Integration Outcome messages as the primary classifier
+
 **Interactive Agent Session**:
 A pi-backed session where a human is intentionally present, such as a **Delegation Session** or **Review Session**.
 _Avoid_: Unattended worker prompt

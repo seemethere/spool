@@ -1272,6 +1272,31 @@ fn retryable_operational_failure_message(reason: &str, retry: &IntegrationRetryP
     .to_string()
 }
 
+fn integration_reason_code(kind: &str, message: Option<&str>) -> &'static str {
+    let message = message.unwrap_or_default();
+    if message.contains("Local Worktree has uncommitted changes") {
+        "uncommitted_local_worktree"
+    } else if message.contains("stale Validated Base Commit") {
+        "stale_validated_base_commit"
+    } else if message.contains("does not include current Main Branch") {
+        "task_branch_missing_main"
+    } else if message.contains("Managed Source Repository has uncommitted changes") {
+        "dirty_managed_source_repository"
+    } else if message.contains("Git lock exists") {
+        "repo_operation_lock_held"
+    } else if message.contains("Squash Merge failed") {
+        "merge_conflict"
+    } else if kind == "success" {
+        "success"
+    } else if kind == "no_changes" {
+        "no_changes"
+    } else if kind == "work_change_failure" {
+        "unknown_work_change_failure"
+    } else {
+        "unknown_operational_failure"
+    }
+}
+
 impl<'a> LocalWorktreeIntegrationAdapter<'a> {
     async fn integrate(&mut self) -> Result<LocalIntegrationResult> {
         if let Err(error) = self.validate_operational_safety() {
@@ -1279,6 +1304,7 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
             let message = retryable_operational_failure_message(&error.to_string(), &retry);
             self.record_outcome(
                 "operational_failure",
+                integration_reason_code("operational_failure", Some(&error.to_string())),
                 None,
                 None,
                 Some(message),
@@ -1303,6 +1329,7 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
         if let Err(error) = self.validate_work_change_safety() {
             self.record_outcome(
                 "work_change_failure",
+                integration_reason_code("work_change_failure", Some(&error.to_string())),
                 None,
                 None,
                 Some(error.to_string()),
@@ -1336,22 +1363,29 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
         )?
         .success()
         {
+            let cleanup = self.cleanup_after_success();
+            let cleanup_message = cleanup
+                .as_ref()
+                .err()
+                .map(|error| format!("cleanup needs operator repair: {error:#}"));
             self.record_outcome(
                 "no_changes",
+                cleanup_message
+                    .as_ref()
+                    .map_or("no_changes", |_| "cleanup_failure"),
                 None,
                 Some(pre_merge_head.clone()),
-                None,
+                cleanup_message.clone(),
                 IntegrationOutcomeRetryFields::default(),
             )
             .await?;
             self.transition("done").await?;
-            let cleanup = self.cleanup_after_success();
             let mut summary = format!(
                 "No-Change Integration recorded for Task {}; moved to Done",
                 self.task.task.identifier
             );
-            if let Err(error) = cleanup {
-                summary.push_str(&format!("; cleanup needs operator repair: {error:#}"));
+            if let Some(message) = cleanup_message {
+                summary.push_str(&format!("; {message}"));
             }
             return Ok(LocalIntegrationResult { summary });
         }
@@ -1364,6 +1398,7 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
             let _ = self.rollback_to(&pre_merge_head);
             self.record_outcome(
                 "work_change_failure",
+                "merge_conflict",
                 None,
                 Some(pre_merge_head.clone()),
                 Some(format!("Squash Merge failed: {error:#}")),
@@ -1384,6 +1419,7 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
             let _ = self.rollback_to(&pre_merge_head);
             self.record_outcome(
                 "work_change_failure",
+                "unknown_work_change_failure",
                 None,
                 Some(pre_merge_head.clone()),
                 Some(format!("Final Commit failed: {error:#}")),
@@ -1402,11 +1438,19 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
         let final_commit = git_output(self.repo, &["rev-parse", "HEAD"], "read Final Commit")?
             .trim()
             .to_string();
+        let cleanup = self.cleanup_after_success();
+        let cleanup_message = cleanup
+            .as_ref()
+            .err()
+            .map(|error| format!("cleanup needs operator repair: {error:#}"));
         self.record_outcome(
             "success",
+            cleanup_message
+                .as_ref()
+                .map_or("success", |_| "cleanup_failure"),
             Some(final_commit.clone()),
             Some(pre_merge_head),
-            None,
+            cleanup_message.clone(),
             IntegrationOutcomeRetryFields::default(),
         )
         .await
@@ -1420,13 +1464,12 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
                 "Final Commit {final_commit} was created but Tasker could not move the Task to Done; operator repair required"
             )
         })?;
-        let cleanup = self.cleanup_after_success();
         let mut summary = format!(
             "Integrated Task {} as Final Commit {}; moved to Done",
             self.task.task.identifier, final_commit
         );
-        if let Err(error) = cleanup {
-            summary.push_str(&format!("; cleanup needs operator repair: {error:#}"));
+        if let Some(message) = cleanup_message {
+            summary.push_str(&format!("; {message}"));
         }
         Ok(LocalIntegrationResult { summary })
     }
@@ -1513,15 +1556,23 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
         .success()
             && self.task.task.validated_base_commit.as_deref() != Some(current_main.as_str())
         {
+            if self.task.task.validated_base_commit.is_some() {
+                anyhow::bail!(
+                    "Task Branch {} does not include current Main Branch {} and has stale Validated Base Commit {} (current Main Branch is {})",
+                    self.task_branch,
+                    self.queue.main_branch,
+                    self.task
+                        .task
+                        .validated_base_commit
+                        .as_deref()
+                        .unwrap_or("not recorded"),
+                    current_main
+                );
+            }
             anyhow::bail!(
-                "Task Branch {} does not include current Main Branch {} and Validated Base Commit {} is stale or missing (current Main Branch is {})",
+                "Task Branch {} does not include current Main Branch {} and Validated Base Commit is missing (current Main Branch is {})",
                 self.task_branch,
                 self.queue.main_branch,
-                self.task
-                    .task
-                    .validated_base_commit
-                    .as_deref()
-                    .unwrap_or("not recorded"),
                 current_main
             );
         }
@@ -1531,6 +1582,7 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
     async fn record_outcome(
         &self,
         kind: &str,
+        reason_code: &str,
         final_commit: Option<String>,
         pre_merge_head: Option<String>,
         message: Option<String>,
@@ -1542,6 +1594,7 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
                 task_identifier: self.task.task.identifier.clone(),
                 agent_run_id: self.agent_run_id.map(ToString::to_string),
                 outcome_kind: kind.to_string(),
+                reason_code: reason_code.to_string(),
                 final_commit,
                 pre_merge_head,
                 message,

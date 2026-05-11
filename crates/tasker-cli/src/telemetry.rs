@@ -66,6 +66,7 @@ pub struct TelemetrySummary {
     pub duplicate_tasks: Vec<DuplicateTaskRun>,
     pub post_integrating_runs: Vec<TelemetryRun>,
     pub failed_or_timed_out_runs: Vec<TelemetryRun>,
+    pub integration_outcome_reason_counts: BTreeMap<String, i64>,
     pub completed_duration_seconds: Vec<i64>,
     pub slowest_completed_runs: Vec<TelemetryRun>,
     pub efficiency: EfficiencyTelemetrySummary,
@@ -555,6 +556,7 @@ pub async fn summarize_agent_runs(
         .collect();
 
     let efficiency = build_efficiency_summary(&rows);
+    let integration_outcome_reason_counts = integration_reason_counts(pool, &options.queue).await?;
 
     Ok(TelemetrySummary {
         queue: options.queue.clone(),
@@ -562,10 +564,36 @@ pub async fn summarize_agent_runs(
         duplicate_tasks,
         post_integrating_runs,
         failed_or_timed_out_runs,
+        integration_outcome_reason_counts,
         completed_duration_seconds,
         slowest_completed_runs,
         efficiency,
     })
+}
+
+async fn integration_reason_counts(
+    pool: &SqlitePool,
+    queue: &str,
+) -> Result<BTreeMap<String, i64>> {
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        r#"
+        SELECT COALESCE(integration_outcomes.reason_code, 'unknown_legacy') AS reason_code,
+               COUNT(*) AS count
+        FROM integration_outcomes
+        JOIN tasks ON tasks.id = integration_outcomes.task_id
+        JOIN task_queues ON task_queues.id = tasks.task_queue_id
+        WHERE task_queues.key = ?
+        GROUP BY COALESCE(integration_outcomes.reason_code, 'unknown_legacy')
+        ORDER BY count DESC, reason_code
+        "#,
+    )
+    .bind(queue)
+    .fetch_all(pool)
+    .await
+    .with_context(|| {
+        format!("failed to load Integration Outcome reason counts for Task Queue {queue}")
+    })?;
+    Ok(rows.into_iter().collect())
 }
 
 fn run_from_row(row: &TelemetryRunRow) -> TelemetryRun {
@@ -781,6 +809,15 @@ pub fn render_summary(summary: &TelemetrySummary) -> String {
             run.failure_reason.as_deref().unwrap_or("none")
         )
         .expect("write string");
+    }
+
+    writeln!(output, "Integration Outcome reason codes:").expect("write string");
+    if summary.integration_outcome_reason_counts.is_empty() {
+        writeln!(output, "  none").expect("write string");
+    } else {
+        for (reason_code, count) in &summary.integration_outcome_reason_counts {
+            writeln!(output, "  {reason_code}: {count}").expect("write string");
+        }
     }
 
     if summary.completed_duration_seconds.is_empty() {

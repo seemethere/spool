@@ -1173,6 +1173,7 @@ mod tests {
                 task_identifier: "TASK-1".to_string(),
                 agent_run_id: Some(run_id.to_string()),
                 outcome_kind: "operational_failure".to_string(),
+                reason_code: "unknown_operational_failure".to_string(),
                 final_commit: None,
                 pre_merge_head: Some("abc123".to_string()),
                 message: Some("conflict while merging".to_string()),

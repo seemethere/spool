@@ -723,6 +723,7 @@ pub struct TaskContextIntegrationOutcome {
     pub id: String,
     pub agent_run_id: Option<String>,
     pub outcome_kind: String,
+    pub reason_code: Option<String>,
     pub final_commit: Option<String>,
     pub pre_merge_head: Option<String>,
     pub message: Option<String>,
@@ -961,6 +962,7 @@ pub struct IntegrationOutcome {
     pub task_id: String,
     pub agent_run_id: Option<String>,
     pub outcome_kind: String,
+    pub reason_code: Option<String>,
     pub final_commit: Option<String>,
     pub pre_merge_head: Option<String>,
     pub message: Option<String>,
@@ -975,6 +977,7 @@ pub struct RecordIntegrationOutcomeInput {
     pub task_identifier: String,
     pub agent_run_id: Option<String>,
     pub outcome_kind: String,
+    pub reason_code: String,
     pub final_commit: Option<String>,
     pub pre_merge_head: Option<String>,
     pub message: Option<String>,
@@ -988,6 +991,7 @@ pub struct IntegrationRetryStatus {
     pub queue_key: String,
     pub task_identifier: String,
     pub task_title: String,
+    pub reason_code: String,
     pub retryable: bool,
     pub retry_attempt: Option<i64>,
     pub next_retry_at: Option<String>,
@@ -1533,6 +1537,7 @@ pub async fn get_task_context_bundle(
             id,
             agent_run_id,
             outcome_kind,
+            reason_code,
             final_commit,
             pre_merge_head,
             message,
@@ -2207,6 +2212,7 @@ pub async fn integration_retries_for_status(
             task_queues.key AS queue_key,
             tasks.identifier AS task_identifier,
             tasks.title AS task_title,
+            COALESCE(latest.reason_code, 'unknown_legacy') AS reason_code,
             latest.retryable AS retryable,
             latest.retry_attempt AS retry_attempt,
             latest.next_retry_at AS next_retry_at,
@@ -2239,6 +2245,7 @@ pub async fn due_integration_retries(
             task_queues.key AS queue_key,
             tasks.identifier AS task_identifier,
             tasks.title AS task_title,
+            COALESCE(latest.reason_code, 'unknown_legacy') AS reason_code,
             latest.retryable AS retryable,
             latest.retry_attempt AS retry_attempt,
             latest.next_retry_at AS next_retry_at,
@@ -2887,6 +2894,24 @@ pub async fn retry_task(
         .with_context(|| format!("retried Task {identifier} was not found"))
 }
 
+pub fn is_valid_integration_outcome_reason_code(reason_code: &str) -> bool {
+    matches!(
+        reason_code,
+        "success"
+            | "no_changes"
+            | "uncommitted_local_worktree"
+            | "stale_validated_base_commit"
+            | "task_branch_missing_main"
+            | "dirty_managed_source_repository"
+            | "repo_operation_lock_held"
+            | "merge_conflict"
+            | "cleanup_failure"
+            | "unknown_operational_failure"
+            | "unknown_work_change_failure"
+            | "unknown_legacy"
+    )
+}
+
 pub async fn record_integration_outcome(
     pool: &SqlitePool,
     input: &RecordIntegrationOutcomeInput,
@@ -2919,6 +2944,9 @@ pub async fn record_integration_outcome(
         }
     }
 
+    if !is_valid_integration_outcome_reason_code(&input.reason_code) {
+        anyhow::bail!("invalid Integration Outcome reason code");
+    }
     if input.retryable && input.outcome_kind != "operational_failure" {
         anyhow::bail!("only operational Integration Outcomes may be marked retryable");
     }
@@ -2936,15 +2964,16 @@ pub async fn record_integration_outcome(
     sqlx::query(
         r#"
         INSERT INTO integration_outcomes (
-            id, task_id, agent_run_id, outcome_kind, final_commit, pre_merge_head, message,
+            id, task_id, agent_run_id, outcome_kind, reason_code, final_commit, pre_merge_head, message,
             retryable, retry_attempt, next_retry_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IS NULL THEN NULL ELSE datetime('now', '+' || ? || ' seconds') END)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IS NULL THEN NULL ELSE datetime('now', '+' || ? || ' seconds') END)
         "#,
     )
     .bind(&outcome_id)
     .bind(&task_id)
     .bind(&input.agent_run_id)
     .bind(&input.outcome_kind)
+    .bind(&input.reason_code)
     .bind(&input.final_commit)
     .bind(&input.pre_merge_head)
     .bind(&input.message)
@@ -2966,6 +2995,7 @@ pub async fn record_integration_outcome(
             "identifier": input.task_identifier,
             "agent_run_id": input.agent_run_id,
             "outcome_kind": input.outcome_kind,
+            "reason_code": input.reason_code,
             "final_commit": input.final_commit,
             "pre_merge_head": input.pre_merge_head,
             "message": input.message,
@@ -2980,7 +3010,7 @@ pub async fn record_integration_outcome(
 
     sqlx::query_as::<_, IntegrationOutcome>(
         r#"
-        SELECT id, task_id, agent_run_id, outcome_kind, final_commit, pre_merge_head, message,
+        SELECT id, task_id, agent_run_id, outcome_kind, reason_code, final_commit, pre_merge_head, message,
                retryable, retry_attempt, next_retry_at, created_at
         FROM integration_outcomes
         WHERE id = ?
@@ -6719,6 +6749,7 @@ mod tests {
                 task_identifier: "TASK-1".to_string(),
                 agent_run_id: None,
                 outcome_kind: "success".to_string(),
+                reason_code: "success".to_string(),
                 final_commit: Some("abc123".to_string()),
                 pre_merge_head: Some("def456".to_string()),
                 message: None,
@@ -6732,13 +6763,65 @@ mod tests {
         .expect("record outcome");
 
         assert_eq!(outcome.outcome_kind, "success");
+        assert_eq!(outcome.reason_code.as_deref(), Some("success"));
         assert_eq!(outcome.final_commit.as_deref(), Some("abc123"));
         let events = list_task_audit_events(&pool, "TASK-1")
             .await
             .expect("events");
         assert!(events
             .iter()
-            .any(|event| event.event_type == "integration_outcome.recorded"));
+            .any(|event| event.event_type == "integration_outcome.recorded"
+                && event.payload_json.contains("\"reason_code\":\"success\"")));
+    }
+
+    #[tokio::test]
+    async fn integration_outcome_reason_code_validation_and_legacy_reads() {
+        let (_temp, pool) = migrated_pool().await;
+        let actor = Actor::operator("tester");
+        create_task_queue(&pool, &sample_queue("TASK", "Tasker"), &actor)
+            .await
+            .expect("queue");
+        create_task(&pool, &sample_task("TASK", "Delivery"), &actor)
+            .await
+            .expect("task");
+
+        let invalid = record_integration_outcome(
+            &pool,
+            &RecordIntegrationOutcomeInput {
+                task_identifier: "TASK-1".to_string(),
+                agent_run_id: None,
+                outcome_kind: "operational_failure".to_string(),
+                reason_code: "not_a_reason".to_string(),
+                final_commit: None,
+                pre_merge_head: None,
+                message: Some("legacy-like failure".to_string()),
+                retryable: true,
+                retry_attempt: Some(1),
+                retry_delay_seconds: Some(30),
+            },
+            &actor,
+        )
+        .await
+        .expect_err("invalid reason code rejected");
+        assert!(invalid
+            .to_string()
+            .contains("invalid Integration Outcome reason code"));
+
+        sqlx::query(
+            "INSERT INTO integration_outcomes (id, task_id, outcome_kind, message, retryable) SELECT 'legacy-outcome', id, 'operational_failure', 'old row', 1 FROM tasks WHERE identifier = 'TASK-1'",
+        )
+        .execute(&pool)
+        .await
+        .expect("legacy insert");
+        sqlx::query("UPDATE tasks SET state = 'integrating' WHERE identifier = 'TASK-1'")
+            .execute(&pool)
+            .await
+            .expect("integrating");
+
+        let retries = integration_retries_for_status(&pool)
+            .await
+            .expect("retries");
+        assert_eq!(retries[0].reason_code, "unknown_legacy");
     }
 
     #[tokio::test]

@@ -1633,14 +1633,16 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool, json: bool) -> Re
                 println!("  Integration retry waits:");
                 for retry in queue_integration_retries {
                     println!(
-                        "    {}\tattempt={}\tnext_retry_at={}\tretryable={}\treason={}",
+                        "    {}\treason_code={}\tattempt={}\tnext_retry_at={}\tretryable={}\thint={}\treason={}",
                         display::task_label(&retry.task_identifier, &retry.task_title, 64),
+                        retry.reason_code,
                         retry.retry_attempt.unwrap_or_default(),
                         retry
                             .next_retry_at
                             .as_deref()
                             .unwrap_or("operator intervention required"),
                         retry.retryable,
+                        integration_recovery_hint(&retry.reason_code),
                         retry.reason.as_deref().unwrap_or("")
                     );
                 }
@@ -1664,6 +1666,20 @@ async fn status(paths: &TaskerPaths, db_path_overridden: bool, json: bool) -> Re
     }
 
     Ok(())
+}
+
+fn integration_recovery_hint(reason_code: &str) -> &'static str {
+    match reason_code {
+        "dirty_managed_source_repository" => "clean or intentionally resolve Managed Source Repository changes, then retry integration",
+        "repo_operation_lock_held" => "wait for or release the Managed Source Repository operation lock after verification",
+        "uncommitted_local_worktree" => "commit or discard Local Worktree changes and move through Rework validation",
+        "stale_validated_base_commit" => "rebase or revalidate against current Main Branch",
+        "task_branch_missing_main" => "merge/rebase Main Branch into the Task Branch or record a current Validated Base Commit",
+        "merge_conflict" => "resolve conflicts in Rework before integrating again",
+        "cleanup_failure" => "remove retained Local Worktree or Task Branch manually after verifying integration",
+        "unknown_legacy" => "inspect the human-readable Integration Outcome message",
+        _ => "inspect the Integration Outcome message and local repository state",
+    }
 }
 
 async fn monitor(
@@ -2058,7 +2074,13 @@ async fn merge(paths: &TaskerPaths, db_path_overridden: bool, command: MergeComm
                 .with_context(|| format!("Task Queue {} not found", detail.task.task_queue_key))?;
             let latest_run =
                 tasker_db::get_latest_agent_run_detail_for_task(&pool, &identifier).await?;
-            print_manual_merge_inspection(&detail, &queue, latest_run.as_ref());
+            let latest_outcome = latest_integration_outcome_for_task(&pool, &identifier).await?;
+            print_manual_merge_inspection(
+                &detail,
+                &queue,
+                latest_run.as_ref(),
+                latest_outcome.as_ref(),
+            );
         }
         MergeCommand::Lock { command } => match command {
             MergeLockCommand::Acquire {
@@ -2250,10 +2272,12 @@ async fn retry_local_worktree_integration(
             Some(LatestIntegrationOutcome {
                 outcome_kind,
                 retryable: true,
+                ..
             }) if outcome_kind == "operational_failure" => {}
             Some(LatestIntegrationOutcome {
                 outcome_kind,
                 retryable: false,
+                ..
             }) if outcome_kind == "operational_failure" => anyhow::bail!(
                 "refusing Integration retry for Task {identifier}: latest operational_failure is no longer retryable; use --force only after operator verification"
             ),
@@ -2284,16 +2308,21 @@ async fn retry_local_worktree_integration(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LatestIntegrationOutcome {
     outcome_kind: String,
+    reason_code: String,
     retryable: bool,
+    message: Option<String>,
 }
 
 async fn latest_integration_outcome_for_task(
     pool: &sqlx::SqlitePool,
     identifier: &str,
 ) -> Result<Option<LatestIntegrationOutcome>> {
-    let row = sqlx::query_as::<_, (String, bool)>(
+    let row = sqlx::query_as::<_, (String, String, bool, Option<String>)>(
         r#"
-        SELECT integration_outcomes.outcome_kind, integration_outcomes.retryable
+        SELECT integration_outcomes.outcome_kind,
+               COALESCE(integration_outcomes.reason_code, 'unknown_legacy') AS reason_code,
+               integration_outcomes.retryable,
+               integration_outcomes.message
         FROM integration_outcomes
         JOIN tasks ON tasks.id = integration_outcomes.task_id
         WHERE tasks.identifier = ?
@@ -2305,12 +2334,14 @@ async fn latest_integration_outcome_for_task(
     .fetch_optional(pool)
     .await
     .context("failed to load latest Integration Outcome")?;
-    Ok(
-        row.map(|(outcome_kind, retryable)| LatestIntegrationOutcome {
+    Ok(row.map(
+        |(outcome_kind, reason_code, retryable, message)| LatestIntegrationOutcome {
             outcome_kind,
+            reason_code,
             retryable,
-        }),
-    )
+            message,
+        },
+    ))
 }
 
 async fn validation_base_commit_for_status(
@@ -2528,8 +2559,14 @@ struct LocalWorktreeIntegrationAdapter<'a> {
 impl<'a> LocalWorktreeIntegrationAdapter<'a> {
     async fn integrate(&mut self) -> Result<LocalIntegrationResult> {
         if let Err(error) = self.validate_operational_safety() {
-            self.record_outcome("operational_failure", None, None, Some(error.to_string()))
-                .await?;
+            self.record_outcome(
+                "operational_failure",
+                integration_reason_code("operational_failure", Some(&error.to_string())),
+                None,
+                None,
+                Some(error.to_string()),
+            )
+            .await?;
             return Ok(LocalIntegrationResult {
                 summary: format!(
                     "operational Delivery Failure for Task {}; left in Integrating: {error:#}",
@@ -2538,8 +2575,14 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
             });
         }
         if let Err(error) = self.validate_work_change_safety() {
-            self.record_outcome("work_change_failure", None, None, Some(error.to_string()))
-                .await?;
+            self.record_outcome(
+                "work_change_failure",
+                integration_reason_code("work_change_failure", Some(&error.to_string())),
+                None,
+                None,
+                Some(error.to_string()),
+            )
+            .await?;
             self.transition("rework").await?;
             return Ok(LocalIntegrationResult {
                 summary: format!(
@@ -2563,16 +2606,28 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
         )?
         .success()
         {
-            self.record_outcome("no_changes", None, Some(pre_merge_head.clone()), None)
-                .await?;
-            self.transition("done").await?;
             let cleanup = self.cleanup_after_success();
+            let cleanup_message = cleanup
+                .as_ref()
+                .err()
+                .map(|error| format!("cleanup needs operator repair: {error:#}"));
+            self.record_outcome(
+                "no_changes",
+                cleanup_message
+                    .as_ref()
+                    .map_or("no_changes", |_| "cleanup_failure"),
+                None,
+                Some(pre_merge_head.clone()),
+                cleanup_message.clone(),
+            )
+            .await?;
+            self.transition("done").await?;
             let mut summary = format!(
                 "No-Change Integration recorded for Task {}; moved to Done",
                 self.task.task.identifier
             );
-            if let Err(error) = cleanup {
-                summary.push_str(&format!("; cleanup needs operator repair: {error:#}"));
+            if let Some(message) = cleanup_message {
+                summary.push_str(&format!("; {message}"));
             }
             return Ok(LocalIntegrationResult { summary });
         }
@@ -2584,6 +2639,7 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
             let _ = self.rollback_to(&pre_merge_head);
             self.record_outcome(
                 "work_change_failure",
+                "merge_conflict",
                 None,
                 Some(pre_merge_head.clone()),
                 Some(format!("Squash Merge failed: {error:#}")),
@@ -2603,6 +2659,7 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
             let _ = self.rollback_to(&pre_merge_head);
             self.record_outcome(
                 "work_change_failure",
+                "unknown_work_change_failure",
                 None,
                 Some(pre_merge_head.clone()),
                 Some(format!("Final Commit failed: {error:#}")),
@@ -2620,11 +2677,19 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
         let final_commit = git_output(self.repo, &["rev-parse", "HEAD"])?
             .trim()
             .to_string();
+        let cleanup = self.cleanup_after_success();
+        let cleanup_message = cleanup
+            .as_ref()
+            .err()
+            .map(|error| format!("cleanup needs operator repair: {error:#}"));
         self.record_outcome(
             "success",
+            cleanup_message
+                .as_ref()
+                .map_or("success", |_| "cleanup_failure"),
             Some(final_commit.clone()),
             Some(pre_merge_head),
-            None,
+            cleanup_message.clone(),
         )
         .await
         .with_context(|| {
@@ -2637,13 +2702,12 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
                 "Final Commit {final_commit} was created but Tasker could not move the Task to Done; operator repair required"
             )
         })?;
-        let cleanup = self.cleanup_after_success();
         let mut summary = format!(
             "Integrated Task {} as Final Commit {}; moved to Done",
             self.task.task.identifier, final_commit
         );
-        if let Err(error) = cleanup {
-            summary.push_str(&format!("; cleanup needs operator repair: {error:#}"));
+        if let Some(message) = cleanup_message {
+            summary.push_str(&format!("; {message}"));
         }
         Ok(LocalIntegrationResult { summary })
     }
@@ -2710,15 +2774,23 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
         .success()
             && self.task.task.validated_base_commit.as_deref() != Some(current_main.as_str())
         {
+            if self.task.task.validated_base_commit.is_some() {
+                anyhow::bail!(
+                    "Task Branch {} does not include current Main Branch {} and has stale Validated Base Commit {} (current Main Branch is {})",
+                    self.task_branch,
+                    self.queue.main_branch,
+                    self.task
+                        .task
+                        .validated_base_commit
+                        .as_deref()
+                        .unwrap_or("not recorded"),
+                    current_main
+                );
+            }
             anyhow::bail!(
-                "Task Branch {} does not include current Main Branch {} and Validated Base Commit {} is stale or missing (current Main Branch is {})",
+                "Task Branch {} does not include current Main Branch {} and Validated Base Commit is missing (current Main Branch is {})",
                 self.task_branch,
                 self.queue.main_branch,
-                self.task
-                    .task
-                    .validated_base_commit
-                    .as_deref()
-                    .unwrap_or("not recorded"),
                 current_main
             );
         }
@@ -2728,6 +2800,7 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
     async fn record_outcome(
         &self,
         kind: &str,
+        reason_code: &str,
         final_commit: Option<String>,
         pre_merge_head: Option<String>,
         message: Option<String>,
@@ -2738,6 +2811,7 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
                 task_identifier: self.task.task.identifier.clone(),
                 agent_run_id: self.agent_run_id.map(ToString::to_string),
                 outcome_kind: kind.to_string(),
+                reason_code: reason_code.to_string(),
                 final_commit,
                 pre_merge_head,
                 message,
@@ -2797,6 +2871,31 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
             run_git(self.repo, &["branch", "-D", self.task_branch])?;
         }
         Ok(())
+    }
+}
+
+fn integration_reason_code(kind: &str, message: Option<&str>) -> &'static str {
+    let message = message.unwrap_or_default();
+    if message.contains("Local Worktree has uncommitted changes") {
+        "uncommitted_local_worktree"
+    } else if message.contains("stale Validated Base Commit") {
+        "stale_validated_base_commit"
+    } else if message.contains("does not include current Main Branch") {
+        "task_branch_missing_main"
+    } else if message.contains("Managed Source Repository has uncommitted changes") {
+        "dirty_managed_source_repository"
+    } else if message.contains("Git lock exists") {
+        "repo_operation_lock_held"
+    } else if message.contains("Squash Merge failed") {
+        "merge_conflict"
+    } else if kind == "success" {
+        "success"
+    } else if kind == "no_changes" {
+        "no_changes"
+    } else if kind == "work_change_failure" {
+        "unknown_work_change_failure"
+    } else {
+        "unknown_operational_failure"
     }
 }
 
@@ -2997,6 +3096,7 @@ fn print_manual_merge_inspection(
     detail: &tasker_db::TaskDetail,
     queue: &tasker_db::TaskQueue,
     latest_run: Option<&tasker_db::AgentRunDetail>,
+    latest_outcome: Option<&LatestIntegrationOutcome>,
 ) {
     let local_worktree = detail
         .task_links
@@ -3080,6 +3180,21 @@ fn print_manual_merge_inspection(
         println!("  (none)");
         println!("  Run Transcript: not recorded");
         println!("  Launcher Session Data: missing");
+    }
+    println!();
+    println!("Latest Integration Outcome:");
+    if let Some(outcome) = latest_outcome {
+        println!("  kind: {}", outcome.outcome_kind);
+        println!("  reason code: {}", outcome.reason_code);
+        println!(
+            "  recovery hint: {}",
+            integration_recovery_hint(&outcome.reason_code)
+        );
+        if let Some(message) = &outcome.message {
+            println!("  message: {message}");
+        }
+    } else {
+        println!("  (none)");
     }
     println!();
     println!("Structured gates:");
@@ -3491,6 +3606,7 @@ mod tests {
             queue_key: "TASK".to_string(),
             task_identifier: "TASK-5".to_string(),
             task_title: "Retry integration".to_string(),
+            reason_code: "dirty_managed_source_repository".to_string(),
             retryable: true,
             retry_attempt: Some(1),
             next_retry_at: Some("later".to_string()),
@@ -4229,7 +4345,7 @@ Implement Bootstrap Task Creation.
             .expect("branch status")
             .success());
         let outcomes: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'success'",
+            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'success' AND reason_code = 'success'",
         )
         .fetch_one(&pool)
         .await
@@ -4264,7 +4380,7 @@ Implement Bootstrap Task Creation.
             .expect("task");
         assert_eq!(detail.task.state, "done");
         let outcomes: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'no_changes'",
+            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'no_changes' AND reason_code = 'no_changes'",
         )
         .fetch_one(&pool)
         .await
@@ -4297,7 +4413,7 @@ Implement Bootstrap Task Creation.
             .expect("task");
         assert_eq!(detail.task.state, "integrating");
         let outcomes: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'operational_failure'",
+            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'operational_failure' AND reason_code = 'dirty_managed_source_repository'",
         )
         .fetch_one(&pool)
         .await
@@ -4330,7 +4446,7 @@ Implement Bootstrap Task Creation.
             .expect("task");
         assert_eq!(detail.task.state, "rework");
         let outcomes: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'work_change_failure'",
+            "SELECT COUNT(*) FROM integration_outcomes WHERE outcome_kind = 'work_change_failure' AND reason_code = 'uncommitted_local_worktree'",
         )
         .fetch_one(&pool)
         .await
@@ -4351,6 +4467,7 @@ Implement Bootstrap Task Creation.
                 task_identifier: "TASK-1".to_string(),
                 agent_run_id: None,
                 outcome_kind: "operational_failure".to_string(),
+                reason_code: "unknown_operational_failure".to_string(),
                 final_commit: None,
                 pre_merge_head: None,
                 message: Some("fixed local operational issue".to_string()),
@@ -4443,6 +4560,7 @@ Implement Bootstrap Task Creation.
                 task_identifier: "TASK-1".to_string(),
                 agent_run_id: None,
                 outcome_kind: "work_change_failure".to_string(),
+                reason_code: "unknown_work_change_failure".to_string(),
                 final_commit: None,
                 pre_merge_head: None,
                 message: Some("requires Task work changes".to_string()),
@@ -4562,6 +4680,13 @@ Implement Bootstrap Task Creation.
             .expect("task")
             .expect("task");
         assert_eq!(detail.task.state, "rework");
+        let reason_code: String = sqlx::query_scalar(
+            "SELECT reason_code FROM integration_outcomes ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("reason code");
+        assert_eq!(reason_code, "stale_validated_base_commit");
     }
 
     #[tokio::test]
@@ -4593,6 +4718,13 @@ Implement Bootstrap Task Creation.
             .expect("task")
             .expect("task");
         assert_eq!(detail.task.state, "rework");
+        let reason_code: String = sqlx::query_scalar(
+            "SELECT reason_code FROM integration_outcomes ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("reason code");
+        assert_eq!(reason_code, "task_branch_missing_main");
     }
 
     #[tokio::test]

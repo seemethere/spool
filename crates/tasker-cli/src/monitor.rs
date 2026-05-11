@@ -369,10 +369,12 @@ fn attention_lines(snapshot: &MonitorSnapshot) -> Vec<Line<'static>> {
                 "↻",
                 "integration",
                 format!(
-                    "{} attempt={} next={}{}",
+                    "{} code={} attempt={} next={} hint={}{}",
                     compact_task_label(&retry.task_identifier, &retry.task_title, 44),
+                    retry.reason_code,
                     retry.retry_attempt.unwrap_or_default(),
                     retry.next_retry_at.as_deref().unwrap_or("operator"),
+                    integration_recovery_hint(&retry.reason_code),
                     retry
                         .reason
                         .as_deref()
@@ -442,10 +444,12 @@ fn attention_texts(snapshot: &MonitorSnapshot) -> Vec<String> {
         }
         for retry in &queue.integration_retries {
             lines.push(format!(
-                "integration: {} attempt={} next={}{}",
+                "integration: {} code={} attempt={} next={} hint={}{}",
                 compact_task_label(&retry.task_identifier, &retry.task_title, 64),
+                retry.reason_code,
                 retry.retry_attempt.unwrap_or_default(),
                 retry.next_retry_at.as_deref().unwrap_or("operator"),
+                integration_recovery_hint(&retry.reason_code),
                 retry
                     .reason
                     .as_deref()
@@ -480,6 +484,20 @@ fn attention_texts(snapshot: &MonitorSnapshot) -> Vec<String> {
         }
     }
     lines
+}
+
+fn integration_recovery_hint(reason_code: &str) -> &'static str {
+    match reason_code {
+        "dirty_managed_source_repository" => "clean managed repo",
+        "repo_operation_lock_held" => "wait/release repo lock",
+        "uncommitted_local_worktree" => "commit/discard worktree changes",
+        "stale_validated_base_commit" => "rebase or revalidate",
+        "task_branch_missing_main" => "update Task Branch from Main",
+        "merge_conflict" => "resolve conflicts in Rework",
+        "cleanup_failure" => "manual cleanup",
+        "unknown_legacy" => "inspect legacy message",
+        _ => "inspect outcome message",
+    }
 }
 
 fn attention_line(icon: &'static str, label: &'static str, detail: String) -> Line<'static> {
@@ -1279,6 +1297,7 @@ mod tests {
                     queue_key: "TASK".to_string(),
                     task_identifier: "TASK-4".to_string(),
                     task_title: "Retry integration".to_string(),
+                    reason_code: "unknown_operational_failure".to_string(),
                     retryable: false,
                     retry_attempt: Some(2),
                     next_retry_at: None,
