@@ -30,21 +30,76 @@ pub fn parse_bootstrap_task(
     text: &str,
 ) -> Result<tasker_db::CreateTask> {
     let (front_matter, brief) = split_front_matter(text)?;
-    let front_matter: BootstrapFrontMatter = serde_yaml::from_str(front_matter)
+    let front_matter_text = front_matter;
+    let front_matter: BootstrapFrontMatter = serde_yaml::from_str(front_matter_text)
         .with_context(|| format!("failed to parse YAML front matter in {source_name}"))?;
+
+    let priority = validate_enum_front_matter_field(
+        source_name,
+        front_matter_text,
+        "priority",
+        front_matter.priority.as_deref().unwrap_or("normal"),
+        &["urgent", "high", "normal", "low"],
+        Some(("medium", "normal")),
+    )?;
+    let state = validate_enum_front_matter_field(
+        source_name,
+        front_matter_text,
+        "state",
+        front_matter.state.as_deref().unwrap_or("ready"),
+        &["backlog", "ready"],
+        None,
+    )?;
 
     Ok(tasker_db::CreateTask {
         queue_key: queue_key.to_string(),
         title: front_matter.title,
         brief: brief.trim().to_string(),
-        priority: normalize_label(front_matter.priority.as_deref().unwrap_or("normal")),
-        state: normalize_label(front_matter.state.as_deref().unwrap_or("ready")),
+        priority,
+        state,
         review_required: front_matter.review_required.unwrap_or(false),
         acceptance_criteria: front_matter.acceptance_criteria.unwrap_or_default(),
         validation_items: front_matter.validation_items.unwrap_or_default(),
         tags: front_matter.tags.unwrap_or_default(),
         conflict_hints: front_matter.conflict_hints.unwrap_or_default(),
         blocking_task_identifiers: front_matter.blocking_task_identifiers.unwrap_or_default(),
+    })
+}
+
+fn validate_enum_front_matter_field(
+    source_name: &str,
+    front_matter: &str,
+    field: &str,
+    raw_value: &str,
+    allowed_values: &[&str],
+    hint: Option<(&str, &str)>,
+) -> Result<String> {
+    let normalized = normalize_label(raw_value);
+    if allowed_values.contains(&normalized.as_str()) {
+        return Ok(normalized);
+    }
+
+    let line = front_matter_field_line(front_matter, field)
+        .map(|line| format!(":{line}"))
+        .unwrap_or_default();
+    let allowed = allowed_values.join(", ");
+    let rejected = raw_value.trim();
+    let mut message =
+        format!("{source_name}{line}: invalid {field} \"{rejected}\"; expected one of: {allowed}");
+    if let Some((from, to)) = hint {
+        if normalized == from {
+            message.push_str(&format!("\nhint: use \"{to}\" instead of \"{from}\""));
+        }
+    }
+    anyhow::bail!(message)
+}
+
+fn front_matter_field_line(front_matter: &str, field: &str) -> Option<usize> {
+    front_matter.lines().enumerate().find_map(|(index, line)| {
+        line.split_once(':')
+            .map(|(key, _)| key.trim())
+            .filter(|key| *key == field)
+            .map(|_| index + 2)
     })
 }
 
@@ -125,6 +180,37 @@ mod tests {
 
         assert_eq!(parsed.priority, "high");
         assert_eq!(parsed.state, "backlog");
+    }
+
+    #[test]
+    fn parser_reports_invalid_priority_with_allowed_values_and_hint() {
+        let error = parse_bootstrap_task(
+            "TASK",
+            ".tasker/bootstrap-tasks/foo.md",
+            "---\ntitle: Test\npriority: medium\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\n---\nBrief\n",
+        )
+        .expect_err("invalid priority fails");
+        let message = error.to_string();
+
+        assert!(message.contains(".tasker/bootstrap-tasks/foo.md:3"));
+        assert!(message.contains("invalid priority \"medium\""));
+        assert!(message.contains("expected one of: urgent, high, normal, low"));
+        assert!(message.contains("hint: use \"normal\" instead of \"medium\""));
+    }
+
+    #[test]
+    fn parser_reports_invalid_state_with_allowed_values() {
+        let error = parse_bootstrap_task(
+            "TASK",
+            "inline",
+            "---\ntitle: Test\nstate: in_progress\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\n---\nBrief\n",
+        )
+        .expect_err("invalid state fails");
+        let message = error.to_string();
+
+        assert!(message.contains("inline:3"));
+        assert!(message.contains("invalid state \"in_progress\""));
+        assert!(message.contains("expected one of: backlog, ready"));
     }
 
     #[test]
