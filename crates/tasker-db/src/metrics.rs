@@ -329,6 +329,14 @@ struct AgentRunMetricsSummary {
     warnings: Vec<String>,
 }
 
+fn is_success_final_status(status: Option<&str>) -> bool {
+    matches!(status, Some("completed" | "succeeded" | "success" | "done"))
+}
+
+fn is_blocking_extension_ui_method(method: &str) -> bool {
+    matches!(method, "confirm" | "input" | "select" | "editor")
+}
+
 impl AgentRunMetricsSummary {
     fn observe_launcher_raw_json(&mut self, raw_json: Option<&str>) {
         let Some(raw_json) = raw_json else { return };
@@ -419,11 +427,13 @@ impl AgentRunMetricsSummary {
                 .or_else(|| value.get("method_name"))
                 .and_then(|value| value.as_str())
                 .unwrap_or("unknown");
-            if method != "notify" {
+            if is_blocking_extension_ui_method(method) {
                 self.blocking_ui_detected = Some(true);
             }
         }
-        if value.get("event").and_then(|value| value.as_str()) == Some("question") {
+        if value.get("event").and_then(|value| value.as_str()) == Some("question")
+            && !is_success_final_status(self.final_status.as_deref())
+        {
             self.unattended_question_detected = Some(true);
         }
         self.observe_roles_and_usage(value);
@@ -707,11 +717,12 @@ impl AgentRunMetricsSummary {
         if self.max_context_tokens.unwrap_or(0) >= 100_000 {
             hints.push("large context growth".to_string());
         }
-        if self.blocking_ui_detected == Some(true)
-            || self.unattended_question_detected == Some(true)
-        {
-            hints.push("unexpected UI/questions".to_string());
-        }
+        // UI interaction signals are emitted as dedicated metrics, not generic optimization
+        // hints. `blocking_ui_detected` means a blocking extension UI method was observed
+        // (`confirm`, `input`, `select`, or `editor`). `unattended_question_detected` means
+        // explicit launcher metadata reported an unattended question, or a question event was
+        // observed on a non-successful run. Benign
+        // fire-and-forget UI such as `notify` should not become an efficiency hint.
         if self.tool_error_count.unwrap_or(0) >= 5 {
             hints.push("validation/tool loop".to_string());
         }

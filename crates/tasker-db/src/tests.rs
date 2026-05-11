@@ -2398,6 +2398,133 @@ async fn persists_agent_run_metrics_for_pi_launcher_outcome() {
 }
 
 #[tokio::test]
+async fn agent_run_metrics_separate_blocking_ui_and_unattended_questions_from_hints() {
+    let (temp, pool) = migrated_pool().await;
+    create_task_queue(
+        &pool,
+        &sample_queue("TASK", "Tasker"),
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect("create queue");
+
+    async fn record_run(
+        pool: &SqlitePool,
+        temp_path: &std::path::Path,
+        title: &str,
+        stdout: &str,
+        final_status: &str,
+        raw_json: &str,
+    ) -> AgentRunMetrics {
+        create_task(
+            pool,
+            &sample_task("TASK", title),
+            &Actor::operator("tester"),
+        )
+        .await
+        .expect("create task");
+        let pi_claim = ClaimNextInput {
+            launcher_kind: "pi".to_string(),
+            ..sample_claim("TASK")
+        };
+        let claimed = claim_next(pool, &pi_claim, &worker_actor())
+            .await
+            .expect("claim")
+            .expect("claimed task");
+        let transcript_path = temp_path.join(format!("{}.jsonl", claimed.run.id));
+        fs::write(
+            &transcript_path,
+            serde_json::json!({
+                "launcher": "pi",
+                "status": if final_status == "completed" { 0 } else { 1 },
+                "stdout": stdout,
+                "stderr": "",
+                "timed_out": false
+            })
+            .to_string()
+                + "\n",
+        )
+        .expect("write transcript");
+        upsert_launcher_session_data(
+            pool,
+            &claimed.run.id,
+            &UpsertLauncherSessionData {
+                launcher_kind: "pi".to_string(),
+                session_id: Some(claimed.run.id.clone()),
+                model: None,
+                provider: None,
+                started_at: Some(claimed.run.created_at.clone()),
+                finished_at: None,
+                final_status: Some(final_status.to_string()),
+                transcript_path: Some(transcript_path.display().to_string()),
+                raw_json: Some(raw_json.to_string()),
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("upsert session");
+        finish_run(
+            pool,
+            &claimed.run.id,
+            &FinishRunInput {
+                outcome: final_status.to_string(),
+                failure_reason: None,
+                failure_reason_code: None,
+                retry_hold_seconds: None,
+            },
+            &worker_actor(),
+        )
+        .await
+        .expect("finish run");
+        get_agent_run_metrics(pool, &claimed.run.id)
+            .await
+            .expect("metrics")
+            .expect("metrics recorded")
+    }
+
+    let benign = record_run(
+        &pool,
+        temp.path(),
+        "Benign UI",
+        "{\"type\":\"extension_ui_request\",\"method\":\"notify\"}\n{\"event\":\"question\"}\n{\"type\":\"agent_end\"}\n",
+        "completed",
+        r#"{"exit_code":0,"timed_out":false,"unattended_question_detected":false}"#,
+    )
+    .await;
+    assert_eq!(benign.unattended_question_detected, Some(0));
+    assert_eq!(benign.blocking_ui_detected, None);
+    let benign_hints: Vec<String> =
+        serde_json::from_str(&benign.efficiency_hints_json).expect("benign hints");
+    assert!(!benign_hints
+        .iter()
+        .any(|hint| hint.contains("UI") || hint.contains("question")));
+
+    let question_failure = record_run(
+        &pool,
+        temp.path(),
+        "Question failure",
+        "{\"event\":\"question\"}\n",
+        "failed",
+        r#"{"exit_code":1,"timed_out":false,"unattended_question_detected":false}"#,
+    )
+    .await;
+    assert_eq!(question_failure.unattended_question_detected, Some(1));
+    assert_eq!(question_failure.blocking_ui_detected, None);
+
+    let blocking_ui = record_run(
+        &pool,
+        temp.path(),
+        "Blocking UI",
+        "{\"type\":\"extension_ui_request\",\"method\":\"confirm\"}\n",
+        "failed",
+        r#"{"exit_code":1,"timed_out":false,"unattended_question_detected":false}"#,
+    )
+    .await;
+    assert_eq!(blocking_ui.unattended_question_detected, Some(0));
+    assert_eq!(blocking_ui.blocking_ui_detected, Some(1));
+}
+
+#[tokio::test]
 async fn agent_run_metrics_warn_for_missing_and_malformed_transcripts() {
     let (temp, pool) = migrated_pool().await;
     create_task_queue(

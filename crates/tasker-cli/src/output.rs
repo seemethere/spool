@@ -241,6 +241,10 @@ pub struct TranscriptSummary {
     warnings: Vec<String>,
 }
 
+fn is_blocking_extension_ui_method(method: &str) -> bool {
+    matches!(method, "confirm" | "input" | "select" | "editor")
+}
+
 impl TranscriptSummary {
     fn observe_event(&mut self, value: &serde_json::Value) {
         let type_name = value.get("type").and_then(|value| value.as_str());
@@ -253,13 +257,15 @@ impl TranscriptSummary {
                 .or_else(|| value.get("method_name"))
                 .and_then(|value| value.as_str())
                 .unwrap_or("unknown");
-            if method != "notify" {
+            if is_blocking_extension_ui_method(method) {
                 self.blocking_ui_request = Some(format!(
                     "blocking extension UI request {method} in unattended Worker Session"
                 ));
             }
         }
-        if value.get("event").and_then(|value| value.as_str()) == Some("question") {
+        if value.get("event").and_then(|value| value.as_str()) == Some("question")
+            && self.unattended_question_detected != Some(false)
+        {
             self.unattended_question_detected = Some(true);
         }
     }
@@ -554,11 +560,19 @@ pub fn write_run_detail(mut writer: impl Write, detail: &tasker_db::AgentRunDeta
         if let Some(timed_out) = metrics.timed_out {
             writeln!(writer, "  timed out: {}", timed_out != 0)?;
         }
+        if metrics.unattended_question_detected.is_some() || metrics.blocking_ui_detected.is_some()
+        {
+            writeln!(writer, "  UI/question signals:")?;
+        }
         if let Some(question) = metrics.unattended_question_detected {
-            writeln!(writer, "  unattended question detected: {}", question != 0)?;
+            writeln!(
+                writer,
+                "    unattended question detected: {}",
+                question != 0
+            )?;
         }
         if let Some(blocking_ui) = metrics.blocking_ui_detected {
-            writeln!(writer, "  blocking UI detected: {}", blocking_ui != 0)?;
+            writeln!(writer, "    blocking UI detected: {}", blocking_ui != 0)?;
         }
         if let Some(path) = &metrics.transcript_path {
             writeln!(writer, "  transcript path: {path}")?;

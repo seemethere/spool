@@ -71,6 +71,10 @@ Each **Agent Run** maps to a child span of the Task trace.
   - `tasker.unattended_question_detected`
   - `tasker.blocking_ui_detected`
 
+`tasker.blocking_ui_detected` is true only when an unattended **Worker Loop** observes a blocking pi extension UI request such as `confirm`, `input`, `select`, or `editor`. Fire-and-forget extension UI events such as `notify` are benign and should not set the attribute.
+
+`tasker.unattended_question_detected` is true when launcher metadata explicitly reports an unattended question, or when a question event is observed on a non-successful Agent Run. Successful runs with benign extension UI or other non-blocking launcher events should not be labeled as unexpected questions.
+
 **Lease Heartbeats** should normally be metrics or summarized events, not one span per heartbeat. Exporters may add an event for lease expiry or abnormal heartbeat gaps.
 
 ### Local Worktree setup span
