@@ -32,6 +32,26 @@ pub struct RepoOperationLockGuard {
     contents: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcquireRepoOperationLock {
+    pub data_dir: PathBuf,
+    pub queue: String,
+    pub operation: String,
+    pub task_identifier: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowRepoOperationLock {
+    pub data_dir: PathBuf,
+    pub queue: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseRepoOperationLock {
+    pub data_dir: PathBuf,
+    pub queue: String,
+}
+
 impl Drop for RepoOperationLockGuard {
     fn drop(&mut self) {
         let Ok(existing) = fs::read_to_string(&self.path) else {
@@ -47,6 +67,29 @@ pub fn lock_path(data_dir: &Path, queue: &str) -> PathBuf {
     data_dir
         .join("repo-operation-locks")
         .join(format!("{}.lock", queue_slug(queue)))
+}
+
+pub fn acquire_repo_operation_lock(
+    request: AcquireRepoOperationLock,
+) -> Result<ActiveRepoOperationLock> {
+    acquire_manual(
+        &request.data_dir,
+        &request.queue,
+        &request.operation,
+        request.task_identifier.as_deref(),
+    )
+}
+
+pub fn show_repo_operation_lock(
+    request: ShowRepoOperationLock,
+) -> Result<Option<ActiveRepoOperationLock>> {
+    active_lock(&request.data_dir, &request.queue)
+}
+
+pub fn release_repo_operation_lock(
+    request: ReleaseRepoOperationLock,
+) -> Result<Option<ActiveRepoOperationLock>> {
+    release_manual(&request.data_dir, &request.queue)
 }
 
 pub fn acquire_guard(

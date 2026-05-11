@@ -909,7 +909,7 @@ mod tests {
         let pool = empty_pool(temp.path()).await;
         seed_task(&pool, "ready").await;
         let data_dir = temp.path().join("data");
-        let _lock = crate::repo_lock::acquire_manual(
+        let _lock = tasker_runner::repo_lock::acquire_manual(
             &data_dir,
             "TASK",
             "manual_integration",
@@ -943,7 +943,7 @@ mod tests {
             !count.exists(),
             "worker should not start while repo lock is held"
         );
-        crate::repo_lock::release_manual(&data_dir, "TASK")
+        tasker_runner::repo_lock::release_manual(&data_dir, "TASK")
             .expect("release lock")
             .expect("held lock");
         let outcome = handle.await.expect("join").expect("supervise");

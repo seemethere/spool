@@ -691,8 +691,8 @@ pub async fn preflight_worker_claim(
         .await
         .context("Worker Loop preflight failed: migration compatibility check failed")?;
 
-    if let Some(active) = crate::repo_lock::active_lock(data_dir, queue_key)? {
-        bail!(crate::repo_lock::blocked_message(&active));
+    if let Some(active) = tasker_runner::repo_lock::active_lock(data_dir, queue_key)? {
+        bail!(tasker_runner::repo_lock::blocked_message(&active));
     }
 
     let queue = tasker_db::get_task_queue(pool, queue_key)
@@ -1823,7 +1823,7 @@ mod tests {
         let pool = tasker_db::connect(&db_path).await.expect("connect");
         tasker_db::run_migrations(&pool).await.expect("migrate");
         seed_ready_task(&pool, &repo, &worktrees).await;
-        let _lock = crate::repo_lock::acquire_manual(
+        let _lock = tasker_runner::repo_lock::acquire_manual(
             &data_dir,
             "TASK",
             "manual_integration",

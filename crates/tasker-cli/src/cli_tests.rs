@@ -1114,6 +1114,52 @@ Implement Bootstrap Task Creation.
         .expect("task");
     assert_eq!(detail.task.state, "done");
 
+    merge(
+        &paths,
+        false,
+        MergeCommand::Lock {
+            command: MergeLockCommand::Acquire {
+                queue: "TASK".to_string(),
+                operation: "manual_integration".to_string(),
+                task: Some("TASK-1".to_string()),
+            },
+        },
+    )
+    .await
+    .expect("acquire operation lock");
+    assert!(
+        tasker_runner::repo_lock::active_lock(&paths.data_dir, "TASK")
+            .expect("active lock")
+            .is_some()
+    );
+    merge(
+        &paths,
+        false,
+        MergeCommand::Lock {
+            command: MergeLockCommand::Status {
+                queue: "TASK".to_string(),
+            },
+        },
+    )
+    .await
+    .expect("show operation lock");
+    merge(
+        &paths,
+        false,
+        MergeCommand::Lock {
+            command: MergeLockCommand::Release {
+                queue: "TASK".to_string(),
+            },
+        },
+    )
+    .await
+    .expect("release operation lock");
+    assert!(
+        tasker_runner::repo_lock::active_lock(&paths.data_dir, "TASK")
+            .expect("active lock")
+            .is_none()
+    );
+
     task(
         &paths,
         false,

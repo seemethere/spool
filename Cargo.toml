@@ -3,6 +3,7 @@ members = [
     "crates/tasker-cli",
     "crates/tasker-config",
     "crates/tasker-db",
+    "crates/tasker-runner",
     "crates/tasker-server",
 ]
 resolver = "2"

@@ -21,7 +21,6 @@ mod merge_cmd;
 mod monitor;
 mod output;
 mod queue_cmd;
-mod repo_lock;
 mod run_cmd;
 mod serve_cmd;
 mod status_cmd;

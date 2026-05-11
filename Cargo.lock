@@ -2014,6 +2014,7 @@ dependencies = [
  "sqlx",
  "tasker-config",
  "tasker-db",
+ "tasker-runner",
  "tasker-server",
  "tempfile",
  "tokio",
@@ -2041,6 +2042,16 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "tasker-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

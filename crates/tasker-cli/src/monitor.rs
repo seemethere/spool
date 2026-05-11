@@ -22,7 +22,8 @@ use ratatui::{
 };
 use sqlx::SqlitePool;
 
-use crate::{display, repo_lock};
+use crate::display;
+use tasker_runner::repo_lock;
 
 const NEXT_TASK_LIMIT: usize = 5;
 

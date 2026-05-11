@@ -1,5 +1,6 @@
 use super::*;
 use crate::status_cmd::integration_recovery_hint;
+use tasker_runner::repo_lock;
 
 pub(crate) async fn merge(
     paths: &TaskerPaths,
@@ -35,12 +36,13 @@ pub(crate) async fn merge(
                 operation,
                 task,
             } => {
-                let active = repo_lock::acquire_manual(
-                    &paths.data_dir,
-                    &queue,
-                    &operation,
-                    task.as_deref(),
-                )?;
+                let active =
+                    repo_lock::acquire_repo_operation_lock(repo_lock::AcquireRepoOperationLock {
+                        data_dir: paths.data_dir.clone(),
+                        queue,
+                        operation,
+                        task_identifier: task,
+                    })?;
                 println!(
                     "acquired Managed Source Repository operation lock for Task Queue {} at {}",
                     active.lock.queue,
@@ -52,14 +54,24 @@ pub(crate) async fn merge(
                 );
             }
             MergeLockCommand::Status { queue } => {
-                if let Some(active) = repo_lock::active_lock(&paths.data_dir, &queue)? {
+                if let Some(active) =
+                    repo_lock::show_repo_operation_lock(repo_lock::ShowRepoOperationLock {
+                        data_dir: paths.data_dir.clone(),
+                        queue: queue.clone(),
+                    })?
+                {
                     println!("{}", repo_lock::blocked_message(&active));
                 } else {
                     println!("no Managed Source Repository operation lock for Task Queue {queue}");
                 }
             }
             MergeLockCommand::Release { queue } => {
-                if let Some(active) = repo_lock::release_manual(&paths.data_dir, &queue)? {
+                if let Some(active) =
+                    repo_lock::release_repo_operation_lock(repo_lock::ReleaseRepoOperationLock {
+                        data_dir: paths.data_dir.clone(),
+                        queue: queue.clone(),
+                    })?
+                {
                     println!(
                         "released Managed Source Repository operation lock for Task Queue {} from {}",
                         active.lock.queue,
