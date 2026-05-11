@@ -493,6 +493,24 @@ enum TelemetryCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Aggregate completed pi Agent Run metrics into a local Workflow Metrics report.
+    Workflow {
+        /// Task Queue Key to summarize.
+        #[arg(long)]
+        queue: String,
+        /// Number of most recent completed pi Agent Runs to include. Ignored when --since or --until is set.
+        #[arg(long, default_value_t = 20)]
+        recent: usize,
+        /// Start of created_at date window, as a SQLite-compatible UTC timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        /// End of created_at date window, as a SQLite-compatible UTC timestamp.
+        #[arg(long)]
+        until: Option<String>,
+        /// Emit machine-readable Workflow Metrics JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -981,7 +999,8 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
             TelemetryCommand::Summary { queue, .. }
             | TelemetryCommand::Correlation { queue, .. }
             | TelemetryCommand::Trend { queue, .. }
-            | TelemetryCommand::Efficiency { queue, .. } => Some(queue.clone()),
+            | TelemetryCommand::Efficiency { queue, .. }
+            | TelemetryCommand::Workflow { queue, .. } => Some(queue.clone()),
             TelemetryCommand::Lifecycle { queue, .. }
             | TelemetryCommand::BackfillMetrics { queue, .. } => queue.clone(),
         },

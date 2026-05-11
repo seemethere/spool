@@ -142,6 +142,30 @@ pub(crate) async fn telemetry(
                 print!("{}", telemetry::render_recent_efficiency_summary(&summary));
             }
         }
+        TelemetryCommand::Workflow {
+            queue,
+            recent,
+            since,
+            until,
+            json,
+        } => {
+            let summary = telemetry::workflow_metrics_summary(
+                &pool,
+                &telemetry::WorkflowMetricsOptions {
+                    queue,
+                    recent,
+                    since,
+                    until,
+                },
+            )
+            .await?;
+            if json {
+                serde_json::to_writer_pretty(std::io::stdout(), &summary)?;
+                println!();
+            } else {
+                print!("{}", telemetry::render_workflow_metrics_summary(&summary));
+            }
+        }
     }
     Ok(())
 }

@@ -2128,6 +2128,64 @@ pub struct RecentEfficiencyOffender {
     pub budget_warning_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowMetricsOptions {
+    pub queue: String,
+    pub recent: usize,
+    pub since: Option<String>,
+    pub until: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkflowMetricsSummary {
+    pub queue: String,
+    pub filter: WorkflowMetricsFilter,
+    pub run_count: usize,
+    pub runs_with_metrics: usize,
+    pub token_summary: WorkflowTokenSummary,
+    pub tool_call_summary: WorkflowToolCallSummary,
+    pub duration_summary: WorkflowDurationSummary,
+    pub repeated_read_count: i64,
+    pub repeated_tasker_context_fetch_count: i64,
+    pub transcript_byte_summary: MetricSummary,
+    pub efficiency_hint_frequencies: BTreeMap<String, i64>,
+    pub cautions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkflowMetricsFilter {
+    pub mode: String,
+    pub recent: Option<usize>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkflowTokenSummary {
+    pub input_tokens: MetricSummary,
+    pub output_tokens: MetricSummary,
+    pub total_tokens: MetricSummary,
+    pub cache_read_tokens: MetricSummary,
+    pub cache_write_tokens: MetricSummary,
+    pub max_context_tokens: MetricSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkflowToolCallSummary {
+    pub tool_calls: MetricSummary,
+    pub tool_errors: MetricSummary,
+    pub repeated_failed_tool_attempts: MetricSummary,
+    pub tool_call_counts: BTreeMap<String, i64>,
+    pub shell_command_counts: BTreeMap<String, i64>,
+    pub top_shell_command_categories: Vec<CountSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkflowDurationSummary {
+    pub completed_run_count: usize,
+    pub seconds: MetricSummary,
+}
+
 #[derive(Debug, Clone, FromRow)]
 struct TrendOutcomeRow {
     created_epoch: i64,
@@ -2844,6 +2902,264 @@ pub fn render_recent_efficiency_summary(summary: &RecentEfficiencySummary) -> St
             .expect("write string");
         }
     }
+    writeln!(output, "cautions:").expect("write string");
+    for caution in &summary.cautions {
+        writeln!(output, "  - {caution}").expect("write string");
+    }
+    output
+}
+
+pub async fn workflow_metrics_summary(
+    pool: &SqlitePool,
+    options: &WorkflowMetricsOptions,
+) -> Result<WorkflowMetricsSummary> {
+    let mut runs = load_completed_pi_workflow_runs(pool, &options.queue).await?;
+    if let Some(since) = &options.since {
+        runs.retain(|run| run.created_at >= *since);
+    }
+    if let Some(until) = &options.until {
+        runs.retain(|run| run.created_at <= *until);
+    }
+    runs.sort_by(|left, right| {
+        right
+            .created_epoch
+            .cmp(&left.created_epoch)
+            .then_with(|| right.agent_run_id.cmp(&left.agent_run_id))
+    });
+    let uses_date_window = options.since.is_some() || options.until.is_some();
+    if !uses_date_window {
+        runs.truncate(options.recent.max(1));
+    }
+    let run_refs = runs.iter().collect::<Vec<_>>();
+    let window = build_recent_efficiency_window("workflow", &run_refs);
+    let mut tool_call_counts = BTreeMap::new();
+    let mut shell_command_counts = BTreeMap::new();
+    let mut hint_counts = BTreeMap::new();
+    for run in &runs {
+        merge_counts(
+            &mut tool_call_counts,
+            json_counts(run.tool_call_counts_json.as_deref()),
+        );
+        merge_counts(
+            &mut shell_command_counts,
+            json_counts(run.shell_command_counts_json.as_deref()),
+        );
+        for hint in json_strings(run.efficiency_hints_json.as_deref()) {
+            *hint_counts.entry(hint).or_insert(0) += 1;
+        }
+    }
+    let mut cautions = vec![
+        "completed pi Agent Runs only; active, failed, fake, and non-pi runs are excluded".to_string(),
+        "token and context metrics may be unavailable; unknown values are shown as unknown/null, not zero".to_string(),
+        "report exports only sanitized numeric summaries; raw prompts, transcripts, Launcher Session Data payloads, tool arguments, Workpad Notes, shell commands, and shell output are omitted".to_string(),
+    ];
+    if window.runs_with_metrics < window.agent_runs {
+        cautions.push(format!(
+            "metric coverage: {}/{} completed pi Agent Run(s) have normalized metrics",
+            window.runs_with_metrics, window.agent_runs
+        ));
+    }
+    Ok(WorkflowMetricsSummary {
+        queue: options.queue.clone(),
+        filter: WorkflowMetricsFilter {
+            mode: if uses_date_window {
+                "date_window"
+            } else {
+                "recent"
+            }
+            .to_string(),
+            recent: (!uses_date_window).then_some(options.recent.max(1)),
+            since: options.since.clone(),
+            until: options.until.clone(),
+        },
+        run_count: window.agent_runs,
+        runs_with_metrics: window.runs_with_metrics,
+        token_summary: WorkflowTokenSummary {
+            input_tokens: window.input_tokens,
+            output_tokens: window.output_tokens,
+            total_tokens: window.total_tokens,
+            cache_read_tokens: window.cache_read_tokens,
+            cache_write_tokens: window.cache_write_tokens,
+            max_context_tokens: window.max_context_tokens,
+        },
+        tool_call_summary: WorkflowToolCallSummary {
+            tool_calls: window.tool_calls,
+            tool_errors: window.tool_errors,
+            repeated_failed_tool_attempts: window.repeated_failed_tool_attempts,
+            tool_call_counts,
+            top_shell_command_categories: top_counts(&shell_command_counts, 10),
+            shell_command_counts,
+        },
+        duration_summary: WorkflowDurationSummary {
+            completed_run_count: runs
+                .iter()
+                .filter(|run| run.duration_seconds.is_some())
+                .count(),
+            seconds: window.duration_seconds,
+        },
+        repeated_read_count: runs
+            .iter()
+            .map(|run| run.repeated_read_count.unwrap_or(0))
+            .sum(),
+        repeated_tasker_context_fetch_count: runs
+            .iter()
+            .map(|run| run.repeated_tasker_context_fetch_count.unwrap_or(0))
+            .sum(),
+        transcript_byte_summary: window.transcript_bytes,
+        efficiency_hint_frequencies: hint_counts,
+        cautions,
+    })
+}
+
+async fn load_completed_pi_workflow_runs(
+    pool: &SqlitePool,
+    queue: &str,
+) -> Result<Vec<TelemetryRunRow>> {
+    sqlx::query_as::<_, TelemetryRunRow>(
+        r#"
+        SELECT
+            tasks.identifier AS task_identifier,
+            tasks.title AS task_title,
+            agent_runs.id AS agent_run_id,
+            agent_runs.outcome AS outcome,
+            agent_runs.failure_reason AS failure_reason,
+            agent_runs.failure_reason_code AS failure_reason_code,
+            agent_runs.created_at AS created_at,
+            unixepoch(agent_runs.created_at) AS created_epoch,
+            agent_runs.finished_at AS finished_at,
+            NULL AS integrating_at,
+            CASE
+                WHEN COALESCE(launcher_session_data.finished_at, agent_runs.finished_at) IS NOT NULL
+                 AND COALESCE(launcher_session_data.started_at, agent_runs.created_at) IS NOT NULL
+                THEN CAST(strftime('%s', COALESCE(launcher_session_data.finished_at, agent_runs.finished_at)) AS INTEGER)
+                   - CAST(strftime('%s', COALESCE(launcher_session_data.started_at, agent_runs.created_at)) AS INTEGER)
+                ELSE NULL
+            END AS duration_seconds,
+            agent_run_metrics.tool_call_count AS tool_call_count,
+            agent_run_metrics.tool_error_count AS tool_error_count,
+            agent_run_metrics.repeated_failed_tool_attempt_count AS repeated_failed_tool_attempt_count,
+            agent_run_metrics.tool_call_counts_json AS tool_call_counts_json,
+            agent_run_metrics.repeated_read_count AS repeated_read_count,
+            agent_run_metrics.repeated_tasker_context_fetch_count AS repeated_tasker_context_fetch_count,
+            agent_run_metrics.shell_command_counts_json AS shell_command_counts_json,
+            agent_run_metrics.assistant_turn_count AS assistant_turn_count,
+            agent_run_metrics.user_turn_count AS user_turn_count,
+            agent_run_metrics.input_tokens AS input_tokens,
+            agent_run_metrics.output_tokens AS output_tokens,
+            agent_run_metrics.total_tokens AS total_tokens,
+            agent_run_metrics.cache_read_tokens AS cache_read_tokens,
+            agent_run_metrics.cache_write_tokens AS cache_write_tokens,
+            agent_run_metrics.max_context_tokens AS max_context_tokens,
+            agent_run_metrics.transcript_byte_size AS transcript_byte_size,
+            agent_run_metrics.efficiency_hints_json AS efficiency_hints_json
+        FROM agent_runs
+        JOIN tasks ON tasks.id = agent_runs.task_id
+        JOIN task_queues ON task_queues.id = agent_runs.task_queue_id
+        LEFT JOIN launcher_session_data ON launcher_session_data.agent_run_id = agent_runs.id
+        LEFT JOIN agent_run_metrics ON agent_run_metrics.agent_run_id = agent_runs.id
+        WHERE task_queues.key = ?
+          AND agent_runs.outcome = 'completed'
+          AND COALESCE(agent_run_metrics.launcher_kind, launcher_session_data.launcher_kind, agent_runs.launcher_kind) = 'pi'
+        ORDER BY agent_runs.created_at DESC, agent_runs.id DESC
+        "#,
+    )
+    .bind(queue)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("failed to load completed pi Workflow Metrics for Task Queue {queue}"))
+}
+
+fn json_strings(json: Option<&str>) -> Vec<String> {
+    json.and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
+        .unwrap_or_default()
+}
+
+pub fn render_workflow_metrics_summary(summary: &WorkflowMetricsSummary) -> String {
+    let mut output = String::new();
+    writeln!(output, "Workflow Metrics report").expect("write string");
+    writeln!(output, "Task Queue: {}", summary.queue).expect("write string");
+    match summary.filter.mode.as_str() {
+        "date_window" => writeln!(
+            output,
+            "filter: date window since={} until={}",
+            summary.filter.since.as_deref().unwrap_or("beginning"),
+            summary.filter.until.as_deref().unwrap_or("now")
+        ),
+        _ => writeln!(
+            output,
+            "filter: latest {} completed pi Agent Run(s)",
+            summary.filter.recent.unwrap_or(summary.run_count)
+        ),
+    }
+    .expect("write string");
+    writeln!(
+        output,
+        "runs: {} completed pi Agent Run(s), metrics on {}",
+        summary.run_count, summary.runs_with_metrics
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "tokens avg/high input={}/{} output={}/{} total={}/{} cache_read={}/{} cache_write={}/{} max_context={}/{}",
+        display_avg(summary.token_summary.input_tokens.average),
+        display_opt(summary.token_summary.input_tokens.high_water),
+        display_avg(summary.token_summary.output_tokens.average),
+        display_opt(summary.token_summary.output_tokens.high_water),
+        display_avg(summary.token_summary.total_tokens.average),
+        display_opt(summary.token_summary.total_tokens.high_water),
+        display_avg(summary.token_summary.cache_read_tokens.average),
+        display_opt(summary.token_summary.cache_read_tokens.high_water),
+        display_avg(summary.token_summary.cache_write_tokens.average),
+        display_opt(summary.token_summary.cache_write_tokens.high_water),
+        display_avg(summary.token_summary.max_context_tokens.average),
+        display_opt(summary.token_summary.max_context_tokens.high_water),
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "tool calls avg/high={} / {}; errors avg/high={} / {}; repeated failed tools avg/high={} / {}",
+        display_avg(summary.tool_call_summary.tool_calls.average),
+        display_opt(summary.tool_call_summary.tool_calls.high_water),
+        display_avg(summary.tool_call_summary.tool_errors.average),
+        display_opt(summary.tool_call_summary.tool_errors.high_water),
+        display_avg(summary.tool_call_summary.repeated_failed_tool_attempts.average),
+        display_opt(summary.tool_call_summary.repeated_failed_tool_attempts.high_water),
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "  tool calls by tool: {}",
+        render_counts(&summary.tool_call_summary.tool_call_counts)
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "  shell command categories: {}",
+        render_counts(&summary.tool_call_summary.shell_command_counts)
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "duration avg/high={} / {} across {} completed run(s); transcript bytes avg/high={} / {}",
+        display_avg(summary.duration_summary.seconds.average),
+        display_opt(summary.duration_summary.seconds.high_water),
+        summary.duration_summary.completed_run_count,
+        display_avg(summary.transcript_byte_summary.average),
+        display_opt(summary.transcript_byte_summary.high_water),
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "repeated reads: {}; repeated Tasker context fetches: {}",
+        summary.repeated_read_count, summary.repeated_tasker_context_fetch_count
+    )
+    .expect("write string");
+    writeln!(
+        output,
+        "efficiency hint frequencies: {}",
+        render_counts(&summary.efficiency_hint_frequencies)
+    )
+    .expect("write string");
     writeln!(output, "cautions:").expect("write string");
     for caution in &summary.cautions {
         writeln!(output, "  - {caution}").expect("write string");
@@ -4097,6 +4413,183 @@ mod tests {
         let json_text = json.to_string();
         assert!(!json_text.contains("secret brief"));
         assert!(!json_text.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn telemetry_workflow_metrics_aggregates_completed_pi_runs_with_filters() {
+        let pool = memory_pool().await;
+        sqlx::query(
+            r#"
+            INSERT INTO task_queues (
+                id, key, name, managed_source_repository, main_branch, worktree_root, branch_template
+            ) VALUES ('queue-1', 'TASK', 'Tasker', '/repo', 'main', '/worktrees', 'tasker/{task_identifier}')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("queue");
+        for (identifier, sequence, title) in [
+            ("TASK-1", 1, "Old pi"),
+            ("TASK-2", 2, "Recent pi"),
+            ("TASK-3", 3, "Failed pi"),
+            ("TASK-4", 4, "Fake launcher"),
+        ] {
+            sqlx::query(
+                "INSERT INTO tasks (id, task_queue_id, identifier, sequence, title, brief, priority, state) VALUES (?, 'queue-1', ?, ?, ?, 'secret brief', 'normal', 'done')",
+            )
+            .bind(identifier)
+            .bind(identifier)
+            .bind(sequence)
+            .bind(title)
+            .execute(&pool)
+            .await
+            .expect("task");
+        }
+        insert_run(
+            &pool,
+            "TASK-1",
+            "queue-1",
+            "old-pi",
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:10:00",
+            Some("completed"),
+            None,
+        )
+        .await;
+        insert_run(
+            &pool,
+            "TASK-2",
+            "queue-1",
+            "recent-pi",
+            "2026-01-02 00:00:00",
+            "2026-01-02 00:05:00",
+            Some("completed"),
+            None,
+        )
+        .await;
+        insert_run(
+            &pool,
+            "TASK-3",
+            "queue-1",
+            "failed-pi",
+            "2026-01-03 00:00:00",
+            "2026-01-03 00:01:00",
+            Some("failed"),
+            Some("secret failure"),
+        )
+        .await;
+        insert_run(
+            &pool,
+            "TASK-4",
+            "queue-1",
+            "fake-run",
+            "2026-01-04 00:00:00",
+            "2026-01-04 00:01:00",
+            Some("completed"),
+            None,
+        )
+        .await;
+        sqlx::query("UPDATE agent_runs SET launcher_kind = 'fake' WHERE id = 'fake-run'")
+            .execute(&pool)
+            .await
+            .expect("fake launcher");
+
+        for (run_id, tool_calls, reads, fetches, tokens, hints, launcher) in [
+            ("old-pi", 10, 1, 1, 1000, r#"["repeated file reads"]"#, "pi"),
+            (
+                "recent-pi",
+                20,
+                2,
+                3,
+                2000,
+                r#"["repeated file reads","large context growth"]"#,
+                "pi",
+            ),
+            ("failed-pi", 30, 3, 3, 3000, r#"["failed"]"#, "pi"),
+            ("fake-run", 40, 4, 4, 4000, r#"["fake"]"#, "fake"),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO agent_run_metrics (
+                    agent_run_id, launcher_kind, final_status, transcript_byte_size,
+                    input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
+                    tool_call_count, tool_error_count, repeated_failed_tool_attempt_count,
+                    tool_call_counts_json, repeated_read_count, repeated_tasker_context_fetch_count,
+                    shell_command_counts_json, assistant_turn_count, user_turn_count,
+                    max_context_tokens, efficiency_hints_json
+                ) VALUES (?, ?, 'completed', 100, 1, 2, ?, 3, 4, ?, 1, 1,
+                    '{"read":2,"bash":1}', ?, ?, '{"tasker_cli":1}', 1, 1, 5000, ?)
+                "#,
+            )
+            .bind(run_id)
+            .bind(launcher)
+            .bind(tokens)
+            .bind(tool_calls)
+            .bind(reads)
+            .bind(fetches)
+            .bind(hints)
+            .execute(&pool)
+            .await
+            .expect("metrics");
+        }
+
+        let recent = workflow_metrics_summary(
+            &pool,
+            &WorkflowMetricsOptions {
+                queue: "TASK".to_string(),
+                recent: 1,
+                since: None,
+                until: None,
+            },
+        )
+        .await
+        .expect("workflow recent");
+        assert_eq!(recent.run_count, 1);
+        assert_eq!(recent.tool_call_summary.tool_calls.high_water, Some(20));
+        assert_eq!(recent.repeated_read_count, 2);
+        assert_eq!(recent.repeated_tasker_context_fetch_count, 3);
+        assert_eq!(recent.token_summary.total_tokens.high_water, Some(2000));
+        assert_eq!(
+            recent
+                .efficiency_hint_frequencies
+                .get("large context growth"),
+            Some(&1)
+        );
+
+        let window = workflow_metrics_summary(
+            &pool,
+            &WorkflowMetricsOptions {
+                queue: "TASK".to_string(),
+                recent: 99,
+                since: Some("2026-01-01 00:00:00".to_string()),
+                until: Some("2026-01-02 23:59:59".to_string()),
+            },
+        )
+        .await
+        .expect("workflow window");
+        assert_eq!(window.filter.mode, "date_window");
+        assert_eq!(window.run_count, 2);
+        assert_eq!(window.runs_with_metrics, 2);
+        assert_eq!(
+            window.tool_call_summary.tool_call_counts.get("read"),
+            Some(&4)
+        );
+        assert_eq!(window.repeated_read_count, 3);
+        assert_eq!(
+            window
+                .efficiency_hint_frequencies
+                .get("repeated file reads"),
+            Some(&2)
+        );
+        let rendered = render_workflow_metrics_summary(&window);
+        assert!(rendered.contains("Workflow Metrics report"));
+        assert!(rendered.contains("runs: 2 completed pi Agent Run(s)"));
+        assert!(rendered.contains("repeated reads: 3"));
+        assert!(!rendered.contains("secret brief"));
+        assert!(!rendered.contains("secret failure"));
+        let json_text = serde_json::to_string(&window).expect("json");
+        assert!(!json_text.contains("secret brief"));
+        assert!(!json_text.contains("secret failure"));
     }
 
     #[tokio::test]
