@@ -11,9 +11,11 @@ beforeEach(() => {
   requests.length = 0;
   globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     requests.push({ url: String(url), init: init ?? {} });
-    const body = String(url).endsWith("/tasks/TASK-1")
-      ? { workpad_note: { body: "existing notes" } }
-      : { ok: true };
+    const body = String(url).endsWith("/tasks/TASK-1/context-bundle")
+      ? { task: { task: { identifier: "TASK-1" } }, queue: { key: "TASK" }, local_workflow: {}, agent_runs: [] }
+      : String(url).endsWith("/tasks/TASK-1")
+        ? { workpad_note: { body: "existing notes" } }
+        : { ok: true };
     return new Response(JSON.stringify(body), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -36,6 +38,28 @@ describe("TaskerClient", () => {
     expect(requests[0].url).toBe("http://tasker.test/tasks/TASK-1");
     expect(requests[0].init.method).toBe("GET");
     expect((requests[0].init.headers as Record<string, string>).authorization).toBe("Bearer token");
+  });
+
+  it("fetches the task context bundle from the narrow run-start endpoint", async () => {
+    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+
+    await client.getTaskContextBundle("TASK-1");
+
+    expect(requests[0].url).toBe("http://tasker.test/tasks/TASK-1/context-bundle");
+    expect(requests[0].init.method).toBe("GET");
+  });
+
+  it("rejects context bundles with raw transcript or launcher payload fields", async () => {
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      requests.push({ url: String(url), init: init ?? {} });
+      return new Response(JSON.stringify({ task: {}, queue: {}, local_workflow: {}, agent_runs: [], raw_json: "{}" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+
+    await expect(client.getTaskContextBundle("TASK-1")).rejects.toThrow("forbidden field raw_json");
   });
 
   it("updates workpad with actor", async () => {

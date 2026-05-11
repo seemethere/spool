@@ -658,6 +658,80 @@ pub struct TaskDetail {
     pub conflict_overlaps: Vec<TaskConflictOverlap>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskContextBundle {
+    pub task: TaskDetail,
+    pub queue: TaskContextQueue,
+    pub local_workflow: TaskLocalWorkflowContext,
+    pub agent_runs: Vec<TaskContextAgentRun>,
+    pub latest_failure: Option<TaskContextRunFailure>,
+    pub latest_integration_outcome: Option<TaskContextIntegrationOutcome>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskContextQueue {
+    pub key: String,
+    pub name: String,
+    pub delivery_backend: String,
+    pub main_branch: String,
+    pub managed_source_repository: String,
+    pub worktree_root: String,
+    pub branch_template: String,
+    pub queue_concurrency_limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskLocalWorkflowContext {
+    pub local_worktree: Option<String>,
+    pub task_branch: Option<String>,
+    pub main_branch: String,
+    pub managed_source_repository: String,
+    pub worktree_root: String,
+    pub branch_template: String,
+    pub delivery_backend: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct TaskContextAgentRun {
+    pub id: String,
+    pub worker_actor_kind: String,
+    pub worker_actor_id: String,
+    pub worker_actor_display_name: String,
+    pub worker_id: String,
+    pub launcher_kind: String,
+    pub lease_expires_at: String,
+    pub last_heartbeat_at: Option<String>,
+    pub outcome: Option<String>,
+    pub failure_reason: Option<String>,
+    pub failure_reason_code: Option<String>,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct TaskContextRunFailure {
+    pub agent_run_id: String,
+    pub outcome: String,
+    pub failure_reason: Option<String>,
+    pub failure_reason_code: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
+pub struct TaskContextIntegrationOutcome {
+    pub id: String,
+    pub agent_run_id: Option<String>,
+    pub outcome_kind: String,
+    pub final_commit: Option<String>,
+    pub pre_merge_head: Option<String>,
+    pub message: Option<String>,
+    pub retryable: bool,
+    pub retry_attempt: Option<i64>,
+    pub next_retry_at: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
 pub struct QueueStatus {
     pub queue_key: String,
@@ -1357,6 +1431,127 @@ pub async fn get_task_detail(pool: &SqlitePool, identifier: &str) -> Result<Opti
         conflict_hints,
         conflict_overlaps,
     }))
+}
+
+pub async fn get_task_context_bundle(
+    pool: &SqlitePool,
+    identifier: &str,
+) -> Result<Option<TaskContextBundle>> {
+    let Some(task) = get_task_detail(pool, identifier).await? else {
+        return Ok(None);
+    };
+    let queue = get_task_queue(pool, &task.task.task_queue_key)
+        .await?
+        .with_context(|| format!("Task Queue {} not found", task.task.task_queue_key))?;
+    let local_worktree = primary_task_link_target(&task.task_links, "local_worktree");
+    let task_branch = primary_task_link_target(&task.task_links, "task_branch");
+
+    let agent_runs = sqlx::query_as::<_, TaskContextAgentRun>(
+        r#"
+        SELECT
+            id,
+            worker_actor_kind,
+            worker_actor_id,
+            worker_actor_display_name,
+            worker_id,
+            launcher_kind,
+            lease_expires_at,
+            last_heartbeat_at,
+            outcome,
+            failure_reason,
+            failure_reason_code,
+            created_at,
+            finished_at,
+            outcome IS NULL AND lease_expires_at > CURRENT_TIMESTAMP AS is_active
+        FROM agent_runs
+        WHERE task_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 5
+        "#,
+    )
+    .bind(&task.task.id)
+    .fetch_all(pool)
+    .await
+    .context("failed to load recent Agent Runs for Task context bundle")?;
+
+    let latest_failure = sqlx::query_as::<_, TaskContextRunFailure>(
+        r#"
+        SELECT
+            id AS agent_run_id,
+            outcome AS outcome,
+            failure_reason,
+            failure_reason_code,
+            finished_at
+        FROM agent_runs
+        WHERE task_id = ?
+          AND outcome IS NOT NULL
+          AND outcome != 'completed'
+        ORDER BY finished_at DESC, created_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(&task.task.id)
+    .fetch_optional(pool)
+    .await
+    .context("failed to load latest Agent Run failure for Task context bundle")?;
+
+    let latest_integration_outcome = sqlx::query_as::<_, TaskContextIntegrationOutcome>(
+        r#"
+        SELECT
+            id,
+            agent_run_id,
+            outcome_kind,
+            final_commit,
+            pre_merge_head,
+            message,
+            retryable,
+            retry_attempt,
+            next_retry_at,
+            created_at
+        FROM integration_outcomes
+        WHERE task_id = ?
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(&task.task.id)
+    .fetch_optional(pool)
+    .await
+    .context("failed to load latest Integration Outcome for Task context bundle")?;
+
+    Ok(Some(TaskContextBundle {
+        task,
+        queue: TaskContextQueue {
+            key: queue.key,
+            name: queue.name,
+            delivery_backend: queue.delivery_backend.clone(),
+            main_branch: queue.main_branch.clone(),
+            managed_source_repository: queue.managed_source_repository.clone(),
+            worktree_root: queue.worktree_root.clone(),
+            branch_template: queue.branch_template.clone(),
+            queue_concurrency_limit: queue.queue_concurrency_limit,
+        },
+        local_workflow: TaskLocalWorkflowContext {
+            local_worktree,
+            task_branch,
+            main_branch: queue.main_branch,
+            managed_source_repository: queue.managed_source_repository,
+            worktree_root: queue.worktree_root,
+            branch_template: queue.branch_template,
+            delivery_backend: queue.delivery_backend,
+        },
+        agent_runs,
+        latest_failure,
+        latest_integration_outcome,
+    }))
+}
+
+fn primary_task_link_target(task_links: &[TaskLink], kind: &str) -> Option<String> {
+    task_links
+        .iter()
+        .find(|link| link.kind == kind && link.is_primary)
+        .or_else(|| task_links.iter().find(|link| link.kind == kind))
+        .map(|link| link.target.clone())
 }
 
 pub async fn upsert_task_link(

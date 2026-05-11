@@ -14,6 +14,12 @@ export class TaskerClient {
     return this.request("GET", `/tasks/${encodeURIComponent(identifier)}`, undefined, signal);
   }
 
+  async getTaskContextBundle(identifier: string, signal?: AbortSignal): Promise<unknown> {
+    const bundle = await this.request("GET", `/tasks/${encodeURIComponent(identifier)}/context-bundle`, undefined, signal);
+    validateTaskContextBundle(bundle);
+    return bundle;
+  }
+
   updateWorkpad(identifier: string, actor: Actor, body: string, signal?: AbortSignal): Promise<unknown> {
     return this.request("PUT", `/tasks/${encodeURIComponent(identifier)}/workpad`, { actor, body }, signal);
   }
@@ -114,6 +120,29 @@ function workpadBody(task: unknown): string {
   if (!note || typeof note !== "object" || !("body" in note)) return "";
   const body = (note as { body?: unknown }).body;
   return typeof body === "string" ? body : "";
+}
+
+function validateTaskContextBundle(bundle: unknown): void {
+  if (!bundle || typeof bundle !== "object") throw new Error("Task context bundle must be an object");
+  const value = bundle as Record<string, unknown>;
+  if (!value.task || typeof value.task !== "object") throw new Error("Task context bundle missing task");
+  if (!value.queue || typeof value.queue !== "object") throw new Error("Task context bundle missing queue");
+  if (!value.local_workflow || typeof value.local_workflow !== "object") {
+    throw new Error("Task context bundle missing local_workflow");
+  }
+  if (!Array.isArray(value.agent_runs)) throw new Error("Task context bundle missing agent_runs");
+  rejectForbiddenContextKeys(value);
+}
+
+function rejectForbiddenContextKeys(value: unknown): void {
+  if (!value || typeof value !== "object") return;
+  for (const [key, child] of Object.entries(value)) {
+    const normalized = key.toLowerCase();
+    if (normalized === "raw_json" || normalized.includes("transcript")) {
+      throw new Error(`Task context bundle contains forbidden field ${key}`);
+    }
+    rejectForbiddenContextKeys(child);
+  }
 }
 
 export function configFromEnv(env: Record<string, string | undefined> = process.env): TaskerExtensionConfig {

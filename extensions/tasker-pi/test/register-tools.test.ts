@@ -24,6 +24,7 @@ describe("registerTaskerExtension", () => {
       "tasker_append_workpad",
       "tasker_create_child_task",
       "tasker_get_task",
+      "tasker_get_task_context_bundle",
       "tasker_report_worker_status",
       "tasker_request_transition",
       "tasker_set_acceptance_criterion_status",
@@ -44,6 +45,7 @@ describe("registerTaskerExtension", () => {
     registerTaskerExtension(pi);
 
     const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool.parameters]));
+    expect(byName.tasker_get_task_context_bundle.properties.identifier.description).toBe("Task Identifier, such as TASKER-1");
     expect(byName.tasker_set_acceptance_criterion_status.properties.status.anyOf.map((item: any) => item.const)).toEqual([
       "pending",
       "satisfied",

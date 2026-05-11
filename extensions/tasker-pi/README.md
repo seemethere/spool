@@ -17,6 +17,7 @@ Set these environment variables before loading the extension:
 ## Tools
 
 - `tasker_get_task`
+- `tasker_get_task_context_bundle` fetches the preferred run-start bundle for Worker Agents: Task Brief, structured requirements, Workpad Note, Task Links, Task Conflict Hints, Task Queue key/config, Local Worktree and Task Branch links, recent Agent Runs, and latest failure/integration summaries. Use this before broad repository discovery instead of repeated `task show`, status, queue, or run lookups.
 - `tasker_update_workpad` replaces the Task's singleton Workpad Note body.
 - `tasker_append_workpad` fetches the current Workpad Note and appends Markdown before saving it, so Worker Agents can add evidence or handoff notes without manually reconstructing the whole note.
 - `tasker_set_acceptance_criterion_status` accepts `pending`, `satisfied`, or `waived`.
@@ -25,7 +26,7 @@ Set these environment variables before loading the extension:
 - `tasker_request_transition` accepts the fixed v1 Task State values.
 - `tasker_report_worker_status` records supervisor-only status (`completion_intent`, `blocked`, or `retryable_failure`) without changing Tasker state.
 
-All mutations send explicit Tasker Actor attribution. The extension does not shell out to the Tasker CLI. Existing replace-style Workpad Note updates remain available for callers that need to rewrite the full note. Worker status reports are a local supervisor contract, not authoritative Tasker state.
+All mutations send explicit Tasker Actor attribution. The extension does not shell out to the Tasker CLI. Existing replace-style Workpad Note updates remain available for callers that need to rewrite the full note. Worker status reports are a local supervisor contract, not authoritative Tasker state. The context bundle is read-only and intentionally excludes raw Run Transcript bodies, raw launcher payloads, secrets, and unrelated queue data.
 
 ## Worker Loop usage
 

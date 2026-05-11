@@ -92,6 +92,17 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "tasker_get_task_context_bundle",
+    label: "Tasker: Get Task Context Bundle",
+    description:
+      "Fetch the read-only Tasker-owned run-start context bundle for a Worker Agent without raw transcripts, raw launcher payloads, secrets, or unrelated queue data.",
+    parameters: Type.Object({ identifier: Identifier }),
+    async execute(_id, params, signal) {
+      return asToolResult(await client.getTaskContextBundle(params.identifier, signal));
+    },
+  });
+
+  pi.registerTool({
     name: "tasker_update_workpad",
     label: "Tasker: Update Workpad",
     description: "Replace the Task's singleton Workpad Note body.",

@@ -104,6 +104,10 @@ pub fn router(app_version: impl Into<String>, pool: SqlitePool) -> Router {
         .route("/queues/{key}/claim-next", post(claim_next))
         .route("/tasks/bootstrap", post(create_task))
         .route("/tasks/{identifier}", get(get_task))
+        .route(
+            "/tasks/{identifier}/context-bundle",
+            get(get_task_context_bundle),
+        )
         .route("/tasks/{identifier}/child-tasks", post(create_child_task))
         .route(
             "/tasks/{identifier}/workpad",
@@ -211,6 +215,24 @@ async fn get_task(
         .map_err(internal_error)?
     {
         Some(task) => Ok(Json(task)),
+        None => Err(error_response(
+            StatusCode::NOT_FOUND,
+            format!("Task {identifier} not found"),
+        )),
+    }
+}
+
+async fn get_task_context_bundle(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+) -> Result<Json<tasker_db::TaskContextBundle>, (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    match tasker_db::get_task_context_bundle(&state.pool, &identifier)
+        .await
+        .map_err(internal_error)?
+    {
+        Some(bundle) => Ok(Json(bundle)),
         None => Err(error_response(
             StatusCode::NOT_FOUND,
             format!("Task {identifier} not found"),
@@ -1074,6 +1096,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_context_bundle_includes_workflow_context_without_raw_launcher_payloads() {
+        let (_temp, pool, token) = migrated_pool().await;
+        let app = router("test-version", pool.clone());
+        assert_eq!(
+            app.clone()
+                .oneshot(create_queue_request("TASK", "Tasker", "operator", &token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(create_task_request("TASK", "Bundle", "operator", &token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(update_workpad_request(
+                    "TASK-1",
+                    "run-start notes",
+                    "worker_agent",
+                    &token,
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let operator = tasker_db::Actor::operator("tester");
+        tasker_db::upsert_task_link(
+            &pool,
+            "TASK-1",
+            &tasker_db::UpsertTaskLink {
+                kind: "local_worktree".to_string(),
+                target: "/worktrees/TASK-1".to_string(),
+                label: Some("Local Worktree".to_string()),
+                is_primary: true,
+            },
+            &operator,
+        )
+        .await
+        .unwrap();
+        tasker_db::upsert_task_link(
+            &pool,
+            "TASK-1",
+            &tasker_db::UpsertTaskLink {
+                kind: "task_branch".to_string(),
+                target: "tasker/TASK-1".to_string(),
+                label: None,
+                is_primary: true,
+            },
+            &operator,
+        )
+        .await
+        .unwrap();
+
+        let claim = app
+            .clone()
+            .oneshot(claim_next_request("TASK", "worker_agent", &token))
+            .await
+            .unwrap();
+        assert_eq!(claim.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(claim.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let claim_json: Value = serde_json::from_slice(&body).unwrap();
+        let run_id = claim_json["run"]["id"].as_str().unwrap();
+        tasker_db::record_integration_outcome(
+            &pool,
+            &tasker_db::RecordIntegrationOutcomeInput {
+                task_identifier: "TASK-1".to_string(),
+                agent_run_id: Some(run_id.to_string()),
+                outcome_kind: "operational_failure".to_string(),
+                final_commit: None,
+                pre_merge_head: Some("abc123".to_string()),
+                message: Some("conflict while merging".to_string()),
+                retryable: true,
+                retry_attempt: Some(1),
+                retry_delay_seconds: Some(60),
+            },
+            &operator,
+        )
+        .await
+        .unwrap();
+
+        let response = app
+            .oneshot(authorized_get("/tasks/TASK-1/context-bundle", &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["task"]["task"]["brief"],
+            "Implement the requested API behavior."
+        );
+        assert_eq!(json["task"]["workpad_note"]["body"], "run-start notes");
+        assert_eq!(
+            json["task"]["conflict_hints"][0]["target"],
+            "crates/tasker-server/src/lib.rs"
+        );
+        assert_eq!(
+            json["local_workflow"]["local_worktree"],
+            "/worktrees/TASK-1"
+        );
+        assert_eq!(json["local_workflow"]["task_branch"], "tasker/TASK-1");
+        assert_eq!(json["queue"]["key"], "TASK");
+        assert_eq!(json["agent_runs"][0]["id"], run_id);
+        assert_eq!(json["agent_runs"][0]["is_active"], true);
+        assert_eq!(
+            json["latest_integration_outcome"]["outcome_kind"],
+            "operational_failure"
+        );
+        assert!(json.to_string().find("raw_json").is_none());
+        assert!(json.to_string().find("transcript").is_none());
+    }
+
+    #[tokio::test]
+    async fn task_context_bundle_allows_absent_optional_fields() {
+        let (_temp, pool, token) = migrated_pool().await;
+        let app = router("test-version", pool);
+        assert_eq!(
+            app.clone()
+                .oneshot(create_queue_request("TASK", "Tasker", "operator", &token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(create_task_request("TASK", "Bundle", "operator", &token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+
+        let response = app
+            .oneshot(authorized_get("/tasks/TASK-1/context-bundle", &token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["task"]["workpad_note"], Value::Null);
+        assert_eq!(json["local_workflow"]["local_worktree"], Value::Null);
+        assert_eq!(json["agent_runs"].as_array().unwrap().len(), 0);
+        assert_eq!(json["latest_failure"], Value::Null);
+        assert_eq!(json["latest_integration_outcome"], Value::Null);
+    }
+
+    #[tokio::test]
     async fn missing_task_returns_not_found() {
         let (_temp, pool, token) = migrated_pool().await;
         let response = router("test-version", pool)
@@ -1337,7 +1520,8 @@ mod tests {
             "review_required": false,
             "acceptance_criteria": ["It works"],
             "validation_items": ["cargo test passes"],
-            "tags": ["api"]
+            "tags": ["api"],
+            "conflict_hints": ["crates/tasker-server/src/lib.rs"]
         })
     }
 
