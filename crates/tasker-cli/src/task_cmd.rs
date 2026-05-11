@@ -8,7 +8,7 @@ pub(crate) async fn task(
 ) -> Result<()> {
     if let TaskCommand::Lint { file } = &command {
         let input = bootstrap::lint_bootstrap_task_file(file)?;
-        println!("valid bootstrap task file");
+        println!("valid file-backed task definition");
         println!("title: {}", input.title);
         println!("priority: {}", input.priority);
         println!("state: {}", input.state);
@@ -21,12 +21,27 @@ pub(crate) async fn task(
         TaskCommand::Create {
             bootstrap,
             queue,
+            from_file,
             file,
             actor,
         } => {
-            if !bootstrap {
-                anyhow::bail!("task create currently requires --bootstrap");
-            }
+            let file = match (from_file, file) {
+                (Some(file), None) => file,
+                (None, Some(file)) if bootstrap => file,
+                (None, Some(_)) => {
+                    anyhow::bail!(
+                        "task create --file is the Bootstrap Task Creation compatibility path and requires --bootstrap; prefer task create --from-file"
+                    );
+                }
+                (None, None) => {
+                    anyhow::bail!(
+                        "task create requires a file-backed Task definition; use --from-file <task.md>"
+                    );
+                }
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("task create accepts only one of --from-file or --file");
+                }
+            };
             let parsed = bootstrap::parse_bootstrap_task_file_with_warnings(&queue, &file)?;
             for warning in &parsed.warnings {
                 eprintln!("warning: {warning}");

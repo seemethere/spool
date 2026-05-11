@@ -1,12 +1,48 @@
 use std::fs;
 
-use clap::CommandFactory;
+use clap::{CommandFactory, Parser};
 
 use super::*;
 
 #[test]
 fn cli_definition_is_valid() {
     Cli::command().debug_assert();
+}
+
+#[test]
+fn task_create_parses_preferred_from_file_shape() {
+    let cli = Cli::try_parse_from([
+        "tasker",
+        "task",
+        "create",
+        "--queue",
+        "TASK",
+        "--from-file",
+        "task.md",
+    ])
+    .expect("parse preferred file-backed create command");
+
+    match cli.command.expect("command") {
+        Command::Task {
+            command:
+                TaskCommand::Create {
+                    bootstrap,
+                    queue,
+                    from_file,
+                    file,
+                    ..
+                },
+        } => {
+            assert!(!bootstrap);
+            assert_eq!(queue, "TASK");
+            assert_eq!(
+                from_file.expect("from file"),
+                std::path::PathBuf::from("task.md")
+            );
+            assert!(file.is_none());
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
 }
 
 #[test]
@@ -268,7 +304,8 @@ fn project_config_guard_refuses_mutating_command_when_inactive() {
             command: TaskCommand::Create {
                 bootstrap: true,
                 queue: "TASK".to_string(),
-                file: repo.join("task.md"),
+                from_file: None,
+                file: Some(repo.join("task.md")),
                 actor: "tester".to_string(),
             },
         }),
@@ -310,7 +347,8 @@ fn project_config_guard_allows_explicit_config_for_mutating_command() {
             command: TaskCommand::Create {
                 bootstrap: true,
                 queue: "TASK".to_string(),
-                file: repo.join("task.md"),
+                from_file: None,
+                file: Some(repo.join("task.md")),
                 actor: "tester".to_string(),
             },
         }),
@@ -649,7 +687,8 @@ fn active_context_for_task_creation_renders_paths_and_queue_key() {
         command: TaskCommand::Create {
             bootstrap: true,
             queue: "TASK".to_string(),
-            file: temp.path().join("task.md"),
+            from_file: None,
+            file: Some(temp.path().join("task.md")),
             actor: "tester".to_string(),
         },
     });
@@ -880,7 +919,8 @@ Implement Bootstrap Task Creation.
         TaskCommand::Create {
             bootstrap: true,
             queue: "TASK".to_string(),
-            file: task_file,
+            from_file: None,
+            file: Some(task_file),
             actor: "tester".to_string(),
         },
     )
@@ -1116,7 +1156,8 @@ Implement Bootstrap Task Creation.
         TaskCommand::Create {
             bootstrap: true,
             queue: "TASK".to_string(),
-            file: temp.path().join("task.md"),
+            from_file: None,
+            file: Some(temp.path().join("task.md")),
             actor: "tester".to_string(),
         },
     )
@@ -1568,7 +1609,8 @@ Implement priority alias normalization.
         TaskCommand::Create {
             bootstrap: true,
             queue: "TASK".to_string(),
-            file: task_file,
+            from_file: None,
+            file: Some(task_file),
             actor: "tester".to_string(),
         },
     )
@@ -1581,6 +1623,89 @@ Implement priority alias normalization.
         .expect("get task")
         .expect("task exists");
     assert_eq!(detail.task.priority, "normal");
+}
+
+#[tokio::test]
+async fn file_backed_create_accepts_from_file_without_bootstrap_flag() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = TaskerPaths::resolve(temp.path(), PathOverrides::default());
+    init(&paths, false).await.expect("init");
+    let repo = temp.path().join("repo");
+    init_git_repo(&repo);
+    queue(
+        &paths,
+        false,
+        QueueCommand::Create {
+            key: "TASK".to_string(),
+            name: "Tasker".to_string(),
+            managed_source_repository: repo,
+            main_branch: "main".to_string(),
+            worktree_root: temp.path().join("worktrees"),
+            branch_template: "tasker/{task_identifier}".to_string(),
+            done_worktree_retention: false,
+            queue_concurrency_limit: None,
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect("create queue");
+
+    let task_file = temp.path().join("task.md");
+    fs::write(
+        &task_file,
+        "---\ntitle: File-backed create\nacceptance_criteria:\n  - Preferred flag works\nvalidation_items:\n  - Task is persisted\n---\nBrief\n",
+    )
+    .expect("write task file");
+
+    task(
+        &paths,
+        false,
+        TaskCommand::Create {
+            bootstrap: false,
+            queue: "TASK".to_string(),
+            from_file: Some(task_file),
+            file: None,
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect("create task from file");
+
+    let pool = tasker_db::connect(&paths.db_path).await.expect("connect");
+    let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+        .await
+        .expect("get task")
+        .expect("task exists");
+    assert_eq!(detail.task.title, "File-backed create");
+}
+
+#[tokio::test]
+async fn file_compatibility_flag_still_requires_bootstrap() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = TaskerPaths::resolve(temp.path(), PathOverrides::default());
+    init(&paths, false).await.expect("init");
+    let task_file = temp.path().join("task.md");
+    fs::write(
+        &task_file,
+        "---\ntitle: Legacy file\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Error is clear\n---\nBrief\n",
+    )
+    .expect("write task file");
+
+    let error = task(
+        &paths,
+        false,
+        TaskCommand::Create {
+            bootstrap: false,
+            queue: "TASK".to_string(),
+            from_file: None,
+            file: Some(task_file),
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect_err("--file without --bootstrap should fail");
+
+    assert!(error.to_string().contains("prefer task create --from-file"));
 }
 
 #[test]

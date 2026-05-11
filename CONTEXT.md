@@ -57,8 +57,12 @@ The point where Tasker development work starts being managed as real Tasker **Ta
 _Avoid_: Full v1 completion, polished launch
 
 **Bootstrap Task Creation**:
-A temporary dogfooding shortcut for creating a **Task** from a Markdown file with YAML front matter before the full **Delegation Session** is ready.
+A temporary dogfooding reason for the early **File-backed Task Creation** implementation before the full **Delegation Session** is ready. Operators should not need to think in terms of bootstrap when creating file-backed **Tasks**.
 _Avoid_: Permanent manual intake model
+
+**File-backed Task Creation**:
+Creating a **Task** from a Markdown file with YAML front matter for structured **Task** fields and a Markdown body for the **Task Brief**. The preferred CLI shape is `tasker task create --queue <key> --from-file task.md`.
+_Avoid_: Bootstrap as user-facing command language, separate intake workflow
 
 **Manual Dogfood Merge**:
 A temporary dogfooding practice where the human inspects and merges a completed **Local Worktree** before automatic **Integrating** is implemented.
@@ -458,7 +462,7 @@ _Avoid_: Separate progress comment
 - A **Task** may have many **Task Conflict Hints**.
 - **Task Conflict Hints** are advisory and do not block claiming by default.
 - Operators use **Task Conflict Hints** during dogfooding to sequence or review overlapping Ready or In Progress Tasks more deliberately.
-- **Bootstrap Task Creation** may populate **Task Conflict Hints** from structured YAML front matter; Workpad Note Markdown remains narrative and is not authoritative for gates or scheduling.
+- **File-backed Task Creation** may populate **Task Conflict Hints** from structured YAML front matter; Workpad Note Markdown remains narrative and is not authoritative for gates or scheduling.
 - A **Task** may have many **Task Links**.
 - A **Delivery Adapter** performs **Delivery Backend** operations outside Tasker.
 - Tasker stores **Delivery Records** and **Integration Outcomes**.
@@ -568,7 +572,7 @@ _Avoid_: Separate progress comment
 - `tasker merge retry` is an **Operator** recovery command that retries Local Worktree Delivery for an **Integrating** **Task** after a retryable **Operational Delivery Failure** without launching a new **Agent Run**.
 - `tasker supervise --watch` keeps polling a **Task Queue** for newly eligible **Tasks** until timeout or interruption instead of exiting when a bounded batch drains.
 - `tasker supervise` retries due **Integrating** Tasks after retryable **Operational Delivery Failures** without launching a new **Agent Run**.
-- Dogfooding API covers health/version, queue create/show/list, bootstrap task create, task show, claim-next, heartbeat, finish-run, Workpad Note update, criterion/validation status update, child task creation, state transition request, local worktree/delivery metadata, status summary, run show, and operator recovery for failed or stuck work.
+- Dogfooding API covers health/version, queue create/show/list, file-backed task create, task show, claim-next, heartbeat, finish-run, Workpad Note update, criterion/validation status update, child task creation, state transition request, local worktree/delivery metadata, status summary, run show, and operator recovery for failed or stuck work.
 - Search, bulk edits, review sessions, metrics export, and token admin APIs are deferred until after **Dogfooding Readiness**.
 - Dogfooding persistence includes queues, tasks, acceptance criteria, validation items, workpad notes/revisions, task links, task relationships, agent runs/heartbeats, delivery records, launcher session data, audit events, and API tokens.
 - **Dogfooding Readiness** comes before full v1 polish.
@@ -587,13 +591,15 @@ _Avoid_: Separate progress comment
 - **Subagent Review Loop** reviewers are advisory development helpers and are distinct from Tasker's domain **Review Agent**.
 - **Oracle Escalation** is used when a reviewer finding, implementation discovery, or user instruction exposes a conflict with documented architecture, security, persistence semantics, task lifecycle, delivery behavior, launcher behavior, or domain language.
 - **Dogfooding Cutover** occurs when Tasker development work starts being created and tracked as real Tasker **Tasks**.
-- The first **Dogfooding Cutover** target is after roadmap Milestone 2, when **Bootstrap Task Creation**, **Task Queues**, task show/status, **Workpad Notes**, and **Audit Events** are usable for real Tasker development work.
+- The first **Dogfooding Cutover** target is after roadmap Milestone 2, when **File-backed Task Creation**, **Task Queues**, task show/status, **Workpad Notes**, and **Audit Events** are usable for real Tasker development work.
 - **Dogfooding Readiness** requires enough init/config, queue setup, delegation or temporary task creation, one-shot work, local worktree handling, work updates, and status visibility to build Tasker with Tasker.
 - **Dogfooding Readiness** uses single-worker execution only.
 - During dogfooding, active **Agent Runs** for **Integrating** **Tasks** share the same **Queue Concurrency Limit** as coding and rework runs; operators unblock saturation by waiting for completion or **Claim Lease** expiry, failing stuck runs, or raising/clearing the limit only if local resources permit.
-- **Bootstrap Task Creation** uses `tasker task create --bootstrap --queue <key> --file task.md`.
-- A bootstrap task file uses YAML front matter for title, acceptance criteria, validation items, priority, state, tags, review requirement, advisory conflict hints, and blocking Task identifiers, with the Markdown body as the **Task Brief**. Priority values are stored canonically as **urgent**, **high**, **normal**, or **low**; Bootstrap Task Creation accepts the safe priority alias `medium` and normalizes it to **normal** with a CLI warning. The canonical example lives at `.tasker/bootstrap-tasks/TEMPLATE.md`.
-- **Bootstrap Task Creation** defaults to **Ready** when the task file does not specify state.
+- **File-backed Task Creation** uses `tasker task create --queue <key> --from-file task.md` as the preferred CLI shape.
+- The existing `tasker task create --bootstrap --queue <key> --file task.md` command remains a compatibility path for the temporary **Bootstrap Task Creation** escape hatch until a deliberate migration removes or aliases the old spelling.
+- A file-backed Task definition uses YAML front matter for title, acceptance criteria, validation items, priority, state, tags, review requirement, advisory conflict hints, and blocking Task identifiers, with the Markdown body as the **Task Brief**. Priority values are stored canonically as **urgent**, **high**, **normal**, or **low**; File-backed Task Creation accepts the safe priority alias `medium` and normalizes it to **normal** with a CLI warning. The canonical example currently lives at `.tasker/bootstrap-tasks/TEMPLATE.md`.
+- **File-backed Task Creation** defaults to **Ready** when the task file does not specify state.
+- Dependency-aware multi-file Task creation should extend **File-backed Task Creation** input handling by reading multiple file definitions and recording explicit blocking **Task** relationships; it is not a separate workflow concept.
 - **Bootstrap Task Creation** does not replace long-term agent-mediated intake.
 - **Manual Dogfood Merge** may be used before automatic **Integrating** is implemented.
 - **Manual Dogfood Merge** does not replace the full MVP requirement for Agent-Gated **Integrating** and **Squash Merge**.
@@ -693,7 +699,7 @@ _Avoid_: Separate progress comment
 - "retry continuity" could mean resuming hidden pi chat history — resolved: each **Agent Run** starts a fresh **Pi RPC Session**; durable continuity lives in Tasker/worktree data.
 - "failed run retry" could mean immediate re-claim — resolved: failed or expired runs create **Retry Holds** with backoff.
 - "task intake" could mean humans entering work directly — resolved: normal v1 intake is agent delegation through `tasker delegate`; humans delegate to agents rather than creating Tasks themselves.
-- "bootstrap task creation" could become permanent manual intake — resolved: **Bootstrap Task Creation** is a temporary dogfooding shortcut only.
+- "bootstrap task creation" could become permanent manual intake — resolved: **File-backed Task Creation** is the user-facing concept, while **Bootstrap Task Creation** is only the temporary dogfooding reason it exists before full delegation.
 - "Backlog refinement" could mean manual field editing — resolved: use `tasker delegate --refine` and a **Delegation Interview**.
 - "grill-me-with-docs" refers to the existing grill-with-docs-style interaction — resolved: call the Tasker intake flow a **Delegation Interview**.
 - "documentation-aware delegation" could imply editing docs on the main repository during intake — resolved: delegation reads docs and creates Tasker work; repo edits happen in Worker Agent worktrees.

@@ -1,8 +1,9 @@
 ---
-# Canonical Bootstrap Task Creation front matter.
-# Create with: tasker task create --bootstrap --queue <TASK_QUEUE_KEY> --file .tasker/bootstrap-tasks/<task>.md
+# Canonical File-backed Task Creation front matter.
+# Create with: tasker task create --queue <TASK_QUEUE_KEY> --from-file .tasker/bootstrap-tasks/<task>.md
+# Compatibility path: tasker task create --bootstrap --queue <TASK_QUEUE_KEY> --file .tasker/bootstrap-tasks/<task>.md
 # Accepted priority values: urgent, high, normal, low.
-# Bootstrap Task Creation accepts only backlog or ready as initial Task States; omit state to default to ready.
+# File-backed Task Creation accepts only backlog or ready as initial Task States; omit state to default to ready.
 title: Replace with a concise Task outcome
 priority: normal
 state: ready

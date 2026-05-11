@@ -126,9 +126,10 @@ Add migrations incrementally by milestone.
    - **Validation Items**
    - tags
    - review requirement.
-5. Bootstrap creation:
-   - `tasker task create --bootstrap --queue <key> --file task.md`
-   - Optional bootstrap `conflict_hints` / `anticipated_touched_files` front matter records advisory expected file or documentation-area overlap for dogfooding coordination.
+5. File-backed Task Creation:
+   - Prefer `tasker task create --queue <key> --from-file task.md`.
+   - Keep `tasker task create --bootstrap --queue <key> --file task.md` as the compatibility spelling for the temporary dogfooding shortcut until a deliberate migration changes it.
+   - Optional file-backed `conflict_hints` / `anticipated_touched_files` front matter records advisory expected file or documentation-area overlap for dogfooding coordination.
    - YAML front matter for structured fields
    - Markdown body as the **Task Brief**
    - default state: **Ready** when omitted.
@@ -150,14 +151,14 @@ Add migrations incrementally by milestone.
 ### Acceptance check
 
 - An **Operator** can create a **Task Queue**.
-- A bootstrap Markdown file creates a **Task** with a generated **Task Identifier**.
+- A file-backed Markdown definition creates a **Task** with a generated **Task Identifier**.
 - `tasker task show` displays current structured fields and **Workpad Note**.
 - `tasker status` displays counts by **Task Queue** and **Task State**.
 - Gate, identifier, audit, and Workpad revision tests pass.
 
 ### Dogfooding checkpoint
 
-After this milestone, create real bootstrap **Tasks** for the remaining milestones.
+After this milestone, create real file-backed **Tasks** for the remaining milestones.
 
 ## Milestone 3: Claim and run lifecycle
 

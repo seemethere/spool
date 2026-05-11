@@ -175,10 +175,12 @@ fn front_matter_field_line(front_matter: &str, field: &str) -> Option<usize> {
 
 fn split_front_matter(text: &str) -> Result<(&str, &str)> {
     let Some(after_start) = text.strip_prefix("---\n") else {
-        anyhow::bail!("bootstrap task file must start with YAML front matter delimited by ---");
+        anyhow::bail!(
+            "file-backed task definition must start with YAML front matter delimited by ---"
+        );
     };
     let Some((front_matter, body)) = after_start.split_once("\n---\n") else {
-        anyhow::bail!("bootstrap task file must close YAML front matter with ---");
+        anyhow::bail!("file-backed task definition must close YAML front matter with ---");
     };
     Ok((front_matter, body))
 }

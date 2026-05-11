@@ -27,8 +27,8 @@ For each **Implementation Slice**:
 - An **Approved Slice Sequence** may contain multiple low-risk slices that the agent implements and commits one-by-one without pausing after each slice.
 - Each slice should advance exactly one current roadmap milestone.
 - Each slice proposal should include intent, likely files touched, and proposed **Slice Acceptance Checks**.
-- For **Bootstrap Task Creation**, start from the canonical template at `.tasker/bootstrap-tasks/TEMPLATE.md` so front matter uses valid values for `priority`, `state`, **Acceptance Criteria**, **Validation Items**, tags, review requirement, blockers, and advisory `conflict_hints`.
-- During dogfooding, Delegating Agents should put likely file paths or documentation areas in structured bootstrap `conflict_hints` (aliases: `anticipated_touched_files`, `touched_files`) when creating parallel-ready Tasks. Recommended hotspot names include `crates/tasker-db`, `crates/tasker-cli`, `worker-loop`, `local-worktree-delivery`, `tasker-pi-extension`, `telemetry`, `monitor`, `docs`, and `migrations`; prefer concrete repository paths when known. Operators should inspect `tasker status`, `tasker monitor --plain`, or `tasker task show <task_identifier>` for advisory overlap before starting parallel batches. These hints are a coordination aid only; they do not block claims and are not a full dependency planner.
+- For **File-backed Task Creation**, prefer `tasker task create --queue <key> --from-file task.md` and start from the canonical template at `.tasker/bootstrap-tasks/TEMPLATE.md` so front matter uses valid values for `priority`, `state`, **Acceptance Criteria**, **Validation Items**, tags, review requirement, blockers, and advisory `conflict_hints`. The older `tasker task create --bootstrap --queue <key> --file task.md` spelling remains a compatibility path for the temporary dogfooding escape hatch.
+- During dogfooding, Delegating Agents should put likely file paths or documentation areas in structured file-backed `conflict_hints` (aliases: `anticipated_touched_files`, `touched_files`) when creating parallel-ready Tasks. Recommended hotspot names include `crates/tasker-db`, `crates/tasker-cli`, `worker-loop`, `local-worktree-delivery`, `tasker-pi-extension`, `telemetry`, `monitor`, `docs`, and `migrations`; prefer concrete repository paths when known. Operators should inspect `tasker status`, `tasker monitor --plain`, or `tasker task show <task_identifier>` for advisory overlap before starting parallel batches. These hints are a coordination aid only; they do not block claims and are not a full dependency planner.
 - Prefer small, reviewable changes over whole-milestone batches.
 - Avoid using Tasker **Task** language for pre-dogfooding planning units; use **Implementation Slice** instead.
 - Keep implementation single-slice and single-writer by default before dogfooding.
@@ -96,6 +96,6 @@ Docs-only slices may have documentation review as their only check.
 
 ## Dogfooding Cutover
 
-The first **Dogfooding Cutover** target is after roadmap Milestone 2, when Tasker can create and show real development **Tasks** using **Bootstrap Task Creation**, **Task Queues**, task show/status, **Workpad Notes**, and **Audit Events**.
+The first **Dogfooding Cutover** target is after roadmap Milestone 2, when Tasker can create and show real development **Tasks** using **File-backed Task Creation**, **Task Queues**, task show/status, **Workpad Notes**, and **Audit Events**.
 
 After cutover, new Tasker development work should be represented as real Tasker **Tasks** whenever practical, even if execution still relies on manual or partially automated implementation.

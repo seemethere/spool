@@ -16,7 +16,7 @@ Tasker should become useful enough to build Tasker with Tasker as quickly as pos
 ### Milestone 2: Core task data
 
 - Queue create/show/list
-- Bootstrap task creation from Markdown + YAML front matter
+- File-backed Task Creation from Markdown + YAML front matter, with the temporary bootstrap command spelling kept as a compatibility path during dogfooding
 - Task show/status CLI
 - Acceptance criteria and validation items
 - Workpad note and revisions

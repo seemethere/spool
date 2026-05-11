@@ -285,20 +285,23 @@ enum QueueCommand {
 enum TaskCommand {
     /// Create a Task.
     Create {
-        /// Use temporary Bootstrap Task Creation from a Markdown file with YAML front matter.
+        /// Use temporary Bootstrap Task Creation compatibility mode with --file.
         #[arg(long)]
         bootstrap: bool,
         /// Task Queue Key for the new Task.
         #[arg(long)]
         queue: String,
-        /// Markdown file containing YAML front matter and the Task Brief body.
+        /// Preferred file-backed Task definition with YAML front matter and the Task Brief body.
+        #[arg(long = "from-file", value_name = "FILE", conflicts_with = "file")]
+        from_file: Option<PathBuf>,
+        /// Compatibility alias for Bootstrap Task Creation. Prefer --from-file for new usage.
         #[arg(long)]
-        file: PathBuf,
+        file: Option<PathBuf>,
         /// Operator actor display name for audit attribution.
         #[arg(long, default_value = "local-operator")]
         actor: String,
     },
-    /// Validate a Bootstrap Task Creation file without creating a Task.
+    /// Validate a file-backed Task definition without creating a Task.
     Lint {
         /// Markdown file containing YAML front matter and the Task Brief body.
         #[arg(long)]
