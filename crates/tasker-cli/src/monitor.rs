@@ -231,6 +231,11 @@ fn render_work_board(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapsh
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(area);
 
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .split(panes[0]);
+
     let mut running_lines = Vec::new();
     for queue in &snapshot.queues {
         for run in &queue.active_runs {
@@ -245,7 +250,7 @@ fn render_work_board(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapsh
                 ),
                 Span::raw(format!(
                     "  {}  {}",
-                    run.task_state,
+                    running_state_label(&run.task_state),
                     compact_run_id(&run.agent_run_id)
                 )),
             ]));
@@ -258,12 +263,23 @@ fn render_work_board(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapsh
         Paragraph::new(running_lines)
             .block(Block::default().title("Running").borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
-        panes[0],
+        left[0],
+    );
+
+    frame.render_widget(
+        Paragraph::new(rework_lines(snapshot, 38))
+            .block(Block::default().title("Rework").borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
+        left[1],
     );
 
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(28),
+            Constraint::Percentage(38),
+        ])
         .split(panes[1]);
 
     let mut next_lines = Vec::new();
@@ -273,12 +289,6 @@ fn render_work_board(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapsh
                 "› {}  {}",
                 compact_task_label(&task.identifier, &task.title, 34),
                 task.priority
-            )));
-        }
-        for group in queue.advisory_conflict_hints.iter().take(3) {
-            next_lines.push(Line::from(format!(
-                "hotspot {}: {} Task(s)",
-                group.target, group.task_count
             )));
         }
         if queue.ready_tasks.len() > NEXT_TASK_LIMIT {
@@ -299,7 +309,18 @@ fn render_work_board(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapsh
         right[0],
     );
 
-    render_recent_runs(frame, right[1], snapshot);
+    frame.render_widget(
+        Paragraph::new(advisory_conflict_lines(snapshot))
+            .block(
+                Block::default()
+                    .title("Advisory Task Conflict Hints")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false }),
+        right[1],
+    );
+
+    render_recent_runs(frame, right[2], snapshot);
 }
 
 fn render_recent_runs(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot) {
@@ -329,7 +350,11 @@ fn render_recent_runs(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnaps
                 .add_modifier(Modifier::BOLD),
         ),
     )
-    .block(Block::default().title("Recent").borders(Borders::ALL));
+    .block(
+        Block::default()
+            .title("Recent Agent Runs")
+            .borders(Borders::ALL),
+    );
     frame.render_widget(table, area);
 }
 
@@ -341,6 +366,81 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect) {
         .block(Block::default().borders(Borders::ALL)),
         area,
     );
+}
+
+fn rework_lines(snapshot: &MonitorSnapshot, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for queue in &snapshot.queues {
+        for task in &queue.rework_tasks {
+            let progress = if has_healthy_active_run(queue, &task.identifier, &snapshot.captured_at)
+            {
+                " — rework in progress"
+            } else {
+                ""
+            };
+            lines.push(Line::from(format!(
+                "↻ {}  code={}{}",
+                compact_task_label(&task.identifier, &task.title, width),
+                task.latest_rework_reason_code
+                    .as_deref()
+                    .unwrap_or("unknown_legacy"),
+                progress
+            )));
+            lines.push(Line::from(format!(
+                "  local_worktree={}",
+                local_worktree_status(
+                    task.local_worktree.as_deref(),
+                    task.task_branch.as_deref(),
+                    &task.main_branch,
+                )
+            )));
+            if let Some(reason) = &task.latest_rework_reason {
+                lines.push(Line::from(format!("  reason: {reason}")));
+            }
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("No Rework Tasks"));
+    }
+    lines
+}
+
+fn advisory_conflict_lines(snapshot: &MonitorSnapshot) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for queue in &snapshot.queues {
+        for group in &queue.advisory_conflict_hints {
+            lines.push(Line::from(format!(
+                "{}: {} Task(s) — {}",
+                group.target, group.task_count, group.tasks
+            )));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("No advisory conflict hints"));
+    }
+    lines
+}
+
+fn running_state_label(task_state: &str) -> &str {
+    if task_state == "rework" {
+        "rework in progress"
+    } else {
+        task_state
+    }
+}
+
+fn has_healthy_active_run(queue: &QueueSnapshot, task_identifier: &str, captured_at: &str) -> bool {
+    queue.active_runs.iter().any(|run| {
+        run.task_identifier == task_identifier
+            && !is_stale_lease(&run.lease_expires_at, captured_at)
+    })
+}
+
+fn has_healthy_active_run_for_snapshot(snapshot: &MonitorSnapshot, task_identifier: &str) -> bool {
+    snapshot
+        .queues
+        .iter()
+        .any(|queue| has_healthy_active_run(queue, task_identifier, &snapshot.captured_at))
 }
 
 fn attention_lines(snapshot: &MonitorSnapshot) -> Vec<Line<'static>> {
@@ -364,24 +464,18 @@ fn attention_lines(snapshot: &MonitorSnapshot) -> Vec<Line<'static>> {
             }
         }
         for task in &queue.rework_tasks {
+            if has_healthy_active_run(queue, &task.identifier, &snapshot.captured_at) {
+                continue;
+            }
             lines.push(attention_line(
                 "↻",
                 "rework",
                 format!(
-                    "{} code={} local_worktree={}{}",
+                    "{} waiting for Worker Agent/operator; code={}",
                     compact_task_label(&task.identifier, &task.title, 44),
                     task.latest_rework_reason_code
                         .as_deref()
-                        .unwrap_or("unknown_legacy"),
-                    local_worktree_status(
-                        task.local_worktree.as_deref(),
-                        task.task_branch.as_deref(),
-                        &task.main_branch,
-                    ),
-                    task.latest_rework_reason
-                        .as_deref()
-                        .map(|reason| format!(" — {reason}"))
-                        .unwrap_or_default()
+                        .unwrap_or("unknown_legacy")
                 ),
             ));
         }
@@ -432,7 +526,9 @@ fn attention_lines(snapshot: &MonitorSnapshot) -> Vec<Line<'static>> {
         }
     }
     for run in &snapshot.recent_runs {
-        if is_unrecovered_attention_outcome(run) {
+        if is_unrecovered_attention_outcome(run)
+            && !has_healthy_active_run_for_snapshot(snapshot, &run.task_identifier)
+        {
             lines.push(attention_line(
                 "✖",
                 "failed run",
@@ -468,21 +564,15 @@ fn attention_texts(snapshot: &MonitorSnapshot) -> Vec<String> {
             }
         }
         for task in &queue.rework_tasks {
+            if has_healthy_active_run(queue, &task.identifier, &snapshot.captured_at) {
+                continue;
+            }
             lines.push(format!(
-                "rework: {} code={} local_worktree={}{}",
+                "rework: {} waiting for Worker Agent/operator; code={}",
                 compact_task_label(&task.identifier, &task.title, 64),
                 task.latest_rework_reason_code
                     .as_deref()
-                    .unwrap_or("unknown_legacy"),
-                local_worktree_status(
-                    task.local_worktree.as_deref(),
-                    task.task_branch.as_deref(),
-                    &task.main_branch,
-                ),
-                task.latest_rework_reason
-                    .as_deref()
-                    .map(|reason| format!(" — {reason}"))
-                    .unwrap_or_default()
+                    .unwrap_or("unknown_legacy")
             ));
         }
         for hold in &queue.retry_holds {
@@ -520,7 +610,9 @@ fn attention_texts(snapshot: &MonitorSnapshot) -> Vec<String> {
         }
     }
     for run in &snapshot.recent_runs {
-        if is_unrecovered_attention_outcome(run) {
+        if is_unrecovered_attention_outcome(run)
+            && !has_healthy_active_run_for_snapshot(snapshot, &run.task_identifier)
+        {
             lines.push(format!(
                 "failed run: {} {}{}",
                 compact_task_label(&run.task_identifier, &run.task_title, 64),
@@ -882,7 +974,7 @@ pub fn write_snapshot(mut writer: impl Write, snapshot: &MonitorSnapshot) -> io:
                 writer,
                 "  ● {}\tstate={}\trun={}\tworker={}",
                 compact_task_label(&run.task_identifier, &run.task_title, 64),
-                run.task_state,
+                running_state_label(&run.task_state),
                 compact_run_id(&run.agent_run_id),
                 run.worker_id
             )?;
@@ -1353,7 +1445,7 @@ mod tests {
                 finished_at: Some("2026-05-09 00:01:00".to_string()),
             }],
         };
-        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let backend = ratatui::backend::TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).expect("terminal");
 
         terminal
@@ -1364,9 +1456,12 @@ mod tests {
         assert!(rendered.contains("Tasker"));
         assert!(rendered.contains("attention board"));
         assert!(rendered.contains("Needs Attention"));
+        assert!(rendered.contains("Running"));
+        assert!(rendered.contains("Rework"));
         assert!(rendered.contains("Next"));
+        assert!(rendered.contains("Advisory Task Conflict Hints"));
         assert!(rendered.contains("Prepare monitor titles"));
-        assert!(rendered.contains("Recent"));
+        assert!(rendered.contains("Recent Agent Runs"));
         assert!(rendered.contains("q quit"));
     }
 
@@ -1494,7 +1589,13 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
 
         assert!(text.find("Needs Attention:").unwrap() < text.find("Running:").unwrap());
-        assert!(text.find("Running:").unwrap() < text.find("Next:").unwrap());
+        assert!(text.find("Running:").unwrap() < text.find("Rework:").unwrap());
+        assert!(text.find("Rework:").unwrap() < text.find("Next:").unwrap());
+        assert!(text.find("Next:").unwrap() < text.find("Advisory Task Conflict Hints:").unwrap());
+        assert!(
+            text.find("Advisory Task Conflict Hints:").unwrap()
+                < text.find("Recent Agent Runs:").unwrap()
+        );
         assert!(text.contains("retry hold: TASK-99"));
         assert!(text.contains("… 2 more Ready Tasks in TASK"));
         assert!(text.contains("Advisory Task Conflict Hints:"));
@@ -1631,6 +1732,132 @@ mod tests {
         assert!(attention_texts(&snapshot).is_empty());
         assert!(text.contains("● TASK-1"));
         assert!(text.contains("run=12345678"));
+    }
+
+    fn task_summary(identifier: &str, title: &str, state: &str) -> tasker_db::TaskStatusSummary {
+        tasker_db::TaskStatusSummary {
+            queue_key: "TASK".to_string(),
+            identifier: identifier.to_string(),
+            title: title.to_string(),
+            state: state.to_string(),
+            priority: "normal".to_string(),
+            local_worktree: None,
+            task_branch: Some(format!("tasker/{identifier}")),
+            main_branch: "main".to_string(),
+            latest_rework_reason_code: Some("merge_conflict".to_string()),
+            latest_rework_reason: Some(
+                "very long merge conflict diagnosis that belongs in Rework details".to_string(),
+            ),
+            unresolved_blocking_task_count: 0,
+            blocking_task_identifiers: None,
+        }
+    }
+
+    fn active_run(identifier: &str, title: &str, state: &str) -> tasker_db::ActiveAgentRunStatus {
+        tasker_db::ActiveAgentRunStatus {
+            queue_key: "TASK".to_string(),
+            task_identifier: identifier.to_string(),
+            task_title: title.to_string(),
+            task_state: state.to_string(),
+            agent_run_id: format!("run-{identifier}"),
+            launcher_kind: "pi".to_string(),
+            worker_id: "worker".to_string(),
+            lease_expires_at: "2026-05-09 00:01:00".to_string(),
+        }
+    }
+
+    fn snapshot_with_queue(queue: QueueSnapshot) -> MonitorSnapshot {
+        MonitorSnapshot {
+            config_path: PathBuf::from("/config.toml"),
+            data_dir: PathBuf::from("/data"),
+            db_path: PathBuf::from("/tasker.db"),
+            queue_filter: Some("TASK".to_string()),
+            captured_at: "2026-05-09 00:00:00".to_string(),
+            queues: vec![queue],
+            recent_runs: Vec::new(),
+        }
+    }
+
+    fn empty_queue() -> QueueSnapshot {
+        QueueSnapshot {
+            key: "TASK".to_string(),
+            name: "Tasker".to_string(),
+            state_counts: Vec::new(),
+            active_agent_runs: 0,
+            active_retry_holds: 0,
+            active_runs: Vec::new(),
+            retry_holds: Vec::new(),
+            ready_tasks: Vec::new(),
+            rework_tasks: Vec::new(),
+            integrating_tasks: Vec::new(),
+            advisory_conflict_hints: Vec::new(),
+            integration_retries: Vec::new(),
+            repo_operation_lock: None,
+        }
+    }
+
+    #[test]
+    fn active_rework_run_is_running_not_noisy_attention() {
+        let mut queue = empty_queue();
+        queue.active_agent_runs = 1;
+        queue.active_runs = vec![active_run("TASK-7", "Fix merge conflict", "rework")];
+        queue.rework_tasks = vec![task_summary("TASK-7", "Fix merge conflict", "rework")];
+        let snapshot = snapshot_with_queue(queue);
+        let mut out = Vec::new();
+
+        write_snapshot(&mut out, &snapshot).expect("write");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(attention_texts(&snapshot).is_empty());
+        assert!(text.contains("state=rework in progress"));
+        assert!(text.contains("Rework:"));
+        assert!(text.contains("rework in progress"));
+        assert!(text.contains("reason: very long merge conflict diagnosis"));
+        assert!(!text.contains("rework: TASK-7"));
+    }
+
+    #[test]
+    fn unattended_rework_is_concise_attention_with_details_in_rework() {
+        let mut queue = empty_queue();
+        queue.rework_tasks = vec![task_summary("TASK-8", "Needs operator recovery", "rework")];
+        let snapshot = snapshot_with_queue(queue);
+        let attention = attention_texts(&snapshot).join("\n");
+        let mut out = Vec::new();
+
+        write_snapshot(&mut out, &snapshot).expect("write");
+        let text = String::from_utf8(out).expect("utf8");
+
+        assert!(attention.contains("rework: TASK-8"));
+        assert!(attention.contains("waiting for Worker Agent/operator; code=merge_conflict"));
+        assert!(!attention.contains("very long merge conflict diagnosis"));
+        assert!(text.contains("local_worktree=missing Task Link"));
+        assert!(text.contains("reason: very long merge conflict diagnosis"));
+    }
+
+    #[test]
+    fn ratatui_advisory_hints_are_separate_from_next() {
+        let mut queue = empty_queue();
+        queue.ready_tasks = vec![task_summary("TASK-9", "Ready implementation", "ready")];
+        queue.advisory_conflict_hints = vec![tasker_db::TaskConflictGroup {
+            queue_key: "TASK".to_string(),
+            target: "crates/tasker-cli".to_string(),
+            task_count: 2,
+            tasks: "TASK-9 (ready), TASK-10 (in_progress)".to_string(),
+        }];
+        let snapshot = snapshot_with_queue(queue);
+        let backend = ratatui::backend::TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| render_snapshot(frame, &snapshot))
+            .expect("draw");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+
+        assert!(rendered.contains("Next"));
+        assert!(rendered.contains("Ready implementation"));
+        assert!(rendered.contains("Advisory Task Conflict Hints"));
+        assert!(rendered.contains("crates/tasker-cli"));
+        assert!(!rendered.contains("hotspot"));
     }
 
     #[test]
