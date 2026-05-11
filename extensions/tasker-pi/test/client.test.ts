@@ -13,7 +13,16 @@ beforeEach(() => {
     requests.push({ url: String(url), init: init ?? {} });
     const body = String(url).endsWith("/tasks/TASK-1/context-bundle")
       ? {
-          task: { task: { identifier: "TASK-1" }, conflict_hints: [{ position: 1, target: "crates/tasker-db" }] },
+          task: {
+            task: { identifier: "TASK-1", brief: "brief" },
+            acceptance_criteria: [{ position: 1, description: "criterion", status: "pending" }],
+            validation_items: [{ position: 1, description: "validation", status: "pending" }],
+            workpad_note: { body: "notes" },
+            task_links: [{ kind: "local_worktree", target: "/worktrees/TASK-1" }],
+            conflict_hints: [{ position: 1, target: "crates/tasker-db" }],
+            blocking_tasks: [],
+            blocked_tasks: [{ identifier: "TASK-2", title: "Blocked", state: "ready", resolved: false }],
+          },
           queue: { key: "TASK" },
           local_workflow: {},
           advisory_hints: {
@@ -21,7 +30,20 @@ beforeEach(() => {
             task_conflict_hints: [{ position: 1, target: "crates/tasker-db" }],
             likely_files_or_paths: ["crates/tasker-db"],
           },
-          agent_runs: [],
+          agent_runs: [{
+            id: "run-1",
+            session_id: "session-1",
+            model: "test-model",
+            provider: "test-provider",
+            final_status: "completed",
+            duration_ms: 1000,
+            tool_call_count: 4,
+            repeated_read_count: 0,
+            repeated_tasker_context_fetch_count: 0,
+            total_tokens: 100,
+            max_context_tokens: 200,
+            efficiency_hints_json: "[]",
+          }],
         }
       : String(url).endsWith("/tasks/TASK-1")
         ? { workpad_note: { body: "existing notes" } }
@@ -64,7 +86,15 @@ describe("TaskerClient", () => {
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       requests.push({ url: String(url), init: init ?? {} });
       return new Response(JSON.stringify({
-        task: { task: { identifier: "TASK-1" }, conflict_hints: [] },
+        task: {
+          task: { identifier: "TASK-1" },
+          acceptance_criteria: [],
+          validation_items: [],
+          task_links: [],
+          conflict_hints: [],
+          blocking_tasks: [],
+          blocked_tasks: [],
+        },
         queue: {},
         local_workflow: {},
         advisory_hints: {
@@ -88,7 +118,14 @@ describe("TaskerClient", () => {
   it("rejects context bundles with raw transcript or launcher payload fields", async () => {
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       requests.push({ url: String(url), init: init ?? {} });
-      return new Response(JSON.stringify({ task: {}, queue: {}, local_workflow: {}, advisory_hints: { task_conflict_hints: [], likely_files_or_paths: [] }, agent_runs: [], raw_json: "{}" }), {
+      return new Response(JSON.stringify({
+        task: { acceptance_criteria: [], validation_items: [], task_links: [], conflict_hints: [], blocking_tasks: [], blocked_tasks: [] },
+        queue: {},
+        local_workflow: {},
+        advisory_hints: { task_conflict_hints: [], likely_files_or_paths: [] },
+        agent_runs: [],
+        raw_json: "{}",
+      }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });

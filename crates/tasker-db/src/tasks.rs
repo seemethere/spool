@@ -572,23 +572,38 @@ pub async fn get_task_context_bundle(
     let agent_runs = sqlx::query_as::<_, TaskContextAgentRun>(
         r#"
         SELECT
-            id,
-            worker_actor_kind,
-            worker_actor_id,
-            worker_actor_display_name,
-            worker_id,
-            launcher_kind,
-            lease_expires_at,
-            last_heartbeat_at,
-            outcome,
-            failure_reason,
-            failure_reason_code,
-            created_at,
-            finished_at,
-            outcome IS NULL AND lease_expires_at > CURRENT_TIMESTAMP AS is_active
+            agent_runs.id AS id,
+            agent_runs.worker_actor_kind AS worker_actor_kind,
+            agent_runs.worker_actor_id AS worker_actor_id,
+            agent_runs.worker_actor_display_name AS worker_actor_display_name,
+            agent_runs.worker_id AS worker_id,
+            agent_runs.launcher_kind AS launcher_kind,
+            agent_runs.lease_expires_at AS lease_expires_at,
+            agent_runs.last_heartbeat_at AS last_heartbeat_at,
+            agent_runs.outcome AS outcome,
+            agent_runs.failure_reason AS failure_reason,
+            agent_runs.failure_reason_code AS failure_reason_code,
+            agent_runs.created_at AS created_at,
+            agent_runs.finished_at AS finished_at,
+            agent_runs.outcome IS NULL AND agent_runs.lease_expires_at > CURRENT_TIMESTAMP AS is_active,
+            launcher_session_data.session_id,
+            launcher_session_data.model,
+            launcher_session_data.provider,
+            COALESCE(agent_run_metrics.final_status, launcher_session_data.final_status) AS final_status,
+            agent_run_metrics.duration_ms,
+            agent_run_metrics.tool_call_count,
+            agent_run_metrics.tool_error_count,
+            agent_run_metrics.repeated_failed_tool_attempt_count,
+            agent_run_metrics.repeated_read_count,
+            agent_run_metrics.repeated_tasker_context_fetch_count,
+            agent_run_metrics.total_tokens,
+            agent_run_metrics.max_context_tokens,
+            agent_run_metrics.efficiency_hints_json
         FROM agent_runs
-        WHERE task_id = ?
-        ORDER BY created_at DESC, id DESC
+        LEFT JOIN launcher_session_data ON launcher_session_data.agent_run_id = agent_runs.id
+        LEFT JOIN agent_run_metrics ON agent_run_metrics.agent_run_id = agent_runs.id
+        WHERE agent_runs.task_id = ?
+        ORDER BY agent_runs.created_at DESC, agent_runs.id DESC
         LIMIT 5
         "#,
     )

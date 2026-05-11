@@ -1131,6 +1131,28 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+        let mut blocked_task = sample_task_json("TASK", "Blocked by bundle task");
+        blocked_task["blocking_task_identifiers"] = serde_json::json!(["TASK-1"]);
+        let blocked_request = serde_json::json!({
+            "actor": { "kind": "operator", "id": "tester", "display_name": "tester" },
+            "task": blocked_task
+        });
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/tasks/bootstrap")
+                        .header("content-type", "application/json")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::from(blocked_request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
         let operator = tasker_db::Actor::operator("tester");
         tasker_db::upsert_task_link(
             &pool,
@@ -1170,6 +1192,50 @@ mod tests {
             .unwrap();
         let claim_json: Value = serde_json::from_slice(&body).unwrap();
         let run_id = claim_json["run"]["id"].as_str().unwrap();
+        tasker_db::upsert_launcher_session_data(
+            &pool,
+            run_id,
+            &tasker_db::UpsertLauncherSessionData {
+                launcher_kind: "pi".to_string(),
+                session_id: Some("session-123".to_string()),
+                model: Some("test-model".to_string()),
+                provider: Some("test-provider".to_string()),
+                started_at: None,
+                finished_at: None,
+                final_status: Some("running".to_string()),
+                transcript_path: Some("/local/private/run.jsonl".to_string()),
+                raw_json: Some(r#"{"private":"launcher details"}"#.to_string()),
+            },
+            &operator,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO agent_run_metrics (
+                agent_run_id, derivation_version, duration_ms, launcher_kind, final_status,
+                total_tokens, tool_call_count, tool_error_count,
+                repeated_failed_tool_attempt_count, repeated_read_count,
+                repeated_tasker_context_fetch_count, max_context_tokens, efficiency_hints_json
+            ) VALUES (?, 1, 1200, 'pi', 'running', 42, 7, 0, 0, 1, 0, 1000, '["repeated file reads"]')
+            ON CONFLICT(agent_run_id) DO UPDATE SET
+                derivation_version = excluded.derivation_version,
+                duration_ms = excluded.duration_ms,
+                final_status = excluded.final_status,
+                total_tokens = excluded.total_tokens,
+                tool_call_count = excluded.tool_call_count,
+                tool_error_count = excluded.tool_error_count,
+                repeated_failed_tool_attempt_count = excluded.repeated_failed_tool_attempt_count,
+                repeated_read_count = excluded.repeated_read_count,
+                repeated_tasker_context_fetch_count = excluded.repeated_tasker_context_fetch_count,
+                max_context_tokens = excluded.max_context_tokens,
+                efficiency_hints_json = excluded.efficiency_hints_json
+            "#,
+        )
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         tasker_db::record_integration_outcome(
             &pool,
             &tasker_db::RecordIntegrationOutcomeInput {
@@ -1229,8 +1295,35 @@ mod tests {
         );
         assert_eq!(json["local_workflow"]["task_branch"], "tasker/TASK-1");
         assert_eq!(json["queue"]["key"], "TASK");
+        assert_eq!(
+            json["task"]["acceptance_criteria"][0]["description"],
+            "It works"
+        );
+        assert_eq!(
+            json["task"]["validation_items"][0]["description"],
+            "cargo test passes"
+        );
+        assert_eq!(json["task"]["task_links"].as_array().unwrap().len(), 2);
+        assert_eq!(json["task"]["blocked_tasks"][0]["identifier"], "TASK-2");
         assert_eq!(json["agent_runs"][0]["id"], run_id);
         assert_eq!(json["agent_runs"][0]["is_active"], true);
+        assert_eq!(json["agent_runs"][0]["session_id"], "session-123");
+        assert_eq!(json["agent_runs"][0]["model"], "test-model");
+        assert_eq!(json["agent_runs"][0]["provider"], "test-provider");
+        assert_eq!(json["agent_runs"][0]["final_status"], "running");
+        assert_eq!(json["agent_runs"][0]["duration_ms"], 1200);
+        assert_eq!(json["agent_runs"][0]["tool_call_count"], 7);
+        assert_eq!(json["agent_runs"][0]["repeated_read_count"], 1);
+        assert_eq!(
+            json["agent_runs"][0]["repeated_tasker_context_fetch_count"],
+            0
+        );
+        assert_eq!(json["agent_runs"][0]["total_tokens"], 42);
+        assert_eq!(json["agent_runs"][0]["max_context_tokens"], 1000);
+        assert_eq!(
+            json["agent_runs"][0]["efficiency_hints_json"],
+            "[\"repeated file reads\"]"
+        );
         assert_eq!(
             json["latest_integration_outcome"]["outcome_kind"],
             "operational_failure"

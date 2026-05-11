@@ -278,6 +278,19 @@ pub struct TaskContextAgentRun {
     pub created_at: String,
     pub finished_at: Option<String>,
     pub is_active: bool,
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub final_status: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub tool_call_count: Option<i64>,
+    pub tool_error_count: Option<i64>,
+    pub repeated_failed_tool_attempt_count: Option<i64>,
+    pub repeated_read_count: Option<i64>,
+    pub repeated_tasker_context_fetch_count: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub max_context_tokens: Option<i64>,
+    pub efficiency_hints_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]

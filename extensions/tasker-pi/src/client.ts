@@ -218,6 +218,17 @@ function validateTaskContextBundle(bundle: unknown): void {
   if (!bundle || typeof bundle !== "object") throw new Error("Task context bundle must be an object");
   const value = bundle as Record<string, unknown>;
   if (!value.task || typeof value.task !== "object") throw new Error("Task context bundle missing task");
+  const taskDetail = value.task as Record<string, unknown>;
+  for (const field of [
+    "acceptance_criteria",
+    "validation_items",
+    "task_links",
+    "conflict_hints",
+    "blocking_tasks",
+    "blocked_tasks",
+  ]) {
+    if (!Array.isArray(taskDetail[field])) throw new Error(`Task context bundle missing task.${field}`);
+  }
   if (!value.queue || typeof value.queue !== "object") throw new Error("Task context bundle missing queue");
   if (!value.local_workflow || typeof value.local_workflow !== "object") {
     throw new Error("Task context bundle missing local_workflow");
