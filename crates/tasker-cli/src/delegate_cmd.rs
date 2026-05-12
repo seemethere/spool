@@ -13,6 +13,7 @@ pub(crate) async fn delegate(
     if options.queue.is_some() && options.refine.is_some() {
         anyhow::bail!("tasker delegate accepts either --queue for creation or --refine for Backlog Task refinement, not both");
     }
+    let initial_intent = resolve_initial_intent(options.initial_intent, options.intent_file)?;
 
     let api_token = tasker_db::ensure_local_api_token(&pool).await?;
     let api_url = options
@@ -48,17 +49,21 @@ pub(crate) async fn delegate(
             )
         };
 
+    let pi_extension =
+        resolve_delegate_pi_extension(options.pi_extension, &managed_source_repository)?;
+
     let outcome = tasker_runner::delegate::run_delegation_session(
         tasker_runner::delegate::DelegationSessionRequest {
             queue_key,
             refine_task_identifier,
             existing_task_context,
+            initial_intent,
             managed_source_repository,
             api_url,
             api_token,
             actor: options.actor,
             pi_bin: options.pi_bin,
-            pi_extension: options.pi_extension,
+            pi_extension,
         },
     )
     .await?;
@@ -74,6 +79,54 @@ pub(crate) async fn delegate(
         ),
     }
     Ok(())
+}
+
+fn resolve_initial_intent(
+    positional_intent: Option<String>,
+    intent_file: Option<PathBuf>,
+) -> Result<Option<String>> {
+    match (positional_intent, intent_file) {
+        (Some(_), Some(path)) => anyhow::bail!(
+            "tasker delegate accepts either positional INTENT or --intent-file {}, not both",
+            path.display()
+        ),
+        (Some(intent), None) => {
+            let trimmed = intent.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("tasker delegate positional INTENT must not be empty");
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+        (None, Some(path)) => {
+            let intent = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read intent file {}", path.display()))?;
+            let trimmed = intent.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("tasker delegate --intent-file {} is empty", path.display());
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+fn resolve_delegate_pi_extension(
+    explicit: Option<PathBuf>,
+    managed_source_repository: &Path,
+) -> Result<Option<PathBuf>> {
+    if let Some(path) = explicit {
+        return Ok(Some(path));
+    }
+
+    let local_extension = managed_source_repository.join("extensions/tasker-pi/src/index.ts");
+    if local_extension.is_file() {
+        Ok(Some(PathBuf::from("extensions/tasker-pi/src/index.ts")))
+    } else {
+        anyhow::bail!(
+            "tasker delegate requires a Tasker Pi Extension. No --pi-extension was provided and the repo-local extension was not found at {}. Run from the Managed Source Repository, restore extensions/tasker-pi/src/index.ts, or pass --pi-extension explicitly.",
+            local_extension.display()
+        )
+    }
 }
 
 async fn resolve_delegate_queue(
@@ -145,6 +198,26 @@ mod tests {
             .await
             .expect("explicit queue");
         assert_eq!(explicit.key, "ALT");
+    }
+
+    #[test]
+    fn delegate_pi_extension_defaults_to_repo_local_path_or_reports_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = resolve_delegate_pi_extension(None, temp.path())
+            .expect_err("missing repo-local extension is actionable");
+        assert!(missing
+            .to_string()
+            .contains("repo-local extension was not found"));
+
+        let extension = temp.path().join("extensions/tasker-pi/src/index.ts");
+        fs::create_dir_all(extension.parent().expect("extension parent")).expect("mkdir");
+        fs::write(&extension, "// fake extension").expect("write extension");
+
+        let resolved = resolve_delegate_pi_extension(None, temp.path()).expect("default extension");
+        assert_eq!(
+            resolved,
+            Some(PathBuf::from("extensions/tasker-pi/src/index.ts"))
+        );
     }
 
     async fn create_queue(pool: &sqlx::SqlitePool, key: &str, root: &Path) {

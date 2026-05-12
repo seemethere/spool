@@ -230,6 +230,12 @@ enum Command {
         /// Refine an existing Backlog Task instead of creating a Root Task.
         #[arg(long)]
         refine: Option<String>,
+        /// Initial human intent to pass to the Delegating Agent.
+        #[arg(value_name = "INTENT")]
+        initial_intent: Option<String>,
+        /// Read initial human intent from a file.
+        #[arg(long, value_name = "PATH")]
+        intent_file: Option<PathBuf>,
         /// Delegating Agent actor display name.
         #[arg(long, default_value = "local-delegating-agent", hide = true)]
         actor: String,
@@ -772,6 +778,8 @@ struct ReviewOptions {
 struct DelegateOptions {
     queue: Option<String>,
     refine: Option<String>,
+    initial_intent: Option<String>,
+    intent_file: Option<PathBuf>,
     actor: String,
     api_url: Option<String>,
     pi_bin: String,
@@ -916,6 +924,8 @@ async fn main() -> Result<()> {
         Some(Command::Delegate {
             queue,
             refine,
+            initial_intent,
+            intent_file,
             actor,
             api_url,
             pi_bin,
@@ -927,6 +937,8 @@ async fn main() -> Result<()> {
                 DelegateOptions {
                     queue,
                     refine,
+                    initial_intent,
+                    intent_file,
                     actor,
                     api_url,
                     pi_bin,

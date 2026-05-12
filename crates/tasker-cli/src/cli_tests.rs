@@ -47,22 +47,57 @@ fn task_create_parses_preferred_from_file_shape() {
 
 #[test]
 fn delegate_parses_create_and_refine_shapes() {
-    let create = Cli::try_parse_from(["tasker", "delegate", "--queue", "TASK"])
-        .expect("parse delegate create command");
+    let create = Cli::try_parse_from([
+        "tasker",
+        "delegate",
+        "--queue",
+        "TASK",
+        "Investigate transcript volume regression",
+    ])
+    .expect("parse delegate create command");
     match create.command.expect("command") {
-        Command::Delegate { queue, refine, .. } => {
+        Command::Delegate {
+            queue,
+            refine,
+            initial_intent,
+            intent_file,
+            ..
+        } => {
             assert_eq!(queue.as_deref(), Some("TASK"));
             assert!(refine.is_none());
+            assert_eq!(
+                initial_intent.as_deref(),
+                Some("Investigate transcript volume regression")
+            );
+            assert!(intent_file.is_none());
         }
         other => panic!("unexpected command: {other:?}"),
     }
 
-    let refine = Cli::try_parse_from(["tasker", "delegate", "--refine", "TASK-1"])
-        .expect("parse delegate refine command");
+    let refine = Cli::try_parse_from([
+        "tasker",
+        "delegate",
+        "--refine",
+        "TASK-1",
+        "--intent-file",
+        "intent.md",
+    ])
+    .expect("parse delegate refine command");
     match refine.command.expect("command") {
-        Command::Delegate { queue, refine, .. } => {
+        Command::Delegate {
+            queue,
+            refine,
+            initial_intent,
+            intent_file,
+            ..
+        } => {
             assert!(queue.is_none());
             assert_eq!(refine.as_deref(), Some("TASK-1"));
+            assert!(initial_intent.is_none());
+            assert_eq!(
+                intent_file.expect("intent file"),
+                std::path::PathBuf::from("intent.md")
+            );
         }
         other => panic!("unexpected command: {other:?}"),
     }
@@ -1613,12 +1648,17 @@ Needs a better contract.
     .await
     .expect("create backlog task");
 
+    let extension = repo.join("extensions/tasker-pi/src/index.ts");
+    fs::create_dir_all(extension.parent().expect("extension parent")).expect("mkdir extension");
+    fs::write(&extension, "// fake extension").expect("write extension");
+
     let capture = temp.path().join("delegate-prompt.jsonl");
     let pi_bin = temp.path().join("fake-pi");
     fs::write(
         &pi_bin,
         format!(
             r#"#!/bin/sh
+printf '%s\n' "$@" >> "{capture}"
 cat >> "{capture}"
 printf '%s\n' '{{"type":"extension_ui_request","method":"input"}}'
 printf '%s\n' '{{"type":"agent_end"}}'
@@ -1639,6 +1679,8 @@ printf '%s\n' "$TASKER_ACTOR_KIND:$TASKER_ACTOR_ID" >> "{capture}"
         DelegateOptions {
             queue: Some("TASK".to_string()),
             refine: None,
+            initial_intent: Some("Investigate transcript volume regression".to_string()),
+            intent_file: None,
             actor: "delegator".to_string(),
             api_url: Some("http://tasker.test".to_string()),
             pi_bin: pi_bin.display().to_string(),
@@ -1653,6 +1695,8 @@ printf '%s\n' "$TASKER_ACTOR_KIND:$TASKER_ACTOR_ID" >> "{capture}"
         DelegateOptions {
             queue: None,
             refine: Some("TASK-1".to_string()),
+            initial_intent: Some("Clarify acceptance criteria".to_string()),
+            intent_file: None,
             actor: "delegator".to_string(),
             api_url: Some("http://tasker.test".to_string()),
             pi_bin: pi_bin.display().to_string(),
@@ -1663,11 +1707,16 @@ printf '%s\n' "$TASKER_ACTOR_KIND:$TASKER_ACTOR_ID" >> "{capture}"
     .expect("delegate refine session");
 
     let captured = fs::read_to_string(capture).expect("capture");
+    assert!(captured.contains("--extension"));
+    assert!(captured.contains("extensions/tasker-pi/src/index.ts"));
     assert!(captured.contains("Task Queue Key: TASK"));
     assert!(captured.contains("tasker_create_delegated_root_task"));
+    assert!(captured.contains("Initial human intent:"));
+    assert!(captured.contains("Investigate transcript volume regression"));
     assert!(captured.contains("Refinement target: TASK-1"));
     assert!(captured.contains("Existing Backlog Task context for refinement"));
     assert!(captured.contains("tasker_refine_backlog_task"));
+    assert!(captured.contains("Clarify acceptance criteria"));
     assert!(captured.contains("delegating_agent:delegator"));
 }
 

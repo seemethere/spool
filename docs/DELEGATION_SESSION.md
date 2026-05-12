@@ -16,15 +16,24 @@ The first implementation is local-first and CLI-first. It does not add a web UI,
 4. When the task contract is clear, the agent calls deterministic Tasker tooling to create one **Root Task** in the selected **Task Queue**.
 5. The created Task defaults to **Backlog** unless the Delegating Agent explicitly requests **Ready** and supplies enough structured requirements for autonomous execution.
 
-The first CLI shape is:
+The first dogfoodable CLI shapes are:
 
 ```text
-tasker delegate --queue <task_queue_key>
+tasker delegate --queue <task_queue_key> "<initial human intent>"
+tasker delegate --queue <task_queue_key> --intent-file <path>
 ```
+
+For Tasker dogfooding, run from the **Managed Source Repository** with the project config selected, for example:
+
+```bash
+bin/tasker-local delegate --queue TASKER "Investigate and reduce transcript volume regression"
+```
+
+When `--pi-extension` is not supplied, `tasker delegate` loads the repo-local Tasker Pi Extension at `extensions/tasker-pi/src/index.ts` if it exists.
 
 Happy path for a human-present Operator or **Delegating Agent**:
 
-1. From the **Managed Source Repository**, run `tasker delegate --queue TASKER` with the project Tasker config selected.
+1. From the **Managed Source Repository**, run `tasker delegate --queue TASKER "<initial human intent>"` with the project Tasker config selected.
 2. Tasker starts a Pi-backed **Interactive Agent Session** with the Delegating Agent Role Prompt and the Tasker Pi Extension environment.
 3. The **Delegating Agent** runs the **Delegation Interview**, asking one question at a time and reading local context docs only as needed for Tasker domain language.
 4. When the draft is clear, the agent validates structured fields and calls the deterministic creation helper, exposed to pi as `tasker_create_delegated_root_task`.
@@ -46,7 +55,7 @@ Refinement is only for **Backlog** Tasks in the first implementation. It must no
 
 Happy path for refinement:
 
-1. From the **Managed Source Repository**, run `tasker delegate --refine TASKER-123` for an existing **Backlog** Task.
+1. From the **Managed Source Repository**, run `tasker delegate --refine TASKER-123 "<refinement intent>"` or `tasker delegate --refine TASKER-123 --intent-file intent.md` for an existing **Backlog** Task.
 2. Tasker loads the Task context bundle and passes the current Task contract, requirements, **Task Conflict Hints**, **Blocking Tasks**, and **Workpad Note** to the Pi-backed **Delegation Session**.
 3. The **Delegating Agent** runs a focused **Delegation Interview** about only missing or ambiguous contract details.
 4. When the refined contract is clear, the agent validates structured fields and calls the deterministic refinement helper, exposed to pi as `tasker_refine_backlog_task`.

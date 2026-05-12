@@ -15,6 +15,7 @@ const DEFAULT_DELEGATING_ROLE_PROMPT: &str = "You are a Tasker Delegating Agent 
 pub struct DelegationPromptContext<'a> {
     pub queue_key: Option<&'a str>,
     pub refine_task_identifier: Option<&'a str>,
+    pub initial_intent: Option<&'a str>,
     pub managed_source_repository: &'a Path,
 }
 
@@ -23,6 +24,7 @@ pub struct DelegationSessionRequest {
     pub queue_key: Option<String>,
     pub refine_task_identifier: Option<String>,
     pub existing_task_context: Option<String>,
+    pub initial_intent: Option<String>,
     pub managed_source_repository: PathBuf,
     pub api_url: String,
     pub api_token: String,
@@ -45,6 +47,7 @@ pub async fn run_delegation_session(
     let mut prompt = build_delegation_prompt(DelegationPromptContext {
         queue_key: request.queue_key.as_deref(),
         refine_task_identifier: request.refine_task_identifier.as_deref(),
+        initial_intent: request.initial_intent.as_deref(),
         managed_source_repository: &request.managed_source_repository,
     })?;
     if let Some(existing_task_context) = &request.existing_task_context {
@@ -56,6 +59,17 @@ pub async fn run_delegation_session(
     let mut command = Command::new(&request.pi_bin);
     command.arg("--mode").arg("rpc");
     if let Some(extension) = &request.pi_extension {
+        let extension_path = if extension.is_absolute() {
+            extension.clone()
+        } else {
+            request.managed_source_repository.join(extension)
+        };
+        if !extension_path.is_file() {
+            anyhow::bail!(
+                "Tasker Pi Extension not found at {}. Restore the repo-local extension, run from the Managed Source Repository, or pass --pi-extension explicitly.",
+                extension_path.display()
+            );
+        }
         command.arg("--extension").arg(extension);
     }
     let mut child = command
@@ -71,7 +85,7 @@ pub async fn run_delegation_session(
         .spawn()
         .with_context(|| {
             format!(
-                "failed to start Pi-backed Delegation Session process {}",
+                "failed to start Pi-backed Delegation Session process {}. Verify pi is installed, the configured pi executable is on PATH, and the Tasker Pi Extension path is valid.",
                 request.pi_bin
             )
         })?;
@@ -127,14 +141,12 @@ pub async fn run_delegation_session(
     }
 
     if !completed {
+        let stdout_text = locked_string(&stdout);
         let stderr_text = locked_string(&stderr);
         anyhow::bail!(
-            "Pi-backed Delegation Session exited without agent_end{}",
-            if stderr_text.trim().is_empty() {
-                String::new()
-            } else {
-                format!(": {}", stderr_text.trim())
-            }
+            "Pi-backed Delegation Session exited without agent_end. Likely causes: Tasker Service/API unavailable at {}, Tasker Pi Extension startup failure, pi startup/runtime failure, or the Delegating Agent ended without emitting agent_end. {}",
+            request.api_url,
+            concise_process_diagnostic(&stdout_text, &stderr_text, &request.api_token)
         );
     }
 
@@ -171,9 +183,40 @@ pub fn build_delegation_prompt(context: DelegationPromptContext<'_>) -> Result<S
         (None, None) => "Task Queue Key: not selected yet\nMode: create one new Root Task after selecting the intended Task Queue.".to_string(),
     };
 
+    let initial_intent = context
+        .initial_intent
+        .map(|intent| format!("\n\nInitial human intent:\n{intent}"))
+        .unwrap_or_default();
+
     Ok(format!(
-        "{base}\n\nDelegation Session type: Interactive Agent Session\nQuestion UI is allowed because a human is intentionally present. Do not apply Unattended Worker Session question-failure handling here; that behavior remains only for Worker Loop launches.\n\n{session_target}\n\nDelegating Agent instructions:\n- Run a one-question-at-a-time Delegation Interview and ask at most one substantive question per turn.\n- Stop asking when the Task can be represented as clear structured Tasker data.\n- Create or refine only Tasker data through deterministic Tasker tooling, preferably the Tasker Pi Extension.\n- Keep structured Acceptance Criteria and Validation Items as authoritative fields; do not bury gates only in the Task Brief.\n- Use Backlog when requirements are incomplete; use Ready only when autonomous Worker Agent execution has enough structured requirements.\n- Prefer Agent-Gated Integration by leaving review_required false unless the human, Task, or Task Queue explicitly requires Human Review.\n- Do not claim to be a Worker Agent, Review Agent, Operator, or Subagent Review Loop reviewer.\n\nStructured Task draft fields:\n- queue_key\n- title\n- brief (Task Brief Markdown narrative; may include a short Workpad Note seed)\n- priority: urgent, high, normal, or low\n- initial_state: backlog or ready\n- review_required\n- tags\n- conflict_hints (advisory Task Conflict Hints / likely paths or docs)\n- blocking_task_identifiers (same Task Queue only)\n- acceptance_criteria\n- validation_items\n"
+        "{base}\n\nDelegation Session type: Interactive Agent Session\nQuestion UI is allowed because a human is intentionally present. Do not apply Unattended Worker Session question-failure handling here; that behavior remains only for Worker Loop launches.\n\n{session_target}{initial_intent}\n\nDelegating Agent instructions:\n- Run a one-question-at-a-time Delegation Interview and ask at most one substantive question per turn.\n- Stop asking when the Task can be represented as clear structured Tasker data.\n- Create or refine only Tasker data through deterministic Tasker tooling, preferably the Tasker Pi Extension.\n- Keep structured Acceptance Criteria and Validation Items as authoritative fields; do not bury gates only in the Task Brief.\n- Use Backlog when requirements are incomplete; use Ready only when autonomous Worker Agent execution has enough structured requirements.\n- Prefer Agent-Gated Integration by leaving review_required false unless the human, Task, or Task Queue explicitly requires Human Review.\n- Do not claim to be a Worker Agent, Review Agent, Operator, or Subagent Review Loop reviewer.\n\nStructured Task draft fields:\n- queue_key\n- title\n- brief (Task Brief Markdown narrative; may include a short Workpad Note seed)\n- priority: urgent, high, normal, or low\n- initial_state: backlog or ready\n- review_required\n- tags\n- conflict_hints (advisory Task Conflict Hints / likely paths or docs)\n- blocking_task_identifiers (same Task Queue only)\n- acceptance_criteria\n- validation_items\n"
     ))
+}
+
+fn concise_process_diagnostic(stdout: &str, stderr: &str, token: &str) -> String {
+    fn redact_and_trim(text: &str, token: &str) -> String {
+        let mut redacted = if token.is_empty() {
+            text.to_string()
+        } else {
+            text.replace(token, "[REDACTED_TASKER_API_TOKEN]")
+        };
+        redacted = redacted.trim().to_string();
+        const LIMIT: usize = 1200;
+        if redacted.len() > LIMIT {
+            redacted.truncate(LIMIT);
+            redacted.push_str("...[truncated]");
+        }
+        redacted
+    }
+
+    let stdout = redact_and_trim(stdout, token);
+    let stderr = redact_and_trim(stderr, token);
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => "No stdout/stderr diagnostics were captured.".to_string(),
+        (false, true) => format!("Captured stdout: {stdout}"),
+        (true, false) => format!("Captured stderr: {stderr}"),
+        (false, false) => format!("Captured stdout: {stdout}; captured stderr: {stderr}"),
+    }
 }
 
 fn scan_agent_end(output: &str) -> bool {
@@ -236,6 +279,7 @@ mod tests {
         let prompt = build_delegation_prompt(DelegationPromptContext {
             queue_key: Some("TASKER"),
             refine_task_identifier: None,
+            initial_intent: None,
             managed_source_repository: temp.path(),
         })
         .expect("prompt");
@@ -276,6 +320,7 @@ mod tests {
         let prompt = build_delegation_prompt(DelegationPromptContext {
             queue_key: Some("TASKER"),
             refine_task_identifier: None,
+            initial_intent: None,
             managed_source_repository: temp.path(),
         })
         .expect("prompt");
@@ -294,6 +339,7 @@ mod tests {
         let prompt = build_delegation_prompt(DelegationPromptContext {
             queue_key: None,
             refine_task_identifier: Some("TASKER-1"),
+            initial_intent: None,
             managed_source_repository: temp.path(),
         })
         .expect("prompt");
@@ -304,6 +350,45 @@ mod tests {
         assert!(prompt.contains("Do not revise active work"));
         assert!(prompt
             .contains("Ready, In Progress, Human Review, Rework, Integrating, Done, or Canceled"));
+    }
+
+    #[test]
+    fn delegation_prompt_includes_initial_intent_for_create_and_refine() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let create_prompt = build_delegation_prompt(DelegationPromptContext {
+            queue_key: Some("TASKER"),
+            refine_task_identifier: None,
+            initial_intent: Some("Investigate transcript volume regression"),
+            managed_source_repository: temp.path(),
+        })
+        .expect("create prompt");
+        assert!(create_prompt.contains("Initial human intent:"));
+        assert!(create_prompt.contains("Investigate transcript volume regression"));
+
+        let refine_prompt = build_delegation_prompt(DelegationPromptContext {
+            queue_key: None,
+            refine_task_identifier: Some("TASKER-1"),
+            initial_intent: Some("Clarify acceptance criteria"),
+            managed_source_repository: temp.path(),
+        })
+        .expect("refine prompt");
+        assert!(refine_prompt.contains("Initial human intent:"));
+        assert!(refine_prompt.contains("Clarify acceptance criteria"));
+    }
+
+    #[test]
+    fn delegation_diagnostic_redacts_token_and_truncates_process_output() {
+        let diagnostic = concise_process_diagnostic(
+            &format!("stdout token={} {}", "secret-token", "x".repeat(1500)),
+            "stderr ok",
+            "secret-token",
+        );
+
+        assert!(diagnostic.contains("[REDACTED_TASKER_API_TOKEN]"));
+        assert!(!diagnostic.contains("secret-token"));
+        assert!(diagnostic.contains("[truncated]"));
+        assert!(diagnostic.contains("stderr ok"));
     }
 
     #[cfg(unix)]
@@ -329,6 +414,7 @@ printf '%s\n' "$TASKER_ACTOR_KIND:$TASKER_ACTOR_ID:$TASKER_API_URL" >> "{capture
             queue_key: Some("TASK".to_string()),
             refine_task_identifier: None,
             existing_task_context: None,
+            initial_intent: None,
             managed_source_repository: temp.path().to_path_buf(),
             api_url: "http://tasker.test".to_string(),
             api_token: "token".to_string(),
