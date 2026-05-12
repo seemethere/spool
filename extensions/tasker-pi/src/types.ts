@@ -41,6 +41,12 @@ export interface RequirementStatusInput {
   validated_base_commit?: string;
 }
 
+export interface ReviewDecisionInput {
+  identifier: string;
+  decision: "approve" | "rework";
+  feedback?: string;
+}
+
 export interface CreateChildTaskInput {
   parent_identifier: string;
   title: string;

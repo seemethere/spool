@@ -109,6 +109,12 @@ pub(crate) fn write_review_packet(
     Ok(())
 }
 
+pub(crate) fn render_review_packet(bundle: &tasker_db::TaskContextBundle) -> Result<String> {
+    let mut out = Vec::new();
+    write_review_packet(&mut out, bundle).context("failed to render Review Packet")?;
+    String::from_utf8(out).context("Review Packet output was not valid UTF-8")
+}
+
 fn write_text_or_none(mut writer: impl Write, text: &str) -> std::io::Result<()> {
     if text.trim().is_empty() {
         writeln!(writer, "(none)")

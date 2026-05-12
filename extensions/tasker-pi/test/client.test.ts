@@ -219,6 +219,25 @@ describe("TaskerClient", () => {
     });
   });
 
+  it("records Review Decisions through the deterministic endpoint", async () => {
+    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const reviewer = { kind: "review_agent", id: "reviewer", display_name: "Reviewer" };
+
+    await client.recordReviewDecision({
+      identifier: "TASK-1",
+      decision: "rework",
+      feedback: "Tighten the validation evidence.",
+    }, reviewer);
+
+    expect(requests[0].url).toBe("http://tasker.test/tasks/TASK-1/review-decision");
+    expect(requests[0].init.method).toBe("POST");
+    expect(JSON.parse(requests[0].init.body as string)).toEqual({
+      actor: reviewer,
+      decision: "rework",
+      feedback: "Tighten the validation evidence.",
+    });
+  });
+
   it("writes supervisor-readable worker status reports", () => {
     const dir = mkdtempSync(join(tmpdir(), "tasker-status-"));
     try {

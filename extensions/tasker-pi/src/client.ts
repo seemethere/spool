@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { appendFileSync, existsSync } from "node:fs";
-import type { Actor, CreateChildTaskInput, RequirementStatusInput, TaskerExtensionConfig, WorkerStatusReportInput } from "./types";
+import type { Actor, CreateChildTaskInput, RequirementStatusInput, ReviewDecisionInput, TaskerExtensionConfig, WorkerStatusReportInput } from "./types";
 
 export class TaskerClient {
   private readonly apiUrl: string;
@@ -89,6 +89,14 @@ export class TaskerClient {
       agent_run_id: agentRunId ?? null,
     }, signal);
     return preflightWarning === undefined ? detail : { detail, preflight_warning: preflightWarning };
+  }
+
+  recordReviewDecision(input: ReviewDecisionInput, actor: Actor, signal?: AbortSignal): Promise<unknown> {
+    return this.request("POST", `/tasks/${encodeURIComponent(input.identifier)}/review-decision`, {
+      actor,
+      decision: input.decision,
+      feedback: input.feedback ?? null,
+    }, signal);
   }
 
   reportWorkerStatus(input: WorkerStatusReportInput, actor: Actor, workerStatusPath?: string): unknown {

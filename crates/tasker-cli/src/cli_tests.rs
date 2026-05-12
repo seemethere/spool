@@ -1343,6 +1343,160 @@ Implement reviewable work.
         .contains("Address the review feedback"));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn review_command_launches_pi_backed_interactive_review_session() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = TaskerPaths::resolve(temp.path(), PathOverrides::default());
+    init(&paths, false).await.expect("init");
+    let repo = temp.path().join("repo");
+    init_git_repo(&repo);
+    let prompt_dir = repo.join(".tasker/prompts");
+    fs::create_dir_all(&prompt_dir).expect("prompt dir");
+    fs::write(
+        prompt_dir.join("review.md"),
+        "Custom repo Review Agent prompt.",
+    )
+    .expect("write prompt override");
+    queue(
+        &paths,
+        false,
+        QueueCommand::Create {
+            key: "TASK".to_string(),
+            name: "Tasker".to_string(),
+            managed_source_repository: repo.clone(),
+            main_branch: "main".to_string(),
+            worktree_root: temp.path().join("worktrees"),
+            branch_template: "tasker/{task_identifier}".to_string(),
+            done_worktree_retention: false,
+            queue_concurrency_limit: None,
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect("create queue");
+    let task_file = temp.path().join("review-task.md");
+    fs::write(
+        &task_file,
+        r#"---
+title: Review launch
+acceptance_criteria:
+  - It works
+validation_items:
+  - Tests pass
+---
+Implement reviewable work.
+"#,
+    )
+    .expect("write task file");
+    task(
+        &paths,
+        false,
+        TaskCommand::Create {
+            bootstrap: false,
+            queue: "TASK".to_string(),
+            from_file: Some(task_file),
+            file: None,
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect("create task");
+    let pool = open_pool(&paths, false).await.expect("pool");
+    let actor = tasker_db::Actor::operator("tester");
+    tasker_db::transition_task_state(
+        &pool,
+        "TASK-1",
+        &tasker_db::TransitionTaskState {
+            to_state: "in_progress".to_string(),
+            agent_run_id: None,
+            repair_override: false,
+        },
+        &actor,
+    )
+    .await
+    .expect("start");
+    tasker_db::update_acceptance_criterion_status(
+        &pool,
+        "TASK-1",
+        1,
+        &tasker_db::UpdateRequirementStatus {
+            status: "satisfied".to_string(),
+            waiver_reason: None,
+            validated_base_commit: None,
+        },
+        &actor,
+    )
+    .await
+    .expect("criterion");
+    tasker_db::update_validation_item_status(
+        &pool,
+        "TASK-1",
+        1,
+        &tasker_db::UpdateRequirementStatus {
+            status: "passed".to_string(),
+            waiver_reason: None,
+            validated_base_commit: None,
+        },
+        &actor,
+    )
+    .await
+    .expect("validation");
+    tasker_db::transition_task_state(
+        &pool,
+        "TASK-1",
+        &tasker_db::TransitionTaskState {
+            to_state: "human_review".to_string(),
+            agent_run_id: None,
+            repair_override: false,
+        },
+        &actor,
+    )
+    .await
+    .expect("human review");
+
+    let capture = temp.path().join("review-prompt.jsonl");
+    let pi_bin = temp.path().join("fake-pi");
+    fs::write(
+        &pi_bin,
+        format!(
+            r#"#!/bin/sh
+cat > "{capture}"
+printf '%s\n' '{{"type":"extension_ui_request","method":"select"}}'
+printf '%s\n' '{{"type":"agent_end"}}'
+printf '%s\n' "$TASKER_ACTOR_KIND:$TASKER_ACTOR_ID" >> "{capture}"
+"#,
+            capture = capture.display()
+        ),
+    )
+    .expect("write fake pi");
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(&pi_bin).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&pi_bin, permissions).expect("chmod");
+
+    review(
+        &paths,
+        false,
+        ReviewOptions {
+            identifier: "TASK-1".to_string(),
+            actor: "reviewer".to_string(),
+            api_url: Some("http://tasker.test".to_string()),
+            pi_bin: pi_bin.display().to_string(),
+            pi_extension: None,
+        },
+    )
+    .await
+    .expect("review session");
+
+    let captured = fs::read_to_string(capture).expect("capture");
+    assert!(captured.contains("Custom repo Review Agent prompt."));
+    assert!(captured.contains("Review Packet"));
+    assert!(captured.contains("Question UI is allowed"));
+    assert!(captured.contains("tasker_record_review_decision"));
+    assert!(captured.contains("review_agent:reviewer"));
+}
+
 #[tokio::test]
 async fn worker_integrating_transition_rejects_dirty_local_worktree_without_state_change() {
     let temp = tempfile::tempdir().expect("tempdir");

@@ -58,6 +58,11 @@ const TransitionParams = Type.Object({
   to_state: TaskState,
   agent_run_id: Type.Optional(Type.String()),
 });
+const ReviewDecisionParams = Type.Object({
+  identifier: Identifier,
+  decision: Type.Union([Type.Literal("approve"), Type.Literal("rework")]),
+  feedback: Type.Optional(Type.String({ description: "Concise human feedback; required by Tasker for rework decisions." })),
+});
 const WorkerStatus = Type.Union([
   Type.Literal("completion_intent"),
   Type.Literal("blocked"),
@@ -169,6 +174,16 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
           signal,
         ),
       );
+    },
+  });
+
+  pi.registerTool({
+    name: "tasker_record_review_decision",
+    label: "Tasker: Record Review Decision",
+    description: "Record a human approve or rework Review Decision for a Task in Human Review through the deterministic Tasker API path.",
+    parameters: ReviewDecisionParams,
+    async execute(_id, params, signal) {
+      return asToolResult(await client.recordReviewDecision(params, config.actor, signal));
     },
   });
 
