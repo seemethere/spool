@@ -5,6 +5,7 @@
 //! should remain a command facade over these APIs.
 
 pub mod commit_metadata;
+pub mod delegate;
 pub mod local_worktree_delivery;
 pub mod repo_lock;
 pub mod review;
