@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { appendFileSync, existsSync } from "node:fs";
-import type { Actor, CreateChildTaskInput, RequirementStatusInput, ReviewDecisionInput, TaskerExtensionConfig, WorkerStatusReportInput } from "./types";
+import type { Actor, CreateChildTaskInput, DelegationTaskDraftInput, RefineBacklogTaskInput, RequirementStatusInput, ReviewDecisionInput, TaskerExtensionConfig, WorkerStatusReportInput } from "./types";
 
 export class TaskerClient {
   private readonly apiUrl: string;
@@ -96,6 +96,43 @@ export class TaskerClient {
       actor,
       decision: input.decision,
       feedback: input.feedback ?? null,
+    }, signal);
+  }
+
+  createDelegatedRootTask(input: DelegationTaskDraftInput, actor: Actor, signal?: AbortSignal): Promise<unknown> {
+    return this.request("POST", "/tasks/delegated-root", {
+      actor,
+      draft: {
+        queue_key: input.queue_key,
+        title: input.title,
+        brief: input.brief,
+        priority: input.priority ?? "normal",
+        initial_state: input.initial_state ?? "backlog",
+        review_required: input.review_required ?? false,
+        tags: input.tags ?? [],
+        conflict_hints: input.conflict_hints ?? [],
+        blocking_task_identifiers: input.blocking_task_identifiers ?? [],
+        acceptance_criteria: input.acceptance_criteria ?? [],
+        validation_items: input.validation_items ?? [],
+      },
+    }, signal);
+  }
+
+  refineBacklogTask(input: RefineBacklogTaskInput, actor: Actor, signal?: AbortSignal): Promise<unknown> {
+    return this.request("POST", `/tasks/${encodeURIComponent(input.identifier)}/refine`, {
+      actor,
+      refinement: {
+        title: input.title ?? null,
+        brief: input.brief ?? null,
+        priority: input.priority ?? null,
+        target_state: input.target_state ?? null,
+        review_required: input.review_required ?? null,
+        tags: input.tags ?? null,
+        conflict_hints: input.conflict_hints ?? null,
+        blocking_task_identifiers: input.blocking_task_identifiers ?? null,
+        acceptance_criteria: input.acceptance_criteria ?? [],
+        validation_items: input.validation_items ?? [],
+      },
     }, signal);
   }
 

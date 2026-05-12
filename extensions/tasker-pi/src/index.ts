@@ -12,6 +12,7 @@ const ValidationStatus = Type.Union([
 ]);
 const Priority = Type.Union([Type.Literal("urgent"), Type.Literal("high"), Type.Literal("normal"), Type.Literal("low")]);
 const ChildTaskState = Type.Union([Type.Literal("backlog"), Type.Literal("ready")]);
+const DelegationTaskState = Type.Union([Type.Literal("backlog"), Type.Literal("ready")]);
 const TaskState = Type.Union([
   Type.Literal("backlog"),
   Type.Literal("ready"),
@@ -62,6 +63,32 @@ const ReviewDecisionParams = Type.Object({
   identifier: Identifier,
   decision: Type.Union([Type.Literal("approve"), Type.Literal("rework")]),
   feedback: Type.Optional(Type.String({ description: "Concise human feedback; required by Tasker for rework decisions." })),
+});
+const DelegationTaskDraftParams = Type.Object({
+  queue_key: Type.String({ description: "Task Queue Key for the new Root Task." }),
+  title: Type.String(),
+  brief: Type.String({ description: "Task Brief Markdown narrative." }),
+  priority: Type.Optional(Priority),
+  initial_state: Type.Optional(DelegationTaskState),
+  review_required: Type.Optional(Type.Boolean()),
+  tags: Type.Optional(Type.Array(Type.String())),
+  conflict_hints: Type.Optional(Type.Array(Type.String({ description: "Advisory Task Conflict Hint target." }))),
+  blocking_task_identifiers: Type.Optional(Type.Array(Identifier)),
+  acceptance_criteria: Type.Optional(Type.Array(Type.String())),
+  validation_items: Type.Optional(Type.Array(Type.String())),
+});
+const RefineBacklogTaskParams = Type.Object({
+  identifier: Identifier,
+  title: Type.Optional(Type.String()),
+  brief: Type.Optional(Type.String({ description: "Task Brief Markdown narrative." })),
+  priority: Type.Optional(Priority),
+  target_state: Type.Optional(DelegationTaskState),
+  review_required: Type.Optional(Type.Boolean()),
+  tags: Type.Optional(Type.Array(Type.String())),
+  conflict_hints: Type.Optional(Type.Array(Type.String({ description: "Replacement advisory Task Conflict Hint targets." }))),
+  blocking_task_identifiers: Type.Optional(Type.Array(Identifier)),
+  acceptance_criteria: Type.Optional(Type.Array(Type.String({ description: "Replacement ordered Acceptance Criteria." }))),
+  validation_items: Type.Optional(Type.Array(Type.String({ description: "Replacement ordered Validation Items." }))),
 });
 const WorkerStatus = Type.Union([
   Type.Literal("completion_intent"),
@@ -184,6 +211,28 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
     parameters: ReviewDecisionParams,
     async execute(_id, params, signal) {
       return asToolResult(await client.recordReviewDecision(params, config.actor, signal));
+    },
+  });
+
+  pi.registerTool({
+    name: "tasker_create_delegated_root_task",
+    label: "Tasker: Create Delegated Root Task",
+    description:
+      "Create one Root Task from a Delegation Session through the deterministic Delegation Task draft helper. Use only in human-present Interactive Agent Sessions.",
+    parameters: DelegationTaskDraftParams,
+    async execute(_id, params, signal) {
+      return asToolResult(await client.createDelegatedRootTask(params, config.actor, signal));
+    },
+  });
+
+  pi.registerTool({
+    name: "tasker_refine_backlog_task",
+    label: "Tasker: Refine Backlog Task",
+    description:
+      "Refine an existing Backlog Task from a Delegation Session through the deterministic Backlog Task refinement helper. Use only in human-present Interactive Agent Sessions.",
+    parameters: RefineBacklogTaskParams,
+    async execute(_id, params, signal) {
+      return asToolResult(await client.refineBacklogTask(params, config.actor, signal));
     },
   });
 

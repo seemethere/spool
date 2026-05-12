@@ -23,11 +23,13 @@ describe("registerTaskerExtension", () => {
     expect(tools.map((tool) => tool.name).sort()).toEqual([
       "tasker_append_workpad",
       "tasker_create_child_task",
+      "tasker_create_delegated_root_task",
       "tasker_get_task",
       "tasker_get_task_context_bundle",
       "tasker_record_review_decision",
       "tasker_report_worker_status",
       "tasker_request_transition",
+      "tasker_refine_backlog_task",
       "tasker_set_acceptance_criterion_status",
       "tasker_set_validation_item_status",
       "tasker_update_workpad",
@@ -64,6 +66,14 @@ describe("registerTaskerExtension", () => {
     expect(byName.tasker_record_review_decision.properties.decision.anyOf.map((item: any) => item.const)).toEqual([
       "approve",
       "rework",
+    ]);
+    expect(byName.tasker_create_delegated_root_task.properties.initial_state.anyOf.map((item: any) => item.const)).toEqual([
+      "backlog",
+      "ready",
+    ]);
+    expect(byName.tasker_refine_backlog_task.properties.target_state.anyOf.map((item: any) => item.const)).toEqual([
+      "backlog",
+      "ready",
     ]);
     expect(byName.tasker_report_worker_status.properties.status.anyOf.map((item: any) => item.const)).toEqual([
       "completion_intent",

@@ -3532,14 +3532,6 @@ fn worker_actor() -> Actor {
     }
 }
 
-fn delegating_actor() -> Actor {
-    Actor {
-        kind: "delegating_agent".to_string(),
-        id: "delegating-agent".to_string(),
-        display_name: "delegating agent".to_string(),
-    }
-}
-
 fn sample_claim(queue_key: &str) -> ClaimNextInput {
     ClaimNextInput {
         queue_key: queue_key.to_string(),

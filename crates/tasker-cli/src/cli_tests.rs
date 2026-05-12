@@ -46,6 +46,29 @@ fn task_create_parses_preferred_from_file_shape() {
 }
 
 #[test]
+fn delegate_parses_create_and_refine_shapes() {
+    let create = Cli::try_parse_from(["tasker", "delegate", "--queue", "TASK"])
+        .expect("parse delegate create command");
+    match create.command.expect("command") {
+        Command::Delegate { queue, refine, .. } => {
+            assert_eq!(queue.as_deref(), Some("TASK"));
+            assert!(refine.is_none());
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let refine = Cli::try_parse_from(["tasker", "delegate", "--refine", "TASK-1"])
+        .expect("parse delegate refine command");
+    match refine.command.expect("command") {
+        Command::Delegate { queue, refine, .. } => {
+            assert!(queue.is_none());
+            assert_eq!(refine.as_deref(), Some("TASK-1"));
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
+#[test]
 fn monitor_help_documents_plain_tmux_and_remote_terminal_expectations() {
     let mut command = Cli::command();
     let monitor = command
@@ -1538,6 +1561,114 @@ printf '%s\n' "$TASKER_ACTOR_KIND:$TASKER_ACTOR_ID" >> "{capture}"
     assert!(captured.contains("Question UI is allowed"));
     assert!(captured.contains("tasker_record_review_decision"));
     assert!(captured.contains("review_agent:reviewer"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn delegate_command_launches_create_and_refine_interactive_sessions() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = TaskerPaths::resolve(temp.path(), PathOverrides::default());
+    init(&paths, false).await.expect("init");
+    let repo = temp.path().join("repo");
+    init_git_repo(&repo);
+    queue(
+        &paths,
+        false,
+        QueueCommand::Create {
+            key: "TASK".to_string(),
+            name: "Tasker".to_string(),
+            managed_source_repository: repo.clone(),
+            main_branch: "main".to_string(),
+            worktree_root: temp.path().join("worktrees"),
+            branch_template: "tasker/{task_identifier}".to_string(),
+            done_worktree_retention: false,
+            queue_concurrency_limit: None,
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect("create queue");
+    let task_file = temp.path().join("refine-task.md");
+    fs::write(
+        &task_file,
+        r#"---
+title: Refine me
+state: backlog
+---
+Needs a better contract.
+"#,
+    )
+    .expect("write task file");
+    task(
+        &paths,
+        false,
+        TaskCommand::Create {
+            bootstrap: false,
+            queue: "TASK".to_string(),
+            from_file: Some(task_file),
+            file: None,
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect("create backlog task");
+
+    let capture = temp.path().join("delegate-prompt.jsonl");
+    let pi_bin = temp.path().join("fake-pi");
+    fs::write(
+        &pi_bin,
+        format!(
+            r#"#!/bin/sh
+cat >> "{capture}"
+printf '%s\n' '{{"type":"extension_ui_request","method":"input"}}'
+printf '%s\n' '{{"type":"agent_end"}}'
+printf '%s\n' "$TASKER_ACTOR_KIND:$TASKER_ACTOR_ID" >> "{capture}"
+"#,
+            capture = capture.display()
+        ),
+    )
+    .expect("write fake pi");
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(&pi_bin).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&pi_bin, permissions).expect("chmod");
+
+    delegate(
+        &paths,
+        false,
+        DelegateOptions {
+            queue: Some("TASK".to_string()),
+            refine: None,
+            actor: "delegator".to_string(),
+            api_url: Some("http://tasker.test".to_string()),
+            pi_bin: pi_bin.display().to_string(),
+            pi_extension: None,
+        },
+    )
+    .await
+    .expect("delegate create session");
+    delegate(
+        &paths,
+        false,
+        DelegateOptions {
+            queue: None,
+            refine: Some("TASK-1".to_string()),
+            actor: "delegator".to_string(),
+            api_url: Some("http://tasker.test".to_string()),
+            pi_bin: pi_bin.display().to_string(),
+            pi_extension: None,
+        },
+    )
+    .await
+    .expect("delegate refine session");
+
+    let captured = fs::read_to_string(capture).expect("capture");
+    assert!(captured.contains("Task Queue Key: TASK"));
+    assert!(captured.contains("tasker_create_delegated_root_task"));
+    assert!(captured.contains("Refinement target: TASK-1"));
+    assert!(captured.contains("Existing Backlog Task context for refinement"));
+    assert!(captured.contains("tasker_refine_backlog_task"));
+    assert!(captured.contains("delegating_agent:delegator"));
 }
 
 #[tokio::test]

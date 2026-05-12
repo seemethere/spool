@@ -14,6 +14,7 @@ mod bootstrap;
 mod cleanup;
 mod cleanup_cmd;
 mod db_cmd;
+mod delegate_cmd;
 mod display;
 mod merge_cmd;
 mod monitor;
@@ -37,6 +38,7 @@ use db_cmd::{
     guard_db_migrate_source_from, guard_supervisor_auto_migrate_source_from,
     prepare_supervisor_migrations,
 };
+use delegate_cmd::delegate;
 use merge_cmd::{git_output, merge};
 #[cfg(test)]
 use merge_cmd::{manual_squash_integration_guidance, post_merge_batch_validation_guidance};
@@ -211,6 +213,27 @@ enum Command {
         #[arg(long, default_value = "local-review-agent", hide = true)]
         actor: String,
         /// Tasker API URL exposed to the launched Review Agent.
+        #[arg(long, hide = true)]
+        api_url: Option<String>,
+        /// Pi executable path.
+        #[arg(long, default_value = "pi", hide = true)]
+        pi_bin: String,
+        /// Tasker Pi Extension file to load into pi.
+        #[arg(long, hide = true)]
+        pi_extension: Option<PathBuf>,
+    },
+    /// Start a Pi-backed interactive Delegation Session.
+    Delegate {
+        /// Task Queue Key for creating a new Root Task.
+        #[arg(long)]
+        queue: Option<String>,
+        /// Refine an existing Backlog Task instead of creating a Root Task.
+        #[arg(long)]
+        refine: Option<String>,
+        /// Delegating Agent actor display name.
+        #[arg(long, default_value = "local-delegating-agent", hide = true)]
+        actor: String,
+        /// Tasker API URL exposed to the launched Delegating Agent.
         #[arg(long, hide = true)]
         api_url: Option<String>,
         /// Pi executable path.
@@ -746,6 +769,15 @@ struct ReviewOptions {
     pi_extension: Option<PathBuf>,
 }
 
+struct DelegateOptions {
+    queue: Option<String>,
+    refine: Option<String>,
+    actor: String,
+    api_url: Option<String>,
+    pi_bin: String,
+    pi_extension: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct PathForwardingOptions {
     config: Option<PathBuf>,
@@ -881,6 +913,28 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Some(Command::Delegate {
+            queue,
+            refine,
+            actor,
+            api_url,
+            pi_bin,
+            pi_extension,
+        }) => {
+            delegate(
+                &paths,
+                db_path_overridden,
+                DelegateOptions {
+                    queue,
+                    refine,
+                    actor,
+                    api_url,
+                    pi_bin,
+                    pi_extension,
+                },
+            )
+            .await
+        }
         Some(Command::Cleanup { command }) => cleanup(&paths, db_path_overridden, command).await,
         Some(Command::Merge { command }) => merge(&paths, db_path_overridden, command).await,
         Some(Command::Serve { bind }) => serve(&paths, bind, db_path_overridden).await,
@@ -983,6 +1037,7 @@ fn command_is_unsafe_mutation(command: &Option<Command>) -> bool {
             | Command::Work { .. }
             | Command::Supervise { .. }
             | Command::Review { .. }
+            | Command::Delegate { .. }
             | Command::Serve { .. },
         ) => true,
         Some(Command::Queue { command }) => matches!(
@@ -1084,6 +1139,10 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
         Some(Command::Monitor { queue: None, .. } | Command::Cleanup { .. }) => None,
         Some(Command::ReviewPacket { identifier }) => queue_key_from_task_identifier(identifier),
         Some(Command::Review { identifier, .. }) => queue_key_from_task_identifier(identifier),
+        Some(Command::Delegate { queue, refine, .. }) => refine
+            .as_deref()
+            .and_then(queue_key_from_task_identifier)
+            .or_else(|| queue.clone()),
         Some(Command::Merge { command }) => match command {
             MergeCommand::Queue { queue } => queue.clone(),
             MergeCommand::Inspect { .. } => None,

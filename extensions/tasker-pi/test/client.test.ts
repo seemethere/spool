@@ -238,6 +238,70 @@ describe("TaskerClient", () => {
     });
   });
 
+  it("creates delegated Root Tasks through the deterministic draft endpoint", async () => {
+    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const delegator = { kind: "delegating_agent", id: "delegator", display_name: "Delegator" };
+
+    await client.createDelegatedRootTask({
+      queue_key: "TASK",
+      title: "Delegated",
+      brief: "Task Brief",
+      initial_state: "ready",
+      acceptance_criteria: ["works"],
+      validation_items: ["tests"],
+    }, delegator);
+
+    expect(requests[0].url).toBe("http://tasker.test/tasks/delegated-root");
+    expect(requests[0].init.method).toBe("POST");
+    expect(JSON.parse(requests[0].init.body as string)).toEqual({
+      actor: delegator,
+      draft: {
+        queue_key: "TASK",
+        title: "Delegated",
+        brief: "Task Brief",
+        priority: "normal",
+        initial_state: "ready",
+        review_required: false,
+        tags: [],
+        conflict_hints: [],
+        blocking_task_identifiers: [],
+        acceptance_criteria: ["works"],
+        validation_items: ["tests"],
+      },
+    });
+  });
+
+  it("refines Backlog Tasks through the deterministic refinement endpoint", async () => {
+    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const delegator = { kind: "delegating_agent", id: "delegator", display_name: "Delegator" };
+
+    await client.refineBacklogTask({
+      identifier: "TASK-1",
+      title: "Refined",
+      target_state: "ready",
+      acceptance_criteria: ["clear"],
+      validation_items: ["checked"],
+    }, delegator);
+
+    expect(requests[0].url).toBe("http://tasker.test/tasks/TASK-1/refine");
+    expect(requests[0].init.method).toBe("POST");
+    expect(JSON.parse(requests[0].init.body as string)).toEqual({
+      actor: delegator,
+      refinement: {
+        title: "Refined",
+        brief: null,
+        priority: null,
+        target_state: "ready",
+        review_required: null,
+        tags: null,
+        conflict_hints: null,
+        blocking_task_identifiers: null,
+        acceptance_criteria: ["clear"],
+        validation_items: ["checked"],
+      },
+    });
+  });
+
   it("writes supervisor-readable worker status reports", () => {
     const dir = mkdtempSync(join(tmpdir(), "tasker-status-"));
     try {

@@ -41,6 +41,12 @@ pub struct CreateTaskRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CreateDelegatedRootTaskRequest {
+    pub actor: tasker_db::Actor,
+    pub draft: tasker_db::DelegationTaskDraft,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CreateChildTaskRequest {
     pub actor: tasker_db::Actor,
     pub task: tasker_db::CreateChildTask,
@@ -118,6 +124,7 @@ pub fn router(app_version: impl Into<String>, pool: SqlitePool) -> Router {
         .route("/queues/{key}", get(get_queue))
         .route("/queues/{key}/claim-next", post(claim_next))
         .route("/tasks/bootstrap", post(create_task))
+        .route("/tasks/delegated-root", post(create_delegated_root_task))
         .route("/tasks/{identifier}", get(get_task))
         .route("/tasks/{identifier}/refine", post(refine_backlog_task))
         .route(
@@ -205,6 +212,18 @@ async fn create_task(
     require_auth(&state.pool, &headers).await?;
     require_task_create_actor(&request.actor)?;
     tasker_db::create_task(&state.pool, &request.task, &request.actor)
+        .await
+        .map(|task| (StatusCode::CREATED, Json(task)))
+        .map_err(task_mutation_error)
+}
+
+async fn create_delegated_root_task(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateDelegatedRootTaskRequest>,
+) -> Result<(StatusCode, Json<tasker_db::TaskDetail>), (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    tasker_db::create_delegated_root_task(&state.pool, &request.draft, &request.actor)
         .await
         .map(|task| (StatusCode::CREATED, Json(task)))
         .map_err(task_mutation_error)
@@ -958,6 +977,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn delegated_root_endpoint_uses_deterministic_draft_helper() {
+        let (_temp, pool, token) = migrated_pool().await;
+        let app = router("test-version", pool);
+
+        let queue = app
+            .clone()
+            .oneshot(create_queue_request("TASK", "Tasker", "operator", &token))
+            .await
+            .unwrap();
+        assert_eq!(queue.status(), StatusCode::CREATED);
+
+        let create = app
+            .clone()
+            .oneshot(create_delegated_root_task_request(
+                "TASK",
+                "Delegated",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(create.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["task"]["identifier"], "TASK-1");
+        assert_eq!(json["task"]["state"], "ready");
+        assert_eq!(json["acceptance_criteria"].as_array().unwrap().len(), 1);
+
+        let invalid = app
+            .oneshot(create_delegated_root_task_request("TASK", "", &token))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1743,6 +1799,41 @@ mod tests {
         Request::builder()
             .method("POST")
             .uri("/tasks/bootstrap")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(request.to_string()))
+            .unwrap()
+    }
+
+    fn create_delegated_root_task_request(
+        queue_key: &str,
+        title: &str,
+        token: &str,
+    ) -> Request<Body> {
+        let request = serde_json::json!({
+            "actor": {
+                "kind": "delegating_agent",
+                "id": "delegator",
+                "display_name": "delegator"
+            },
+            "draft": {
+                "queue_key": queue_key,
+                "title": title,
+                "brief": "Delegated Task Brief",
+                "priority": "normal",
+                "initial_state": "ready",
+                "review_required": false,
+                "acceptance_criteria": ["Outcome is clear"],
+                "validation_items": ["Deterministic check passes"],
+                "tags": ["delegation"],
+                "conflict_hints": ["crates/tasker-cli"],
+                "blocking_task_identifiers": []
+            }
+        });
+
+        Request::builder()
+            .method("POST")
+            .uri("/tasks/delegated-root")
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {token}"))
             .body(Body::from(request.to_string()))

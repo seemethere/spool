@@ -47,6 +47,34 @@ export interface ReviewDecisionInput {
   feedback?: string;
 }
 
+export interface DelegationTaskDraftInput {
+  queue_key: string;
+  title: string;
+  brief: string;
+  priority?: "urgent" | "high" | "normal" | "low";
+  initial_state?: "backlog" | "ready";
+  review_required?: boolean;
+  tags?: string[];
+  conflict_hints?: string[];
+  blocking_task_identifiers?: string[];
+  acceptance_criteria?: string[];
+  validation_items?: string[];
+}
+
+export interface RefineBacklogTaskInput {
+  identifier: string;
+  title?: string;
+  brief?: string;
+  priority?: "urgent" | "high" | "normal" | "low";
+  target_state?: "backlog" | "ready";
+  review_required?: boolean;
+  tags?: string[];
+  conflict_hints?: string[];
+  blocking_task_identifiers?: string[];
+  acceptance_criteria?: string[];
+  validation_items?: string[];
+}
+
 export interface CreateChildTaskInput {
   parent_identifier: string;
   title: string;
