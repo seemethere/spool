@@ -407,6 +407,158 @@ async fn bootstrap_task_creation_rejects_later_lifecycle_states() {
 }
 
 #[tokio::test]
+async fn delegation_task_draft_creates_valid_root_task_with_structured_fields() {
+    let (_temp, pool) = migrated_pool().await;
+    create_task_queue(
+        &pool,
+        &sample_queue("TASK", "Tasker"),
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect("create queue");
+
+    let draft = DelegationTaskDraft {
+        queue_key: " TASK ".to_string(),
+        title: " Add delegate helper ".to_string(),
+        brief: " Create a deterministic helper. ".to_string(),
+        priority: "High".to_string(),
+        initial_state: "Ready".to_string(),
+        review_required: true,
+        tags: vec![
+            "delegation".to_string(),
+            "dogfood".to_string(),
+            "delegation".to_string(),
+        ],
+        conflict_hints: vec![
+            "crates/tasker-db".to_string(),
+            "crates/tasker-db".to_string(),
+        ],
+        blocking_task_identifiers: vec![],
+        acceptance_criteria: vec!["Draft validates".to_string()],
+        validation_items: vec!["cargo test -p tasker-db".to_string()],
+    };
+
+    let created = create_delegated_root_task(&pool, &draft, &delegating_actor())
+        .await
+        .expect("create delegated Root Task");
+
+    assert_eq!(created.task.identifier, "TASK-1");
+    assert_eq!(created.task.title, "Add delegate helper");
+    assert_eq!(created.task.priority, "high");
+    assert_eq!(created.task.state, "ready");
+    assert!(created.task.review_required);
+    assert_eq!(
+        created.acceptance_criteria[0].description,
+        "Draft validates"
+    );
+    assert_eq!(
+        created.validation_items[0].description,
+        "cargo test -p tasker-db"
+    );
+    assert_eq!(created.tags, vec!["delegation", "dogfood"]);
+    assert_eq!(created.conflict_hints[0].target, "crates/tasker-db");
+}
+
+#[test]
+fn delegation_task_draft_rejects_ready_without_structured_gates() {
+    let mut draft = sample_delegation_draft("TASK", "Missing gates");
+    draft.initial_state = "ready".to_string();
+    draft.acceptance_criteria.clear();
+
+    let error = validate_delegation_task_draft(&draft).expect_err("Ready without gates fails");
+
+    let message = error.to_string();
+    assert!(message.contains("Ready Task drafts require"));
+    assert!(message.contains("acceptance_criteria"));
+    assert!(message.contains("validation_items"));
+}
+
+#[test]
+fn delegation_task_draft_rejects_unsupported_fields() {
+    let error = serde_json::from_value::<DelegationTaskDraft>(serde_json::json!({
+        "queue_key": "TASK",
+        "title": "Unsupported field",
+        "brief": "Brief",
+        "estimate": "not a v1 Tasker field"
+    }))
+    .expect_err("unsupported Delegating Agent fields fail");
+
+    assert!(error.to_string().contains("unknown field"));
+}
+
+#[tokio::test]
+async fn delegation_task_draft_records_blockers_conflict_hints_and_review_requirement() {
+    let (_temp, pool) = migrated_pool().await;
+    create_task_queue(
+        &pool,
+        &sample_queue("TASK", "Tasker"),
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect("create queue");
+    create_task(
+        &pool,
+        &sample_task("TASK", "Blocking"),
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect("create Blocking Task");
+
+    let mut draft = sample_delegation_draft("TASK", "Blocked draft");
+    draft.initial_state = "ready".to_string();
+    draft.review_required = true;
+    draft.conflict_hints = vec!["docs/DELEGATION_SESSION.md".to_string()];
+    draft.blocking_task_identifiers = vec![" task-1 ".to_string()];
+
+    let created = create_delegated_root_task(&pool, &draft, &delegating_actor())
+        .await
+        .expect("create blocked delegated Root Task");
+
+    assert!(created.task.review_required);
+    assert_eq!(created.blocking_tasks.len(), 1);
+    assert_eq!(created.blocking_tasks[0].identifier, "TASK-1");
+    assert_eq!(
+        created.conflict_hints[0].target,
+        "docs/DELEGATION_SESSION.md"
+    );
+}
+
+#[tokio::test]
+async fn delegation_task_draft_rejects_cross_queue_blockers() {
+    let (_temp, pool) = migrated_pool().await;
+    create_task_queue(
+        &pool,
+        &sample_queue("TASK", "Tasker"),
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect("create queue");
+    create_task_queue(
+        &pool,
+        &sample_queue("OTHER", "Other"),
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect("create other queue");
+    create_task(
+        &pool,
+        &sample_task("OTHER", "Other blocker"),
+        &Actor::operator("tester"),
+    )
+    .await
+    .expect("create other Blocking Task");
+
+    let mut draft = sample_delegation_draft("TASK", "Cross queue blocker");
+    draft.blocking_task_identifiers = vec!["OTHER-1".to_string()];
+
+    let error = create_delegated_root_task(&pool, &draft, &delegating_actor())
+        .await
+        .expect_err("cross-queue blocker fails");
+
+    assert!(error.to_string().contains("same Task Queue"));
+}
+
+#[tokio::test]
 async fn backlog_task_may_be_created_before_requirements_are_complete() {
     let (_temp, pool) = migrated_pool().await;
     create_task_queue(
@@ -3142,6 +3294,30 @@ fn sample_queue(key: &str, name: &str) -> CreateTaskQueue {
         branch_template: "tasker/{task_identifier}".to_string(),
         done_worktree_retention: false,
         queue_concurrency_limit: None,
+    }
+}
+
+fn delegating_actor() -> Actor {
+    Actor {
+        kind: "delegating_agent".to_string(),
+        id: "delegate".to_string(),
+        display_name: "Delegating Agent".to_string(),
+    }
+}
+
+fn sample_delegation_draft(queue_key: &str, title: &str) -> DelegationTaskDraft {
+    DelegationTaskDraft {
+        queue_key: queue_key.to_string(),
+        title: title.to_string(),
+        brief: "A delegated Task Brief.".to_string(),
+        priority: "normal".to_string(),
+        initial_state: "backlog".to_string(),
+        review_required: false,
+        tags: Vec::new(),
+        conflict_hints: Vec::new(),
+        blocking_task_identifiers: Vec::new(),
+        acceptance_criteria: vec!["Delegated outcome is clear".to_string()],
+        validation_items: vec!["Deterministic tests pass".to_string()],
     }
 }
 

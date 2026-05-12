@@ -17,6 +17,7 @@ mod requirements;
 mod review;
 mod runs;
 mod status;
+mod task_draft;
 mod tasks;
 mod transitions;
 mod validation;
@@ -49,6 +50,9 @@ pub use status::{
     active_agent_runs_for_status, active_retry_holds_for_status, due_integration_retries,
     integration_retries_for_status, merge_queue_tasks, status_by_queue_and_state,
     task_conflict_groups_for_status, tasks_for_status_by_states,
+};
+pub use task_draft::{
+    create_delegated_root_task, validate_delegation_task_draft, DelegationTaskDraft,
 };
 pub use tasks::{
     create_child_task, create_task, get_task_context_bundle, get_task_detail, upsert_task_link,
