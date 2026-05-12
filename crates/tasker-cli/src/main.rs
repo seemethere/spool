@@ -19,6 +19,7 @@ mod merge_cmd;
 mod monitor;
 mod output;
 mod queue_cmd;
+mod review_packet;
 mod run_cmd;
 mod serve_cmd;
 mod status_cmd;
@@ -39,6 +40,7 @@ use merge_cmd::{git_output, merge};
 #[cfg(test)]
 use merge_cmd::{manual_squash_integration_guidance, post_merge_batch_validation_guidance};
 use queue_cmd::queue;
+use review_packet::review_packet;
 use run_cmd::run;
 use serve_cmd::serve;
 #[cfg(test)]
@@ -197,6 +199,8 @@ enum Command {
         #[command(subcommand)]
         command: RunCommand,
     },
+    /// Build a read-only local Review Packet summary for a Human Review Task.
+    ReviewPacket { identifier: String },
     /// Explicit operator cleanup for local dogfood storage artifacts.
     Cleanup {
         #[command(subcommand)]
@@ -827,6 +831,9 @@ async fn main() -> Result<()> {
             .await
         }
         Some(Command::Run { command }) => run(&paths, db_path_overridden, command).await,
+        Some(Command::ReviewPacket { identifier }) => {
+            review_packet(&paths, db_path_overridden, identifier).await
+        }
         Some(Command::Cleanup { command }) => cleanup(&paths, db_path_overridden, command).await,
         Some(Command::Merge { command }) => merge(&paths, db_path_overridden, command).await,
         Some(Command::Serve { bind }) => serve(&paths, bind, db_path_overridden).await,
@@ -956,6 +963,7 @@ fn command_is_unsafe_mutation(command: &Option<Command>) -> bool {
             Command::Status { .. }
             | Command::Telemetry { .. }
             | Command::Monitor { .. }
+            | Command::ReviewPacket { .. }
             | Command::Version,
         )
         | None => false,
@@ -1026,6 +1034,7 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
             | TelemetryCommand::BackfillMetrics { queue, .. } => queue.clone(),
         },
         Some(Command::Monitor { queue: None, .. } | Command::Cleanup { .. }) => None,
+        Some(Command::ReviewPacket { identifier }) => queue_key_from_task_identifier(identifier),
         Some(Command::Merge { command }) => match command {
             MergeCommand::Queue { queue } => queue.clone(),
             MergeCommand::Inspect { .. } => None,
