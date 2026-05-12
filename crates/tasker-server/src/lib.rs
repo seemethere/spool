@@ -980,7 +980,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegated_root_endpoint_uses_deterministic_draft_helper() {
+    async fn delegation_endpoints_cover_create_and_refine_happy_paths_without_pi() {
         let (_temp, pool, token) = migrated_pool().await;
         let app = router("test-version", pool);
 
@@ -1010,10 +1010,44 @@ mod tests {
         assert_eq!(json["acceptance_criteria"].as_array().unwrap().len(), 1);
 
         let invalid = app
+            .clone()
             .oneshot(create_delegated_root_task_request("TASK", "", &token))
             .await
             .unwrap();
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        let backlog = app
+            .clone()
+            .oneshot(create_backlog_task_request("TASK", "Refine me", &token))
+            .await
+            .unwrap();
+        assert_eq!(backlog.status(), StatusCode::CREATED);
+
+        let refine = app
+            .clone()
+            .oneshot(refine_backlog_task_request("TASK-2", &token))
+            .await
+            .unwrap();
+        assert_eq!(refine.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(refine.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["task"]["identifier"], "TASK-2");
+        assert_eq!(json["task"]["title"], "Refined Backlog Task");
+        assert_eq!(json["task"]["state"], "ready");
+        assert_eq!(
+            json["acceptance_criteria"][0]["description"],
+            "Refined outcome is clear"
+        );
+        assert_eq!(
+            json["validation_items"][0]["description"],
+            "Refinement deterministic test passes"
+        );
+        assert_eq!(
+            json["conflict_hints"][0]["target"],
+            "docs/DELEGATION_SESSION.md"
+        );
     }
 
     #[tokio::test]
@@ -1805,6 +1839,29 @@ mod tests {
             .unwrap()
     }
 
+    fn create_backlog_task_request(queue_key: &str, title: &str, token: &str) -> Request<Body> {
+        let mut task = sample_task_json(queue_key, title);
+        task["state"] = serde_json::json!("backlog");
+        task["acceptance_criteria"] = serde_json::json!([]);
+        task["validation_items"] = serde_json::json!([]);
+        let request = serde_json::json!({
+            "actor": {
+                "kind": "operator",
+                "id": "tester",
+                "display_name": "tester"
+            },
+            "task": task
+        });
+
+        Request::builder()
+            .method("POST")
+            .uri("/tasks/bootstrap")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(request.to_string()))
+            .unwrap()
+    }
+
     fn create_delegated_root_task_request(
         queue_key: &str,
         title: &str,
@@ -1834,6 +1891,36 @@ mod tests {
         Request::builder()
             .method("POST")
             .uri("/tasks/delegated-root")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(request.to_string()))
+            .unwrap()
+    }
+
+    fn refine_backlog_task_request(identifier: &str, token: &str) -> Request<Body> {
+        let request = serde_json::json!({
+            "actor": {
+                "kind": "delegating_agent",
+                "id": "delegator",
+                "display_name": "delegator"
+            },
+            "refinement": {
+                "title": "Refined Backlog Task",
+                "brief": "# Task Brief\n\nReady for a Worker Agent.",
+                "priority": "normal",
+                "target_state": "ready",
+                "review_required": false,
+                "acceptance_criteria": ["Refined outcome is clear"],
+                "validation_items": ["Refinement deterministic test passes"],
+                "tags": ["delegation"],
+                "conflict_hints": ["docs/DELEGATION_SESSION.md"],
+                "blocking_task_identifiers": []
+            }
+        });
+
+        Request::builder()
+            .method("POST")
+            .uri(format!("/tasks/{identifier}/refine"))
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {token}"))
             .body(Body::from(request.to_string()))

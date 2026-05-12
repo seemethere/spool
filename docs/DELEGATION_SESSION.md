@@ -22,6 +22,15 @@ The first CLI shape is:
 tasker delegate --queue <task_queue_key>
 ```
 
+Happy path for a human-present Operator or **Delegating Agent**:
+
+1. From the **Managed Source Repository**, run `tasker delegate --queue TASKER` with the project Tasker config selected.
+2. Tasker starts a Pi-backed **Interactive Agent Session** with the Delegating Agent Role Prompt and the Tasker Pi Extension environment.
+3. The **Delegating Agent** runs the **Delegation Interview**, asking one question at a time and reading local context docs only as needed for Tasker domain language.
+4. When the draft is clear, the agent validates structured fields and calls the deterministic creation helper, exposed to pi as `tasker_create_delegated_root_task`.
+5. Tasker creates one **Root Task** with a **Task Brief**, structured **Acceptance Criteria**, structured **Validation Items**, priority, tags, optional **Task Conflict Hints**, optional same-queue **Blocking Tasks**, and Actor-attributed Audit Events.
+6. The resulting **Task State** is **Backlog** by default. It may be **Ready** only when the draft includes enough structured requirements for autonomous Worker Agent execution.
+
 If the operator omits `--queue` and exactly one local **Task Queue** is configured, the command may select it. If more than one queue is available, the session should ask the present human which queue to use before creating a Task.
 
 ### `tasker delegate --refine <task_identifier>`
@@ -34,6 +43,15 @@ If the operator omits `--queue` and exactly one local **Task Queue** is configur
 4. The agent may request a **State Transition** from **Backlog** to **Ready** only after the Task has at least one structured **Acceptance Criterion** and one structured **Validation Item** and is otherwise eligible for **Ready**.
 
 Refinement is only for **Backlog** Tasks in the first implementation. It must not revise active work in **Ready**, **In Progress**, **Human Review**, **Rework**, **Integrating**, **Done**, or **Canceled**; those states use Worker, Review, or Operator flows.
+
+Happy path for refinement:
+
+1. From the **Managed Source Repository**, run `tasker delegate --refine TASKER-123` for an existing **Backlog** Task.
+2. Tasker loads the Task context bundle and passes the current Task contract, requirements, **Task Conflict Hints**, **Blocking Tasks**, and **Workpad Note** to the Pi-backed **Delegation Session**.
+3. The **Delegating Agent** runs a focused **Delegation Interview** about only missing or ambiguous contract details.
+4. When the refined contract is clear, the agent validates structured fields and calls the deterministic refinement helper, exposed to pi as `tasker_refine_backlog_task`.
+5. Tasker updates the existing **Backlog** Task, records Actor-attributed Audit Events, preserves requirement status only for unchanged requirements, and resets statuses for clarified requirements.
+6. The Task remains **Backlog** unless the Delegating Agent requests **Ready** and the refined Task has at least one structured **Acceptance Criterion** and one structured **Validation Item**.
 
 ## Delegation Interview behavior
 
@@ -78,6 +96,12 @@ The first implementation should split the feature into deterministic helpers and
 3. The CLI path launches pi, supplies the Delegating Agent Role Prompt, and lets the Tasker Pi Extension call the deterministic helpers.
 
 This boundary allows follow-up Tasks to test creation/refinement behavior with temp SQLite databases and fake Delegating Agent output before any real pi smoke test.
+
+Real pi smoke tests are optional. Normal validation should use deterministic tests with temp SQLite databases, HTTP/API handlers, and fake Pi launchers so local development and CI do not require pi credentials or external agent availability.
+
+## File-backed compatibility path
+
+File-backed Task Creation remains available for dogfooding and compatibility, for example `tasker task create --queue <task_queue_key> --from-file task.md`. The older `--bootstrap --file` spelling is the **Bootstrap Task Creation** compatibility path. These commands are useful escape hatches while Tasker is being dogfooded, but they are not the preferred long-term intake flow. The preferred v1 intake path is a **Delegation Session** that turns human intent into structured Tasker fields through `tasker delegate` or refines an existing **Backlog** Task through `tasker delegate --refine`.
 
 ## Out of scope for the first implementation
 
