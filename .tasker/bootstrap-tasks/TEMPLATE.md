@@ -4,6 +4,8 @@
 # Compatibility path: tasker task create --bootstrap --queue <TASK_QUEUE_KEY> --file .tasker/bootstrap-tasks/<task>.md
 # Accepted priority values: urgent, high, normal, low.
 # File-backed Task Creation accepts only backlog or ready as initial Task States; omit state to default to ready.
+# Ordinary Tasker dogfood Tasks should keep review_required false so they use Agent-Gated Integration.
+# Set review_required true only when the Task or Operator explicitly requires Human Review.
 title: Replace with a concise Task outcome
 priority: normal
 state: ready

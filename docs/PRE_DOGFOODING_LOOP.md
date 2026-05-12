@@ -41,6 +41,8 @@ For each **Implementation Slice**:
 
 Use advisory subagents to improve pre-dogfooding implementation quality without creating parallel implementation streams.
 
+After **Dogfooding Cutover**, Tasker's own development **Tasks** should keep using the same advisory pattern when extra confidence is needed, but the advisory review does not put the **Task** into **Human Review**. For the Tasker dogfood **Task Queue**, the default is **Agent-Gated Integration**: once structured **Acceptance Criteria** and **Validation Items** pass, a **Worker Agent** should request **Integrating** unless the **Task** explicitly requires **Human Review** or a human/**Operator** asks for it.
+
 Default loop for implementation slices:
 
 1. Implement the approved **Implementation Slice** as the single writer.
@@ -53,7 +55,7 @@ Default loop for implementation slices:
 
 Reviewer subagents should focus on correctness, domain language, test coverage, API shape, persistence safety, security/authentication, and whether the diff stays within the approved slice.
 
-A reviewer subagent is an advisory development helper, not Tasker's domain **Review Agent**.
+A reviewer subagent is an advisory development helper, not Tasker's domain **Review Agent**. It does not prepare a **Review Packet** or record a **Review Decision**; those remain part of optional **Review Session** workflows for **Tasks** that actually enter **Human Review**.
 
 ### Oracle Escalation
 
@@ -77,6 +79,8 @@ The oracle decides whether to continue within scope, insert a prerequisite slice
 Use risk-based review before **Dogfooding Cutover**.
 
 Agent self-review is enough for low-risk slices. Human review is required for slices that affect persistence schema, task lifecycle or state transitions, Local Worktree Delivery behavior, launcher/pi behavior, authentication, or ADR-worthy architectural decisions, unless the human explicitly approved those details as part of an **Approved Slice Sequence**.
+
+This pre-dogfooding human-review standard is not the default Tasker dogfood workflow. After cutover, Human Review remains an optional product workflow for queues or **Tasks** whose **Review Policy** requires it; ordinary Tasker repository work should use **Agent-Gated Integration** plus an advisory **Subagent Review Loop** when useful.
 
 ## ADR policy
 

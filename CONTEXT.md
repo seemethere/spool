@@ -514,6 +514,7 @@ _Avoid_: Separate progress comment
 - A **Review Agent** records **Review Decisions**.
 - A **Review Decision** moves a **Task** from **Human Review** to **Rework** or **Integrating**.
 - Local-first queues default to **Agent-Gated Integration**.
+- Tasker's own dogfood **Task Queue** follows the local-first default: ordinary Tasker development **Tasks** proceed to **Integrating** after structured gates pass instead of entering **Human Review**.
 - A **Worker Agent** may move **In Progress** or **Rework** work to **Integrating** when structured gates pass and **Review Policy** does not require **Human Review**.
 - When the same **Agent Run** still owns the **Claim Lease**, it may perform **Integrating** immediately after the **State Transition**.
 - **Human Review** requires a human decision when **Review Policy** requires review or an agent explicitly requests review.
@@ -588,7 +589,8 @@ _Avoid_: Separate progress comment
 - A completed **Pre-Dogfooding Development Loop** normally ends with unstaged or staged working tree changes, a concise summary, and a recommended Conventional Commit message; the human decides whether the agent commits.
 - In an **Approved Slice Sequence**, the agent may implement and commit multiple approved low-risk **Implementation Slices** in order, stopping when scope, architecture, security, persistence semantics, task lifecycle, delivery behavior, launcher behavior, or unresolved check failures require human input.
 - A **Subagent Review Loop** runs before committing implementation slices during pre-dogfooding work.
-- **Subagent Review Loop** reviewers are advisory development helpers and are distinct from Tasker's domain **Review Agent**.
+- During dogfooding, a **Subagent Review Loop** is the preferred advisory review mechanism for Tasker development when extra confidence is needed before committing or requesting **Integrating**.
+- **Subagent Review Loop** reviewers are advisory development helpers and are distinct from Tasker's domain **Review Agent**, **Review Session**, and **Review Decision**.
 - **Oracle Escalation** is used when a reviewer finding, implementation discovery, or user instruction exposes a conflict with documented architecture, security, persistence semantics, task lifecycle, delivery behavior, launcher behavior, or domain language.
 - **Dogfooding Cutover** occurs when Tasker development work starts being created and tracked as real Tasker **Tasks**.
 - The first **Dogfooding Cutover** target is after roadmap Milestone 2, when **File-backed Task Creation**, **Task Queues**, task show/status, **Workpad Notes**, and **Audit Events** are usable for real Tasker development work.

@@ -69,6 +69,12 @@ Temporary dogfooding escape hatches are allowed only when clearly marked:
 
 These do not replace the target model.
 
+## Dogfood review and integration default
+
+Tasker's own dogfood **Task Queue** defaults to **Agent-Gated Integration**, not **Human Review**. After structured **Acceptance Criteria** are satisfied or waived and **Validation Items** are passed or waived, ordinary dogfood **Tasks** should proceed to **Integrating**.
+
+Use **Human Review** only when the **Task** or **Task Queue** explicitly requires it, such as `review_required: true`, or when a human/**Operator** asks for it. When extra confidence is needed for Tasker development, prefer an advisory **Subagent Review Loop** before committing or requesting **Integrating**. Advisory subagents do not replace Tasker's domain **Review Agent**, **Review Session**, or **Review Decision**.
+
 ## Agent efficiency rules
 
 Efficiency is a first-class dogfooding concern. Optimize for fewer tokens, fewer tool calls, and less repeated context discovery while preserving correctness.
