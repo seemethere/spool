@@ -149,7 +149,7 @@ An agent that creates or updates a **Task** so another agent can perform the wor
 _Avoid_: Human task author
 
 **Delegation Session**:
-A local `tasker delegate` interaction where a **Delegating Agent** turns human intent into a **Root Task**.
+A human-present pi interaction where a **Delegating Agent** turns human intent into a **Root Task** through **Tasker Pi Extension** delegation tools. `tasker delegate` may host or wrap this flow, but the dogfood path can happen directly in an ordinary pi session.
 _Avoid_: Manual task form
 
 **Delegation Interview**:
@@ -502,9 +502,10 @@ _Avoid_: Separate progress comment
 - Authentication identifies the API client; **Actor** identifies the source of the domain change.
 - Every Tasker domain mutation produces an **Audit Event**.
 - Current Tasker state is read from current records, not reconstructed from **Audit Events**.
-- `tasker delegate` starts a **Delegation Session**.
-- `tasker delegate --refine` starts a **Delegation Session** for an existing **Backlog** **Task**.
-- A **Delegation Session** uses a **Delegation Interview** and the **Tasker Pi Extension**.
+- The preferred dogfood **Delegation Session** runs in an ordinary human-present pi session with the **Tasker Pi Extension** loaded.
+- `tasker delegate` remains a CLI wrapper or fallback for starting a **Delegation Session**.
+- `tasker delegate --refine` remains a CLI wrapper or fallback for starting a **Delegation Session** for an existing **Backlog** **Task**.
+- A **Delegation Session** uses a **Delegation Interview** and the **Tasker Pi Extension** delegation tools.
 - A **Delegation Interview** may read repository context docs but does not edit them by default.
 - Repository doc changes discovered during delegation become **Acceptance Criteria** or **Child Tasks**.
 - A **Delegating Agent** creates **Delegated Tasks**.
@@ -700,9 +701,9 @@ _Avoid_: Separate progress comment
 - "running a command from a Task Branch with a new migration" could imply upgrading the shared project Task Backend from unintegrated code — resolved: normal commands are check-only for migrations, and explicit `tasker db migrate` is guarded to run from the Managed Source Repository Main Branch by default.
 - "retry continuity" could mean resuming hidden pi chat history — resolved: each **Agent Run** starts a fresh **Pi RPC Session**; durable continuity lives in Tasker/worktree data.
 - "failed run retry" could mean immediate re-claim — resolved: failed or expired runs create **Retry Holds** with backoff.
-- "task intake" could mean humans entering work directly — resolved: normal v1 intake is agent delegation through `tasker delegate`; humans delegate to agents rather than creating Tasks themselves.
-- "bootstrap task creation" could become permanent manual intake — resolved: **File-backed Task Creation** is the user-facing concept, while **Bootstrap Task Creation** is only the temporary dogfooding reason it exists before full delegation.
-- "Backlog refinement" could mean manual field editing — resolved: use `tasker delegate --refine` and a **Delegation Interview**.
+- "task intake" could mean humans entering work directly — resolved: normal v1 intake is agent delegation through an extension-native **Delegation Session**; humans delegate to agents rather than creating Tasks themselves.
+- "bootstrap task creation" could become permanent manual intake — resolved: **File-backed Task Creation** is the fallback compatibility concept, while **Bootstrap Task Creation** is only the temporary dogfooding reason it exists before full delegation.
+- "Backlog refinement" could mean manual field editing — resolved: use a **Delegation Session** with deterministic refinement tooling; `tasker delegate --refine` remains a wrapper/fallback.
 - "grill-me-with-docs" refers to the existing grill-with-docs-style interaction — resolved: call the Tasker intake flow a **Delegation Interview**.
 - "documentation-aware delegation" could imply editing docs on the main repository during intake — resolved: delegation reads docs and creates Tasker work; repo edits happen in Worker Agent worktrees.
 - "agent" could mean creator, executor, or reviewer — resolved: use **Delegating Agent**, **Worker Agent**, and **Review Agent** as distinct **Actor** roles.

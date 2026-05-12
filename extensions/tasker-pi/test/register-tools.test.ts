@@ -1,11 +1,25 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import registerTaskerExtension from "../src/index";
 import type { ExtensionAPI } from "../src/types";
 
 const originalEnv = { ...process.env };
+const originalFetch = globalThis.fetch;
+const requests: Array<{ url: string; init: RequestInit }> = [];
+
+beforeEach(() => {
+  requests.length = 0;
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    requests.push({ url: String(url), init: init ?? {} });
+    return new Response(JSON.stringify({ task: { identifier: "TASKER-999" } }), {
+      status: 201,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+});
 
 afterEach(() => {
   process.env = { ...originalEnv };
+  globalThis.fetch = originalFetch;
 });
 
 describe("registerTaskerExtension", () => {
@@ -80,5 +94,62 @@ describe("registerTaskerExtension", () => {
       "blocked",
       "retryable_failure",
     ]);
+  });
+
+  it("executes delegated Root Task creation through the extension tool with a Delegating Agent actor", async () => {
+    process.env.TASKER_API_URL = "http://tasker.test";
+    process.env.TASKER_API_TOKEN = "token";
+    process.env.TASKER_ACTOR_KIND = "delegating_agent";
+    process.env.TASKER_ACTOR_ID = "delegate-session";
+    process.env.TASKER_ACTOR_DISPLAY_NAME = "Delegation Session";
+    const tools: Array<{ name: string; parameters: any; execute: Function }> = [];
+    const pi: ExtensionAPI = {
+      registerTool(tool) {
+        tools.push({ name: tool.name, parameters: tool.parameters, execute: tool.execute });
+      },
+    };
+
+    registerTaskerExtension(pi);
+    const createTool = tools.find((tool) => tool.name === "tasker_create_delegated_root_task");
+    expect(createTool).toBeDefined();
+
+    const result = await createTool!.execute("tool-1", {
+      queue_key: "TASKER",
+      title: "Delegate through extension",
+      brief: "Task Brief from a human-present pi session.",
+      priority: "urgent",
+      initial_state: "ready",
+      review_required: false,
+      tags: ["dogfood"],
+      conflict_hints: ["extensions/tasker-pi"],
+      blocking_task_identifiers: [],
+      acceptance_criteria: ["The Task is created through the Tasker Pi Extension."],
+      validation_items: ["Fake-extension test observes the delegated-root API call."],
+    }, new AbortController().signal);
+
+    expect(result.details).toEqual({ task: { identifier: "TASKER-999" } });
+    expect(requests[0].url).toBe("http://tasker.test/tasks/delegated-root");
+    expect(requests[0].init.method).toBe("POST");
+    expect((requests[0].init.headers as Record<string, string>).authorization).toBe("Bearer token");
+    expect(JSON.parse(requests[0].init.body as string)).toEqual({
+      actor: {
+        kind: "delegating_agent",
+        id: "delegate-session",
+        display_name: "Delegation Session",
+      },
+      draft: {
+        queue_key: "TASKER",
+        title: "Delegate through extension",
+        brief: "Task Brief from a human-present pi session.",
+        priority: "urgent",
+        initial_state: "ready",
+        review_required: false,
+        tags: ["dogfood"],
+        conflict_hints: ["extensions/tasker-pi"],
+        blocking_task_identifiers: [],
+        acceptance_criteria: ["The Task is created through the Tasker Pi Extension."],
+        validation_items: ["Fake-extension test observes the delegated-root API call."],
+      },
+    });
   });
 });

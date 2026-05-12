@@ -1,14 +1,50 @@
 # Delegation Sessions
 
-`tasker delegate` starts a Pi-backed **Delegation Session** where a **Delegating Agent** turns out-of-band human intent into one structured **Root Task**. `tasker delegate --refine <task_identifier>` starts the same interactive flow for an existing **Backlog** **Task** and updates that Task until it is ready for agent execution.
+The preferred dogfood **Delegation Session** is an ordinary human-present pi session with the **Tasker Pi Extension** loaded. The human and **Delegating Agent** clarify out-of-band intent in that session, then the agent calls `tasker_create_delegated_root_task` to create one structured **Root Task** through the Tasker API. `tasker delegate` remains a CLI wrapper/fallback around the same extension-native tooling until a better CLI-hosted interactive loop is deliberately needed.
 
 The first implementation is local-first and CLI-first. It does not add a web UI, custom workflow fields, external tracker sync, GitHub requirements, or direct human task forms. The deterministic Tasker API helpers should be implemented separately from the Pi-backed interactive session so they can be tested without launching pi.
 
-## CLI contract
+## Extension-native dogfood path
+
+Use this path for ordinary Tasker dogfooding instead of writing a bootstrap file or relying on the CLI to orchestrate a Pi RPC interview loop:
+
+1. Start `tasker serve` for the project Task Backend and load `extensions/tasker-pi/src/index.ts` in a normal human-present pi session with `TASKER_API_URL`, `TASKER_API_TOKEN`, and a Delegating Agent actor, for example `TASKER_ACTOR_KIND=delegating_agent`.
+2. Ask the **Delegating Agent** to run a one-question-at-a-time **Delegation Interview** for the intended work.
+3. When the draft is clear, the agent calls `tasker_create_delegated_root_task` with structured Tasker fields.
+4. Tasker creates one **Root Task** with a **Task Brief**, structured **Acceptance Criteria**, structured **Validation Items**, priority, tags, optional **Task Conflict Hints**, optional same-queue **Blocking Tasks**, review requirement, and Actor-attributed Audit Events.
+5. The resulting **Task State** is **Backlog** by default. It may be **Ready** only when the draft includes enough structured requirements for autonomous Worker Agent execution.
+
+Concise dogfood example payload for the extension tool:
+
+```json
+{
+  "queue_key": "TASKER",
+  "title": "Reduce repeated Tasker context reads in Worker prompts",
+  "brief": "Update Worker Agent run-start instructions so agents use the Task context bundle before broad discovery and avoid repeated task show/status loops.",
+  "priority": "normal",
+  "initial_state": "ready",
+  "review_required": false,
+  "tags": ["dogfood", "agent-efficiency"],
+  "conflict_hints": [".tasker/prompts", "docs/AGENT_EFFICIENCY_STRATEGY.md"],
+  "blocking_task_identifiers": [],
+  "acceptance_criteria": [
+    "Worker prompt guidance names tasker_get_task_context_bundle as the first Tasker read",
+    "Guidance discourages repeated broad CLI status/show loops during normal Worker execution"
+  ],
+  "validation_items": [
+    "Relevant prompt or documentation tests pass",
+    "Documentation includes the updated run-start context discipline"
+  ]
+}
+```
+
+The extension sends this draft to `POST /tasks/delegated-root`; Rust Tasker remains authoritative for normalization, validation, persistence, blocking relationships, and Audit Events.
+
+## CLI wrapper/fallback contract
 
 ### `tasker delegate`
 
-`tasker delegate` is the normal intake path for a new **Root Task**.
+`tasker delegate` is a secondary wrapper/fallback intake path for a new **Root Task**. It still launches pi and loads the **Tasker Pi Extension**, but the extension-native human-present path above is preferred for dogfooding because the conversation already happens inside pi.
 
 1. The command runs from the **Managed Source Repository** with the intended project Tasker config selected.
 2. The command starts an **Interactive Agent Session** using the built-in Delegating Agent **Role Prompt**, unless `.tasker/prompts/delegate.md` exists.
@@ -23,7 +59,7 @@ tasker delegate --queue <task_queue_key> "<initial human intent>"
 tasker delegate --queue <task_queue_key> --intent-file <path>
 ```
 
-For Tasker dogfooding, run from the **Managed Source Repository** with the project config selected, for example:
+When using the fallback, run from the **Managed Source Repository** with the project config selected, for example:
 
 ```bash
 bin/tasker-local delegate --queue TASKER "Investigate and reduce transcript volume regression"
@@ -110,7 +146,7 @@ Real pi smoke tests are optional. Normal validation should use deterministic tes
 
 ## File-backed compatibility path
 
-File-backed Task Creation remains available for dogfooding and compatibility, for example `tasker task create --queue <task_queue_key> --from-file task.md`. The older `--bootstrap --file` spelling is the **Bootstrap Task Creation** compatibility path. These commands are useful escape hatches while Tasker is being dogfooded, but they are not the preferred long-term intake flow. The preferred v1 intake path is a **Delegation Session** that turns human intent into structured Tasker fields through `tasker delegate` or refines an existing **Backlog** Task through `tasker delegate --refine`.
+File-backed Task Creation remains available for dogfooding and compatibility, for example `tasker task create --queue <task_queue_key> --from-file task.md`. The older `--bootstrap --file` spelling is the **Bootstrap Task Creation** compatibility path. These commands are useful escape hatches while Tasker is being dogfooded, but they are not the preferred long-term intake flow. The preferred dogfood intake path is an extension-native **Delegation Session** that turns human intent into structured Tasker fields through `tasker_create_delegated_root_task`; `tasker delegate` and `tasker delegate --refine` remain wrapper/fallback paths around the same deterministic Tasker API helpers.
 
 ## Out of scope for the first implementation
 

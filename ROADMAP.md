@@ -64,7 +64,7 @@ Early dogfooding task chain: simplify the **Worker Agent Contribution Surface** 
 ## Full v1 after dogfooding
 
 - Complete Agent-Gated Integrating polish beyond the first dogfood slice
-- Implement the first Delegation Session contract in `docs/DELEGATION_SESSION.md`, including `tasker delegate`, `tasker delegate --refine <task_identifier>`, deterministic creation/refinement helpers, and the Pi-backed Delegation Interview
+- Implement the first Delegation Session contract in `docs/DELEGATION_SESSION.md`, centered on extension-native `tasker_create_delegated_root_task` dogfood intake, with `tasker delegate`, `tasker delegate --refine <task_identifier>`, deterministic creation/refinement helpers, and the Pi-backed Delegation Interview as wrapper/fallback polish
 - Review sessions
 - Metrics export
 - Richer transcript export/pruning policies
