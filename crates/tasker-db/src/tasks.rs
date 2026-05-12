@@ -340,6 +340,293 @@ pub async fn create_child_task(
         .with_context(|| format!("created Child Task {child_identifier} was not found"))
 }
 
+pub async fn refine_backlog_task(
+    pool: &SqlitePool,
+    identifier: &str,
+    input: &RefineBacklogTask,
+    actor: &Actor,
+) -> Result<TaskDetail> {
+    validate_refine_backlog_actor(actor)?;
+    validate_refine_backlog_task_input(input)?;
+
+    let mut tx = pool.begin().await.context("failed to begin transaction")?;
+    let task = sqlx::query_as::<_, Task>(
+        r#"
+        SELECT tasks.id, tasks.task_queue_id, task_queues.key AS task_queue_key, tasks.identifier,
+               tasks.sequence, tasks.title, tasks.brief, tasks.priority, tasks.state,
+               tasks.review_required, tasks.validated_base_commit, tasks.created_at, tasks.updated_at
+        FROM tasks
+        JOIN task_queues ON task_queues.id = tasks.task_queue_id
+        WHERE tasks.identifier = ?
+        "#,
+    )
+    .bind(identifier)
+    .fetch_optional(&mut *tx)
+    .await
+    .with_context(|| format!("failed to load Task {identifier}"))?
+    .with_context(|| format!("Task {identifier} not found"))?;
+
+    if task.state != "backlog" {
+        anyhow::bail!("Backlog Task refinement only supports Backlog Tasks");
+    }
+
+    apply_requirement_refinement(
+        &mut tx,
+        &task.id,
+        "acceptance_criteria",
+        &input.acceptance_criteria,
+    )
+    .await?;
+    let validation_changed = apply_requirement_refinement(
+        &mut tx,
+        &task.id,
+        "validation_items",
+        &input.validation_items,
+    )
+    .await?;
+
+    let title = input.title.as_deref().map(str::trim).unwrap_or(&task.title);
+    let brief = input.brief.as_deref().map(str::trim).unwrap_or(&task.brief);
+    let priority = input
+        .priority
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or(&task.priority);
+    let review_required = input.review_required.unwrap_or(task.review_required);
+
+    sqlx::query(
+        r#"
+        UPDATE tasks
+        SET title = ?, brief = ?, priority = ?, review_required = ?,
+            validated_base_commit = CASE WHEN ? THEN NULL ELSE validated_base_commit END,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        "#,
+    )
+    .bind(title)
+    .bind(brief)
+    .bind(priority)
+    .bind(review_required)
+    .bind(validation_changed)
+    .bind(&task.id)
+    .execute(&mut *tx)
+    .await
+    .context("failed to update refined Backlog Task fields")?;
+
+    if let Some(tags) = &input.tags {
+        sqlx::query("DELETE FROM task_tags WHERE task_id = ?")
+            .bind(&task.id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to replace Task Tags")?;
+        for tag in normalized_tags(tags) {
+            sqlx::query("INSERT INTO task_tags (task_id, tag) VALUES (?, ?)")
+                .bind(&task.id)
+                .bind(tag)
+                .execute(&mut *tx)
+                .await
+                .context("failed to insert refined Task Tag")?;
+        }
+    }
+
+    if let Some(conflict_hints) = &input.conflict_hints {
+        sqlx::query("DELETE FROM task_conflict_hints WHERE task_id = ?")
+            .bind(&task.id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to replace Task Conflict Hints")?;
+        for (index, target) in normalized_conflict_hints(conflict_hints).iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO task_conflict_hints (id, task_id, position, target) VALUES (?, ?, ?, ?)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(&task.id)
+            .bind((index + 1) as i64)
+            .bind(target)
+            .execute(&mut *tx)
+            .await
+            .context("failed to insert refined Task Conflict Hint")?;
+        }
+    }
+
+    let blocking_task_identifiers = input
+        .blocking_task_identifiers
+        .as_ref()
+        .map(|identifiers| normalized_task_identifiers(identifiers));
+    if let Some(blocking_task_identifiers) = &blocking_task_identifiers {
+        sqlx::query(
+            "DELETE FROM task_relationships WHERE target_task_id = ? AND relationship_kind = 'blocks'",
+        )
+        .bind(&task.id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to replace Blocking Task relationships")?;
+        create_blocking_relationships(
+            &mut tx,
+            &task.task_queue_id,
+            &task.id,
+            blocking_task_identifiers,
+        )
+        .await?;
+    }
+
+    let mut transitioned_to_ready = false;
+    if input.target_state.as_deref().map(str::trim) == Some("ready") {
+        let transition_task = Task {
+            title: title.to_string(),
+            brief: brief.to_string(),
+            priority: priority.to_string(),
+            review_required,
+            ..task.clone()
+        };
+        validate_transition(&transition_task, "ready", actor)?;
+        ensure_ready_requirements_exist(&mut tx, &task.id).await?;
+        sqlx::query("UPDATE tasks SET state = 'ready', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = 'backlog'")
+            .bind(&task.id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to transition refined Task to Ready")?;
+        append_audit_event_in_tx(
+            &mut tx,
+            actor,
+            "task.state_transitioned",
+            "task",
+            &task.id,
+            serde_json::json!({
+                "identifier": identifier,
+                "from": "backlog",
+                "to": "ready",
+                "repair_override": false,
+            }),
+        )
+        .await?;
+        transitioned_to_ready = true;
+    }
+
+    append_audit_event_in_tx(
+        &mut tx,
+        actor,
+        "task.refined",
+        "task",
+        &task.id,
+        serde_json::json!({
+            "identifier": identifier,
+            "title_updated": input.title.is_some(),
+            "brief_updated": input.brief.is_some(),
+            "priority_updated": input.priority.is_some(),
+            "review_required_updated": input.review_required.is_some(),
+            "acceptance_criteria_supplied": input.acceptance_criteria.len(),
+            "validation_items_supplied": input.validation_items.len(),
+            "tags_updated": input.tags.is_some(),
+            "conflict_hints_updated": input.conflict_hints.is_some(),
+            "blocking_task_identifiers": blocking_task_identifiers,
+            "transitioned_to_ready": transitioned_to_ready,
+        }),
+    )
+    .await?;
+
+    tx.commit()
+        .await
+        .context("failed to commit Backlog Task refinement")?;
+    get_task_detail(pool, identifier)
+        .await?
+        .with_context(|| format!("refined Task {identifier} was not found"))
+}
+
+fn validate_refine_backlog_task_input(input: &RefineBacklogTask) -> Result<()> {
+    if let Some(title) = &input.title {
+        ensure_not_blank("title", title)?;
+    }
+    if let Some(brief) = &input.brief {
+        ensure_not_blank("Task Brief", brief)?;
+    }
+    if let Some(priority) = &input.priority {
+        validate_priority(priority.trim())?;
+    }
+    if let Some(target_state) = &input.target_state {
+        let target_state = target_state.trim();
+        validate_state(target_state)?;
+        if target_state != "backlog" && target_state != "ready" {
+            anyhow::bail!("Backlog Task refinement only supports Backlog or Ready target states");
+        }
+    }
+    for criterion in &input.acceptance_criteria {
+        ensure_not_blank("Acceptance Criterion", criterion)?;
+    }
+    for item in &input.validation_items {
+        ensure_not_blank("Validation Item", item)?;
+    }
+    if let Some(conflict_hints) = &input.conflict_hints {
+        for hint in conflict_hints {
+            ensure_not_blank("Task Conflict Hint", hint)?;
+        }
+    }
+    if let Some(identifiers) = &input.blocking_task_identifiers {
+        for identifier in identifiers {
+            ensure_not_blank("Blocking Task Identifier", identifier)?;
+        }
+    }
+    Ok(())
+}
+
+async fn apply_requirement_refinement(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: &str,
+    table: &str,
+    descriptions: &[String],
+) -> Result<bool> {
+    if descriptions.is_empty() {
+        return Ok(false);
+    }
+    let existing: Vec<(i64, String)> = sqlx::query_as(&format!(
+        "SELECT position, description FROM {table} WHERE task_id = ? ORDER BY position"
+    ))
+    .bind(task_id)
+    .fetch_all(&mut **tx)
+    .await
+    .context("failed to load existing requirements for Backlog refinement")?;
+    if descriptions.len() < existing.len() {
+        anyhow::bail!(
+            "Backlog Task refinement cannot remove Acceptance Criteria or Validation Items"
+        );
+    }
+
+    let mut changed = false;
+    for (index, description) in descriptions.iter().enumerate() {
+        let position = (index + 1) as i64;
+        let description = description.trim();
+        match existing.get(index) {
+            Some((_, existing_description)) if existing_description == description => {}
+            Some(_) => {
+                changed = true;
+                sqlx::query(&format!(
+                    "UPDATE {table} SET description = ?, status = 'pending', waiver_reason = NULL, updated_at = CURRENT_TIMESTAMP WHERE task_id = ? AND position = ?"
+                ))
+                .bind(description)
+                .bind(task_id)
+                .bind(position)
+                .execute(&mut **tx)
+                .await
+                .context("failed to clarify requirement during Backlog refinement")?;
+            }
+            None => {
+                changed = true;
+                sqlx::query(&format!(
+                    "INSERT INTO {table} (id, task_id, position, description) VALUES (?, ?, ?, ?)"
+                ))
+                .bind(Uuid::new_v4().to_string())
+                .bind(task_id)
+                .bind(position)
+                .bind(description)
+                .execute(&mut **tx)
+                .await
+                .context("failed to add requirement during Backlog refinement")?;
+            }
+        }
+    }
+    Ok(changed)
+}
+
 pub async fn get_task_detail(pool: &SqlitePool, identifier: &str) -> Result<Option<TaskDetail>> {
     let Some(task) = sqlx::query_as::<_, Task>(
         r#"

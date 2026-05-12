@@ -13,9 +13,9 @@ use uuid::Uuid;
 
 pub(crate) fn validate_transition(task: &Task, to_state: &str, actor: &Actor) -> Result<()> {
     match actor.kind.as_str() {
-        "operator" | "review_agent" | "worker_agent" => {}
+        "operator" | "review_agent" | "worker_agent" | "delegating_agent" => {}
         _ => anyhow::bail!(
-            "State Transitions require an Operator, Review Agent, or Worker Agent actor"
+            "State Transitions require an Operator, Review Agent, Worker Agent, or Delegating Agent actor"
         ),
     }
     if task.state == to_state {
@@ -58,6 +58,11 @@ pub(crate) fn validate_transition(task: &Task, to_state: &str, actor: &Actor) ->
         } else if to_state != "human_review" && to_state != "canceled" {
             anyhow::bail!("Worker Agent cannot request this State Transition");
         }
+    } else if actor.kind == "delegating_agent" && !(task.state == "backlog" && to_state == "ready")
+    {
+        anyhow::bail!(
+            "Delegating Agent State Transitions are limited to Backlog to Ready refinement"
+        );
     }
     Ok(())
 }
@@ -250,6 +255,15 @@ pub(crate) fn validate_child_task_actor(actor: &Actor) -> Result<()> {
         anyhow::bail!(
             "Child Task creation requires an Operator, Delegating Agent, or Worker Agent actor"
         )
+    }
+}
+
+pub(crate) fn validate_refine_backlog_actor(actor: &Actor) -> Result<()> {
+    validate_actor(actor)?;
+    if actor.kind == "operator" || actor.kind == "delegating_agent" {
+        Ok(())
+    } else {
+        anyhow::bail!("Backlog Task refinement requires an Operator or Delegating Agent actor")
     }
 }
 

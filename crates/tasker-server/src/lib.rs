@@ -47,6 +47,12 @@ pub struct CreateChildTaskRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RefineBacklogTaskRequest {
+    pub actor: tasker_db::Actor,
+    pub refinement: tasker_db::RefineBacklogTask,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct UpdateWorkpadRequest {
     pub actor: tasker_db::Actor,
     pub body: String,
@@ -113,6 +119,7 @@ pub fn router(app_version: impl Into<String>, pool: SqlitePool) -> Router {
         .route("/queues/{key}/claim-next", post(claim_next))
         .route("/tasks/bootstrap", post(create_task))
         .route("/tasks/{identifier}", get(get_task))
+        .route("/tasks/{identifier}/refine", post(refine_backlog_task))
         .route(
             "/tasks/{identifier}/context-bundle",
             get(get_task_context_bundle),
@@ -215,6 +222,24 @@ async fn create_child_task(
         .await
         .map(|task| (StatusCode::CREATED, Json(task)))
         .map_err(task_mutation_error)
+}
+
+async fn refine_backlog_task(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+    Json(request): Json<RefineBacklogTaskRequest>,
+) -> Result<Json<tasker_db::TaskDetail>, (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    tasker_db::refine_backlog_task(
+        &state.pool,
+        &identifier,
+        &request.refinement,
+        &request.actor,
+    )
+    .await
+    .map(Json)
+    .map_err(task_mutation_error)
 }
 
 async fn get_task(
@@ -603,6 +628,7 @@ fn task_mutation_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>
         || message.contains("active Agent Run ID")
         || message.contains("active Claim Lease")
         || message.contains("Review Decisions require")
+        || message.contains("Backlog Task refinement requires")
     {
         error_response(StatusCode::FORBIDDEN, message)
     } else if message.contains("not found") {
@@ -612,6 +638,8 @@ fn task_mutation_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>
         || message.contains("invalid Task State")
         || message.contains("invalid requirement status")
         || message.contains("only supports Backlog or Ready")
+        || message.contains("only supports Backlog Tasks")
+        || message.contains("cannot remove")
         || message.contains("invalid Agent Run outcome")
         || message.contains("State Transition")
         || message.contains("Review Decision")

@@ -582,6 +582,209 @@ async fn backlog_task_may_be_created_before_requirements_are_complete() {
 }
 
 #[tokio::test]
+async fn refine_backlog_task_updates_contract_and_can_promote_ready() {
+    let (_temp, pool) = migrated_pool().await;
+    let actor = Actor::operator("tester");
+    create_task_queue(&pool, &sample_queue("TASK", "Tasker"), &actor)
+        .await
+        .expect("create queue");
+    create_task(&pool, &sample_task("TASK", "Blocking"), &actor)
+        .await
+        .expect("create blocking task");
+    let mut backlog = sample_task("TASK", "Rough Backlog Task");
+    backlog.state = "backlog".to_string();
+    backlog.acceptance_criteria.clear();
+    backlog.validation_items.clear();
+    backlog.tags = vec!["rough".to_string()];
+    create_task(&pool, &backlog, &actor)
+        .await
+        .expect("create backlog task");
+
+    let detail = refine_backlog_task(
+        &pool,
+        "TASK-2",
+        &RefineBacklogTask {
+            title: Some("Agent-ready Backlog Task".to_string()),
+            brief: Some("# Task Brief\n\nClear enough for a Worker Agent.".to_string()),
+            priority: Some("high".to_string()),
+            target_state: Some("ready".to_string()),
+            review_required: Some(true),
+            acceptance_criteria: vec!["A deterministic helper refines the Task".to_string()],
+            validation_items: vec!["Database tests cover refinement".to_string()],
+            tags: Some(vec!["delegation".to_string(), "dogfood".to_string()]),
+            conflict_hints: Some(vec!["crates/tasker-db".to_string()]),
+            blocking_task_identifiers: Some(vec![" task-1 ".to_string(), "TASK-1".to_string()]),
+        },
+        &delegating_actor(),
+    )
+    .await
+    .expect("refine backlog task");
+
+    assert_eq!(detail.task.title, "Agent-ready Backlog Task");
+    assert_eq!(detail.task.state, "ready");
+    assert_eq!(detail.task.priority, "high");
+    assert!(detail.task.review_required);
+    assert_eq!(detail.acceptance_criteria[0].status, "pending");
+    assert_eq!(detail.validation_items[0].status, "pending");
+    assert_eq!(detail.tags, vec!["delegation", "dogfood"]);
+    assert_eq!(detail.conflict_hints[0].target, "crates/tasker-db");
+    assert_eq!(detail.blocking_tasks[0].identifier, "TASK-1");
+
+    let events = list_task_audit_events(&pool, "TASK-2")
+        .await
+        .expect("audit events");
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "task.refined"));
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "task.state_transitioned"));
+}
+
+#[tokio::test]
+async fn refine_backlog_task_preserves_or_resets_requirement_statuses() {
+    let (_temp, pool) = migrated_pool().await;
+    let actor = Actor::operator("tester");
+    create_task_queue(&pool, &sample_queue("TASK", "Tasker"), &actor)
+        .await
+        .expect("create queue");
+    let mut backlog = sample_task("TASK", "Requirements");
+    backlog.state = "backlog".to_string();
+    backlog.acceptance_criteria = vec![
+        "Keep criterion".to_string(),
+        "Clarify criterion".to_string(),
+    ];
+    backlog.validation_items = vec![
+        "Keep validation".to_string(),
+        "Clarify validation".to_string(),
+    ];
+    create_task(&pool, &backlog, &actor)
+        .await
+        .expect("create backlog task");
+    update_acceptance_criterion_status(
+        &pool,
+        "TASK-1",
+        1,
+        &UpdateRequirementStatus {
+            status: "satisfied".to_string(),
+            waiver_reason: None,
+            validated_base_commit: None,
+        },
+        &actor,
+    )
+    .await
+    .expect("satisfy criterion");
+    update_acceptance_criterion_status(
+        &pool,
+        "TASK-1",
+        2,
+        &UpdateRequirementStatus {
+            status: "satisfied".to_string(),
+            waiver_reason: None,
+            validated_base_commit: None,
+        },
+        &actor,
+    )
+    .await
+    .expect("satisfy second criterion");
+    update_validation_item_status(
+        &pool,
+        "TASK-1",
+        1,
+        &UpdateRequirementStatus {
+            status: "passed".to_string(),
+            waiver_reason: None,
+            validated_base_commit: Some("abc123".to_string()),
+        },
+        &actor,
+    )
+    .await
+    .expect("pass validation");
+
+    let detail = refine_backlog_task(
+        &pool,
+        "TASK-1",
+        &RefineBacklogTask {
+            title: None,
+            brief: None,
+            priority: None,
+            target_state: None,
+            review_required: None,
+            acceptance_criteria: vec![
+                "Keep criterion".to_string(),
+                "Clarified criterion".to_string(),
+                "New criterion".to_string(),
+            ],
+            validation_items: vec![
+                "Keep validation".to_string(),
+                "Clarified validation".to_string(),
+            ],
+            tags: None,
+            conflict_hints: None,
+            blocking_task_identifiers: None,
+        },
+        &delegating_actor(),
+    )
+    .await
+    .expect("refine requirements");
+
+    assert_eq!(detail.acceptance_criteria[0].status, "satisfied");
+    assert_eq!(detail.acceptance_criteria[1].status, "pending");
+    assert_eq!(detail.acceptance_criteria[2].status, "pending");
+    assert_eq!(detail.validation_items[0].status, "passed");
+    assert_eq!(detail.validation_items[1].status, "pending");
+    assert_eq!(detail.task.validated_base_commit, None);
+}
+
+#[tokio::test]
+async fn refine_backlog_task_rejects_non_backlog_and_invalid_requirement_edits() {
+    let (_temp, pool) = migrated_pool().await;
+    let actor = Actor::operator("tester");
+    create_task_queue(&pool, &sample_queue("TASK", "Tasker"), &actor)
+        .await
+        .expect("create queue");
+    create_task(&pool, &sample_task("TASK", "Ready"), &actor)
+        .await
+        .expect("create ready task");
+
+    let input = RefineBacklogTask {
+        title: None,
+        brief: Some("Refined".to_string()),
+        priority: None,
+        target_state: None,
+        review_required: None,
+        acceptance_criteria: vec![],
+        validation_items: vec![],
+        tags: None,
+        conflict_hints: None,
+        blocking_task_identifiers: None,
+    };
+    let error = refine_backlog_task(&pool, "TASK-1", &input, &delegating_actor())
+        .await
+        .expect_err("non-backlog refinement rejected");
+    assert!(error.to_string().contains("only supports Backlog Tasks"));
+
+    let mut backlog = sample_task("TASK", "Backlog");
+    backlog.state = "backlog".to_string();
+    backlog.acceptance_criteria = vec!["First".to_string(), "Second".to_string()];
+    create_task(&pool, &backlog, &actor)
+        .await
+        .expect("create backlog task");
+    let error = refine_backlog_task(
+        &pool,
+        "TASK-2",
+        &RefineBacklogTask {
+            acceptance_criteria: vec!["Only one".to_string()],
+            ..input
+        },
+        &delegating_actor(),
+    )
+    .await
+    .expect_err("requirement removal rejected");
+    assert!(error.to_string().contains("cannot remove"));
+}
+
+#[tokio::test]
 async fn mutations_require_attributed_actor() {
     let (_temp, pool) = migrated_pool().await;
     let error = create_task_queue(
@@ -3326,6 +3529,14 @@ fn worker_actor() -> Actor {
         kind: "worker_agent".to_string(),
         id: "worker".to_string(),
         display_name: "worker".to_string(),
+    }
+}
+
+fn delegating_actor() -> Actor {
+    Actor {
+        kind: "delegating_agent".to_string(),
+        id: "delegating-agent".to_string(),
+        display_name: "delegating agent".to_string(),
     }
 }
 

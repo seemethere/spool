@@ -107,6 +107,25 @@ pub struct CreateChildTask {
     pub blocks_parent: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RefineBacklogTask {
+    pub title: Option<String>,
+    pub brief: Option<String>,
+    pub priority: Option<String>,
+    pub target_state: Option<String>,
+    pub review_required: Option<bool>,
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    pub validation_items: Vec<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub conflict_hints: Option<Vec<String>>,
+    #[serde(default)]
+    pub blocking_task_identifiers: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, PartialEq, Eq)]
 pub struct Task {
     pub id: String,
