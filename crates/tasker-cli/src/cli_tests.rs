@@ -1215,9 +1215,74 @@ Implement Bootstrap Task Creation.
 #[tokio::test]
 async fn task_review_decision_command_records_rework_feedback() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let paths = TaskerPaths::resolve(temp.path(), PathOverrides::default());
+    let (paths, pool) = seed_cli_human_review_task(temp.path(), "Review me").await;
+
+    task(
+        &paths,
+        false,
+        TaskCommand::ReviewDecision {
+            identifier: "TASK-1".to_string(),
+            decision: "rework".to_string(),
+            feedback: Some("Address the review feedback.".to_string()),
+            feedback_file: None,
+            actor_kind: "review_agent".to_string(),
+            actor: "reviewer".to_string(),
+        },
+    )
+    .await
+    .expect("record Review Decision");
+
+    let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+        .await
+        .expect("load task")
+        .expect("task exists");
+    assert_eq!(detail.task.state, "rework");
+    assert!(detail
+        .workpad_note
+        .expect("Workpad Note")
+        .body
+        .contains("Address the review feedback"));
+}
+
+#[tokio::test]
+async fn task_review_decision_command_records_approve_to_integrating() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (paths, pool) = seed_cli_human_review_task(temp.path(), "Approve me").await;
+
+    task(
+        &paths,
+        false,
+        TaskCommand::ReviewDecision {
+            identifier: "TASK-1".to_string(),
+            decision: "approve".to_string(),
+            feedback: None,
+            feedback_file: None,
+            actor_kind: "review_agent".to_string(),
+            actor: "reviewer".to_string(),
+        },
+    )
+    .await
+    .expect("record approve Review Decision");
+
+    let detail = tasker_db::get_task_detail(&pool, "TASK-1")
+        .await
+        .expect("load task")
+        .expect("task exists");
+    assert_eq!(detail.task.state, "integrating");
+    let events = tasker_db::list_task_audit_events(&pool, "TASK-1")
+        .await
+        .expect("audit events");
+    assert!(events.iter().any(|event| {
+        event.event_type == "task.review_decision_recorded"
+            && event.actor_kind == "review_agent"
+            && event.payload_json.contains("\"decision\":\"approve\"")
+    }));
+}
+
+async fn seed_cli_human_review_task(temp: &Path, title: &str) -> (TaskerPaths, sqlx::SqlitePool) {
+    let paths = TaskerPaths::resolve(temp, PathOverrides::default());
     init(&paths, false).await.expect("init");
-    let repo = temp.path().join("repo");
+    let repo = temp.join("repo");
     init_git_repo(&repo);
     queue(
         &paths,
@@ -1227,7 +1292,7 @@ async fn task_review_decision_command_records_rework_feedback() {
             name: "Tasker".to_string(),
             managed_source_repository: repo,
             main_branch: "main".to_string(),
-            worktree_root: temp.path().join("worktrees"),
+            worktree_root: temp.join("worktrees"),
             branch_template: "tasker/{task_identifier}".to_string(),
             done_worktree_retention: false,
             queue_concurrency_limit: None,
@@ -1236,18 +1301,20 @@ async fn task_review_decision_command_records_rework_feedback() {
     )
     .await
     .expect("create queue");
-    let task_file = temp.path().join("review-task.md");
+    let task_file = temp.join("review-task.md");
     fs::write(
         &task_file,
-        r#"---
-title: Review me
+        format!(
+            r#"---
+title: {title}
 acceptance_criteria:
   - It works
 validation_items:
   - Tests pass
 ---
 Implement reviewable work.
-"#,
+"#
+        ),
     )
     .expect("write task file");
     task(
@@ -1316,31 +1383,7 @@ Implement reviewable work.
     .await
     .expect("human review");
 
-    task(
-        &paths,
-        false,
-        TaskCommand::ReviewDecision {
-            identifier: "TASK-1".to_string(),
-            decision: "rework".to_string(),
-            feedback: Some("Address the review feedback.".to_string()),
-            feedback_file: None,
-            actor_kind: "review_agent".to_string(),
-            actor: "reviewer".to_string(),
-        },
-    )
-    .await
-    .expect("record Review Decision");
-
-    let detail = tasker_db::get_task_detail(&pool, "TASK-1")
-        .await
-        .expect("load task")
-        .expect("task exists");
-    assert_eq!(detail.task.state, "rework");
-    assert!(detail
-        .workpad_note
-        .expect("Workpad Note")
-        .body
-        .contains("Address the review feedback"));
+    (paths, pool)
 }
 
 #[cfg(unix)]
