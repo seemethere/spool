@@ -65,6 +65,12 @@ pub struct UpdateWorkpadRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct UpsertTaskLinkRequest {
+    pub actor: tasker_db::Actor,
+    pub link: tasker_db::UpsertTaskLink,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct UpdateRequirementStatusRequest {
     pub actor: tasker_db::Actor,
     pub status: String,
@@ -136,6 +142,7 @@ pub fn router(app_version: impl Into<String>, pool: SqlitePool) -> Router {
             "/tasks/{identifier}/workpad",
             axum::routing::put(update_workpad),
         )
+        .route("/tasks/{identifier}/links", post(upsert_task_link))
         .route("/tasks/{identifier}/transition", post(transition_task))
         .route(
             "/tasks/{identifier}/review-decision",
@@ -414,6 +421,20 @@ async fn update_workpad(
         .map_err(task_mutation_error)
 }
 
+async fn upsert_task_link(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+    Json(request): Json<UpsertTaskLinkRequest>,
+) -> Result<Json<tasker_db::TaskDetail>, (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    require_task_link_actor(&request.actor)?;
+    tasker_db::upsert_task_link(&state.pool, &identifier, &request.link, &request.actor)
+        .await
+        .map(Json)
+        .map_err(task_mutation_error)
+}
+
 async fn status(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -619,6 +640,20 @@ fn require_workpad_actor(
         Err(error_response(
             StatusCode::FORBIDDEN,
             "Workpad Note updates require an Operator, Delegating Agent, or Worker Agent actor",
+        ))
+    }
+}
+
+fn require_task_link_actor(
+    actor: &tasker_db::Actor,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if actor.kind == "operator" || actor.kind == "delegating_agent" || actor.kind == "worker_agent"
+    {
+        Ok(())
+    } else {
+        Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Task Link updates require an Operator, Delegating Agent, or Worker Agent actor",
         ))
     }
 }
@@ -977,6 +1012,215 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn task_link_endpoint_upserts_and_returns_updated_task_detail() {
+        let (_temp, pool, token) = migrated_pool().await;
+        let app = router("test-version", pool);
+
+        assert_eq!(
+            app.clone()
+                .oneshot(create_queue_request("TASK", "Tasker", "operator", &token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(create_task_request("TASK", "API Task", "operator", &token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+
+        let insert = app
+            .clone()
+            .oneshot(upsert_task_link_request(
+                "TASK-1",
+                "work_log",
+                "/tmp/tasker.log",
+                Some("Initial log"),
+                false,
+                "worker_agent",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(insert.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(insert.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["task"]["identifier"], "TASK-1");
+        assert_eq!(json["task_links"].as_array().unwrap().len(), 1);
+        assert_eq!(json["task_links"][0]["kind"], "work_log");
+        assert_eq!(json["task_links"][0]["target"], "/tmp/tasker.log");
+        assert_eq!(json["task_links"][0]["label"], "Initial log");
+
+        let update = app
+            .clone()
+            .oneshot(upsert_task_link_request(
+                "TASK-1",
+                "work_log",
+                "/tmp/tasker.log",
+                Some("Updated log"),
+                false,
+                "worker_agent",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(update.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["task_links"].as_array().unwrap().len(), 1);
+        assert_eq!(json["task_links"][0]["label"], "Updated log");
+
+        let primary_branch = app
+            .clone()
+            .oneshot(upsert_task_link_request(
+                "TASK-1",
+                "task_branch",
+                "tasker/TASK-1",
+                None,
+                true,
+                "operator",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(primary_branch.status(), StatusCode::OK);
+
+        let primary_log = app
+            .oneshot(upsert_task_link_request(
+                "TASK-1",
+                "work_log",
+                "/tmp/tasker.log",
+                Some("Updated log"),
+                true,
+                "worker_agent",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(primary_log.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(primary_log.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let links = json["task_links"].as_array().unwrap();
+        assert_eq!(links.len(), 2);
+        assert_eq!(
+            links
+                .iter()
+                .filter(|link| link["is_primary"].as_bool().unwrap())
+                .count(),
+            1
+        );
+        assert!(links.iter().any(|link| link["kind"] == "work_log"
+            && link["target"] == "/tmp/tasker.log"
+            && link["is_primary"] == true));
+    }
+
+    #[tokio::test]
+    async fn task_link_endpoint_maps_missing_task_invalid_actor_and_invalid_input_errors() {
+        let (_temp, pool, token) = migrated_pool().await;
+        let app = router("test-version", pool);
+
+        assert_eq!(
+            app.clone()
+                .oneshot(create_queue_request("TASK", "Tasker", "operator", &token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(create_task_request("TASK", "API Task", "operator", &token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+
+        let missing = app
+            .clone()
+            .oneshot(upsert_task_link_request(
+                "TASK-999",
+                "work_log",
+                "/tmp/tasker.log",
+                None,
+                false,
+                "worker_agent",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let invalid_actor_kind = app
+            .clone()
+            .oneshot(upsert_task_link_request(
+                "TASK-1",
+                "work_log",
+                "/tmp/tasker.log",
+                None,
+                false,
+                "review_agent",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_actor_kind.status(), StatusCode::FORBIDDEN);
+
+        let blank_actor_id = app
+            .clone()
+            .oneshot(upsert_task_link_request_with_actor_id(
+                "TASK-1",
+                "work_log",
+                "/tmp/tasker.log",
+                "",
+                "worker_agent",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(blank_actor_id.status(), StatusCode::BAD_REQUEST);
+
+        let blank_kind = app
+            .clone()
+            .oneshot(upsert_task_link_request(
+                "TASK-1",
+                "",
+                "/tmp/tasker.log",
+                None,
+                false,
+                "worker_agent",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(blank_kind.status(), StatusCode::BAD_REQUEST);
+
+        let blank_target = app
+            .oneshot(upsert_task_link_request(
+                "TASK-1",
+                "work_log",
+                "",
+                None,
+                false,
+                "worker_agent",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(blank_target.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -2022,6 +2266,66 @@ mod tests {
         Request::builder()
             .method("PUT")
             .uri(format!("/tasks/{identifier}/workpad"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(request.to_string()))
+            .unwrap()
+    }
+
+    fn upsert_task_link_request(
+        identifier: &str,
+        kind: &str,
+        target: &str,
+        label: Option<&str>,
+        is_primary: bool,
+        actor_kind: &str,
+        token: &str,
+    ) -> Request<Body> {
+        upsert_task_link_request_with_actor(
+            identifier, kind, target, label, is_primary, "tester", actor_kind, token,
+        )
+    }
+
+    fn upsert_task_link_request_with_actor_id(
+        identifier: &str,
+        kind: &str,
+        target: &str,
+        actor_id: &str,
+        actor_kind: &str,
+        token: &str,
+    ) -> Request<Body> {
+        upsert_task_link_request_with_actor(
+            identifier, kind, target, None, false, actor_id, actor_kind, token,
+        )
+    }
+
+    fn upsert_task_link_request_with_actor(
+        identifier: &str,
+        kind: &str,
+        target: &str,
+        label: Option<&str>,
+        is_primary: bool,
+        actor_id: &str,
+        actor_kind: &str,
+        token: &str,
+    ) -> Request<Body> {
+        let request = serde_json::json!({
+            "actor": {
+                "kind": actor_kind,
+                "id": actor_id,
+                "display_name": "tester"
+            },
+            "link": {
+                "kind": kind,
+                "target": target,
+                "label": label,
+                "is_primary": is_primary
+            }
+        });
+
+        Request::builder()
+            .method("POST")
+            .uri(format!("/tasks/{identifier}/links"))
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {token}"))
             .body(Body::from(request.to_string()))
