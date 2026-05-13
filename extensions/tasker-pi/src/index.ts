@@ -54,6 +54,13 @@ const ChildTaskParams = Type.Object({
   review_required: Type.Optional(Type.Boolean()),
   blocks_parent: Type.Optional(Type.Boolean()),
 });
+const TaskLinkParams = Type.Object({
+  identifier: Identifier,
+  kind: Type.String({ description: "Task Link kind, such as local_worktree, task_branch, review_artifact, or external_reference." }),
+  target: Type.String({ description: "Task Link target such as a path, branch name, URL, or artifact identifier." }),
+  label: Type.Optional(Type.String({ description: "Optional human-readable Task Link label." })),
+  is_primary: Type.Optional(Type.Boolean({ description: "Whether this Task Link should become the Primary Handoff Link for the Task." })),
+});
 const TransitionParams = Type.Object({
   identifier: Identifier,
   to_state: TaskState,
@@ -183,6 +190,29 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
     parameters: ChildTaskParams,
     async execute(_id, params, signal) {
       return asToolResult(await client.createChildTask(params, config.actor, signal));
+    },
+  });
+
+  pi.registerTool({
+    name: "tasker_attach_task_link",
+    label: "Tasker: Attach Task Link",
+    description:
+      "Attach or upsert a typed Task Link collaboration/delivery reference on a Task. Task Links are not authoritative Acceptance Criteria, Validation Items, or scheduling gates.",
+    parameters: TaskLinkParams,
+    async execute(_id, params, signal) {
+      return asToolResult(
+        await client.upsertTaskLink(
+          params.identifier,
+          {
+            kind: params.kind,
+            target: params.target,
+            label: params.label,
+            is_primary: params.is_primary,
+          },
+          config.actor,
+          signal,
+        ),
+      );
     },
   });
 

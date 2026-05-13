@@ -25,6 +25,7 @@ For extension-native dogfood delegation, load the extension in a normal human-pr
 - `tasker_set_acceptance_criterion_status` accepts `pending`, `satisfied`, or `waived`.
 - `tasker_set_validation_item_status` accepts `pending`, `passed`, `failed`, or `waived`.
 - `tasker_create_child_task`
+- `tasker_attach_task_link` attaches or upserts a typed **Task Link** with Task Identifier, kind, target, optional label, and optional Primary Handoff Link selection. **Task Links** are collaboration/delivery references, not authoritative **Acceptance Criteria**, **Validation Items**, or scheduling gates.
 - `tasker_create_delegated_root_task` creates one Root Task from structured Delegation Session draft data by calling Tasker's deterministic `/tasks/delegated-root` API path. The Rust Tasker API validates the draft and persists the Task; the extension does not duplicate persistence rules.
 - `tasker_refine_backlog_task` refines an existing Backlog Task through the deterministic refinement API path.
 - `tasker_upsert_task_link` attaches or updates a typed Task Link through `POST /tasks/{identifier}/links` with `kind`, `target`, optional `label`, and optional `is_primary`. Use it for collaboration and delivery references such as `local_worktree`, `task_branch`, review packets/artifacts, local logs, chat threads, media, or non-required external references. Do not use Task Links as authoritative gate state; structured Acceptance Criteria and Validation Items remain the completion gates.

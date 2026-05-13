@@ -36,6 +36,7 @@ describe("registerTaskerExtension", () => {
 
     expect(tools.map((tool) => tool.name).sort()).toEqual([
       "tasker_append_workpad",
+      "tasker_attach_task_link",
       "tasker_create_child_task",
       "tasker_create_delegated_root_task",
       "tasker_get_task",
@@ -63,6 +64,14 @@ describe("registerTaskerExtension", () => {
 
     const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool.parameters]));
     expect(byName.tasker_get_task_context_bundle.properties.identifier.description).toBe("Task Identifier, such as TASKER-1");
+    expect(Object.keys(byName.tasker_attach_task_link.properties).sort()).toEqual([
+      "identifier",
+      "is_primary",
+      "kind",
+      "label",
+      "target",
+    ].sort());
+    expect(byName.tasker_attach_task_link.properties.is_primary.type).toBe("boolean");
     expect(byName.tasker_set_acceptance_criterion_status.properties.status.anyOf.map((item: any) => item.const)).toEqual([
       "pending",
       "satisfied",
@@ -149,6 +158,48 @@ describe("registerTaskerExtension", () => {
         blocking_task_identifiers: [],
         acceptance_criteria: ["The Task is created through the Tasker Pi Extension."],
         validation_items: ["Fake-extension test observes the delegated-root API call."],
+      },
+    });
+  });
+
+  it("executes Task Link attachment through the extension tool with the configured actor", async () => {
+    process.env.TASKER_API_URL = "http://tasker.test";
+    process.env.TASKER_API_TOKEN = "token";
+    process.env.TASKER_ACTOR_ID = "worker-1";
+    process.env.TASKER_ACTOR_DISPLAY_NAME = "Worker One";
+    const tools: Array<{ name: string; parameters: any; execute: Function }> = [];
+    const pi: ExtensionAPI = {
+      registerTool(tool) {
+        tools.push({ name: tool.name, parameters: tool.parameters, execute: tool.execute });
+      },
+    };
+
+    registerTaskerExtension(pi);
+    const linkTool = tools.find((tool) => tool.name === "tasker_attach_task_link");
+    expect(linkTool).toBeDefined();
+
+    const result = await linkTool!.execute("tool-1", {
+      identifier: "TASKER-999",
+      kind: "review_artifact",
+      target: "file:///tmp/review.md",
+      label: "Review artifact",
+      is_primary: true,
+    }, new AbortController().signal);
+
+    expect(result.details).toEqual({ task: { identifier: "TASKER-999" } });
+    expect(requests[0].url).toBe("http://tasker.test/tasks/TASKER-999/links");
+    expect(requests[0].init.method).toBe("POST");
+    expect(JSON.parse(requests[0].init.body as string)).toEqual({
+      actor: {
+        kind: "worker_agent",
+        id: "worker-1",
+        display_name: "Worker One",
+      },
+      link: {
+        kind: "review_artifact",
+        target: "file:///tmp/review.md",
+        label: "Review artifact",
+        is_primary: true,
       },
     });
   });
