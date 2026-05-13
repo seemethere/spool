@@ -238,6 +238,48 @@ describe("TaskerClient", () => {
     });
   });
 
+  it("upserts Task Links with actor attribution through the narrow endpoint", async () => {
+    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+
+    await client.upsertTaskLink("TASK-1", {
+      kind: "change_artifact",
+      target: "file:///tmp/tasker.patch",
+      label: "Patch artifact",
+      is_primary: true,
+    }, actor);
+
+    expect(requests[0].url).toBe("http://tasker.test/tasks/TASK-1/links");
+    expect(requests[0].init.method).toBe("POST");
+    expect(JSON.parse(requests[0].init.body as string)).toEqual({
+      actor,
+      link: {
+        kind: "change_artifact",
+        target: "file:///tmp/tasker.patch",
+        label: "Patch artifact",
+        is_primary: true,
+      },
+    });
+  });
+
+  it("defaults omitted Task Link label and primary selection in request body", async () => {
+    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+
+    await client.upsertTaskLink("TASK-1", {
+      kind: "chat_thread",
+      target: "local://thread/1",
+    }, actor);
+
+    expect(JSON.parse(requests[0].init.body as string)).toEqual({
+      actor,
+      link: {
+        kind: "chat_thread",
+        target: "local://thread/1",
+        label: null,
+        is_primary: false,
+      },
+    });
+  });
+
   it("creates delegated Root Tasks through the deterministic draft endpoint", async () => {
     const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
     const delegator = { kind: "delegating_agent", id: "delegator", display_name: "Delegator" };

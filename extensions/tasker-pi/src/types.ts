@@ -47,6 +47,13 @@ export interface ReviewDecisionInput {
   feedback?: string;
 }
 
+export interface TaskLinkInput {
+  kind: string;
+  target: string;
+  label?: string;
+  is_primary?: boolean;
+}
+
 export interface DelegationTaskDraftInput {
   queue_key: string;
   title: string;

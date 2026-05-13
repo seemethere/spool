@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { appendFileSync, existsSync } from "node:fs";
-import type { Actor, CreateChildTaskInput, DelegationTaskDraftInput, RefineBacklogTaskInput, RequirementStatusInput, ReviewDecisionInput, TaskerExtensionConfig, WorkerStatusReportInput } from "./types";
+import type { Actor, CreateChildTaskInput, DelegationTaskDraftInput, RefineBacklogTaskInput, RequirementStatusInput, ReviewDecisionInput, TaskerExtensionConfig, TaskLinkInput, WorkerStatusReportInput } from "./types";
 
 export class TaskerClient {
   private readonly apiUrl: string;
@@ -96,6 +96,18 @@ export class TaskerClient {
       actor,
       decision: input.decision,
       feedback: input.feedback ?? null,
+    }, signal);
+  }
+
+  upsertTaskLink(identifier: string, input: TaskLinkInput, actor: Actor, signal?: AbortSignal): Promise<unknown> {
+    return this.request("POST", `/tasks/${encodeURIComponent(identifier)}/links`, {
+      actor,
+      link: {
+        kind: input.kind,
+        target: input.target,
+        label: input.label ?? null,
+        is_primary: input.is_primary ?? false,
+      },
     }, signal);
   }
 
