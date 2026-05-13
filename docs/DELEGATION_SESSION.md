@@ -132,6 +132,12 @@ The first deterministic creation/refinement payload contains only Tasker-owned s
 
 The **Task Brief** may include a short "Workpad Note seed" section for narrative handoff, but structured Tasker fields remain authoritative for gates and scheduling. Acceptance Criteria and Validation Items must not be buried only in Markdown.
 
+## Task Link attachment during delegation
+
+During a human-present **Delegation Session**, a **Delegating Agent** should attach **Task Links** through the **Tasker Pi Extension** only for references that help a future **Worker Agent**, **Review Agent**, or **Operator** locate collaboration or delivery context. Examples include a local design note, a chat/thread reference, a media artifact supplied by the human, or a non-required external reference. Do not attach links as a substitute for the **Task Brief**, **Acceptance Criteria**, **Validation Items**, **Task Conflict Hints**, or same-queue **Blocking Tasks**.
+
+When a link is the main handoff artifact for the created or refined **Task**, mark it as the **Primary Handoff Link**. Keep examples local-first; GitHub, pull requests, and external trackers may appear only as optional references and must not become required dependencies for the v1 delegation flow.
+
 ## Deterministic helper boundary
 
 The first implementation should split the feature into deterministic helpers and the Pi-backed session:

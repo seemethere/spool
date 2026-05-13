@@ -27,11 +27,23 @@ For extension-native dogfood delegation, load the extension in a normal human-pr
 - `tasker_create_child_task`
 - `tasker_create_delegated_root_task` creates one Root Task from structured Delegation Session draft data by calling Tasker's deterministic `/tasks/delegated-root` API path. The Rust Tasker API validates the draft and persists the Task; the extension does not duplicate persistence rules.
 - `tasker_refine_backlog_task` refines an existing Backlog Task through the deterministic refinement API path.
+- `tasker_upsert_task_link` attaches or updates a typed Task Link through `POST /tasks/{identifier}/links` with `kind`, `target`, optional `label`, and optional `is_primary`. Use it for collaboration and delivery references such as `local_worktree`, `task_branch`, review packets/artifacts, local logs, chat threads, media, or non-required external references. Do not use Task Links as authoritative gate state; structured Acceptance Criteria and Validation Items remain the completion gates.
 - `tasker_request_transition` accepts the fixed v1 Task State values.
 - `tasker_record_review_decision` records a human Review Decision through the deterministic review API path.
 - `tasker_report_worker_status` records supervisor-only status (`completion_intent`, `blocked`, or `retryable_failure`) without changing Tasker state.
 
 All mutations send explicit Tasker Actor attribution. The extension does not shell out to the Tasker CLI. Existing replace-style Workpad Note updates remain available for callers that need to rewrite the full note. Worker status reports are a local supervisor contract, not authoritative Tasker state. The context bundle is read-only and intentionally excludes raw Run Transcript bodies, raw launcher payloads, secrets, and unrelated queue data.
+
+
+## Task Link attachment guidance
+
+Attach **Task Links** through the Tasker Pi Extension when a reference helps another agent, a **Review Session**, or Local Worktree Delivery find the right artifact without scraping transcripts or guessing paths. Common local-first examples:
+
+- Worker Agents may attach `local_worktree` and `task_branch` references when preparing Local Worktree Delivery, and may attach local patch, log, or artifact references when they are useful handoff evidence.
+- Delegating Agents may attach non-gate context from an Interactive Agent Session, such as a local design note, chat/thread reference, media artifact, or external reference supplied by the human. Keep the Task Brief and structured requirements authoritative; do not hide Acceptance Criteria or Validation Items in links.
+- Review Agents may attach or update review packet/artifact references that help future Worker Agents or Operators inspect feedback, while recording the actual Review Decision through the review-decision path.
+
+Use `is_primary: true` only for the main handoff artifact a finishing or reviewing agent should inspect first. Task Links are collaboration and delivery references; they are not scheduling rules, **Review Policy**, **Criterion Status**, **Validation Status**, **Waivers**, or proof that a Task can transition. GitHub, pull requests, and external trackers are optional future/reference targets, not required dependencies for v1.
 
 ## Worker Loop usage
 

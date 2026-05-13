@@ -25,3 +25,10 @@ Approving does not imply waivers. Any unsatisfied **Acceptance Criterion** or un
 Question UI is expected in this **Interactive Agent Session**. This does not change **Unattended Worker Session** behavior: blocking question UI during `tasker work --launcher pi` still fails the **Agent Run** with the `unattended_question` failure reason code instead of waiting for a human.
 
 The first Review Session path is local-first and does not require GitHub, a pull request, or a web UI. The Review Packet intentionally omits raw Run Transcript bodies, raw Launcher Session Data payloads, prompts, secrets, and unrelated Task Queue data.
+
+
+## Task Link attachment during review
+
+A **Review Agent** may attach or update **Task Links** through the **Tasker Pi Extension** when the review produces a durable reference that will help rework, handoff, or operator inspection. Common examples are a local Review Packet artifact, a diff or patch file, a local log excerpt artifact, or an optional external review/reference target. Use `is_primary` only when the artifact is the main item a future reviewer or finishing agent should inspect first.
+
+Task Links are collaboration and delivery references, not authoritative gate state. The actual **Review Decision** must be recorded through the review-decision path, and structured **Acceptance Criteria**, **Validation Items**, and any explicit **Waivers** remain authoritative for whether a **Task** may leave **Human Review** for **Integrating**.
