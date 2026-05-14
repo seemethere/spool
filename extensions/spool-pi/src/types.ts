@@ -4,7 +4,7 @@ export interface Actor {
   display_name: string;
 }
 
-export interface TaskerExtensionConfig {
+export interface SpoolExtensionConfig {
   apiUrl: string;
   apiToken: string;
   actor: Actor;
@@ -12,7 +12,7 @@ export interface TaskerExtensionConfig {
   workerStatusPath?: string;
 }
 
-export interface TaskerToolResult {
+export interface SpoolToolResult {
   content: Array<{ type: "text"; text: string }>;
   details: unknown;
 }
@@ -29,7 +29,7 @@ export interface ExtensionAPI {
       signal: AbortSignal,
       onUpdate?: unknown,
       ctx?: unknown,
-    ) => Promise<TaskerToolResult>;
+    ) => Promise<SpoolToolResult>;
   }): void;
 }
 

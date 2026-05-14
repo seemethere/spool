@@ -1594,7 +1594,7 @@ printf '%s\n' "$SPOOL_ACTOR_KIND:$SPOOL_ACTOR_ID" >> "{capture}"
     assert!(captured.contains("Custom repo Review Agent prompt."));
     assert!(captured.contains("Review Packet"));
     assert!(captured.contains("Question UI is allowed"));
-    assert!(captured.contains("tasker_record_review_decision"));
+    assert!(captured.contains("spool_record_review_decision"));
     assert!(captured.contains("review_agent:reviewer"));
 }
 
@@ -1648,7 +1648,7 @@ Needs a better contract.
     .await
     .expect("create backlog task");
 
-    let extension = repo.join("extensions/tasker-pi/src/index.ts");
+    let extension = repo.join("extensions/spool-pi/src/index.ts");
     fs::create_dir_all(extension.parent().expect("extension parent")).expect("mkdir extension");
     fs::write(&extension, "// fake extension").expect("write extension");
 
@@ -1708,14 +1708,14 @@ printf '%s\n' "$SPOOL_ACTOR_KIND:$SPOOL_ACTOR_ID" >> "{capture}"
 
     let captured = fs::read_to_string(capture).expect("capture");
     assert!(captured.contains("--extension"));
-    assert!(captured.contains("extensions/tasker-pi/src/index.ts"));
+    assert!(captured.contains("extensions/spool-pi/src/index.ts"));
     assert!(captured.contains("Task Queue Key: TASK"));
-    assert!(captured.contains("tasker_create_delegated_root_task"));
+    assert!(captured.contains("spool_create_delegated_root_task"));
     assert!(captured.contains("Initial human intent:"));
     assert!(captured.contains("Investigate transcript volume regression"));
     assert!(captured.contains("Refinement target: TASK-1"));
     assert!(captured.contains("Existing Backlog Task context for refinement"));
-    assert!(captured.contains("tasker_refine_backlog_task"));
+    assert!(captured.contains("spool_refine_backlog_task"));
     assert!(captured.contains("Clarify acceptance criteria"));
     assert!(captured.contains("delegating_agent:delegator"));
 }

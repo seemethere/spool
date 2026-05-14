@@ -118,12 +118,12 @@ fn resolve_delegate_pi_extension(
         return Ok(Some(path));
     }
 
-    let local_extension = managed_source_repository.join("extensions/tasker-pi/src/index.ts");
+    let local_extension = managed_source_repository.join("extensions/spool-pi/src/index.ts");
     if local_extension.is_file() {
-        Ok(Some(PathBuf::from("extensions/tasker-pi/src/index.ts")))
+        Ok(Some(PathBuf::from("extensions/spool-pi/src/index.ts")))
     } else {
         anyhow::bail!(
-            "spool delegate requires a Spool Pi Extension. No --pi-extension was provided and the repo-local extension was not found at {}. Run from the Managed Source Repository, restore extensions/tasker-pi/src/index.ts, or pass --pi-extension explicitly.",
+            "spool delegate requires a Spool Pi Extension. No --pi-extension was provided and the repo-local extension was not found at {}. Run from the Managed Source Repository, restore extensions/spool-pi/src/index.ts, or pass --pi-extension explicitly.",
             local_extension.display()
         )
     }
@@ -160,7 +160,7 @@ fn render_refinement_context(bundle: &spool_db::TaskContextBundle) -> Result<Str
             "key": bundle.queue.key,
             "name": bundle.queue.name,
         },
-        "deterministic_refinement_tool": "tasker_refine_backlog_task",
+        "deterministic_refinement_tool": "spool_refine_backlog_task",
         "interactive_session_note": "Question UI is allowed in this Delegation Session only; Unattended Worker Session question handling is unchanged.",
     }))
     .context("failed to render Backlog Task refinement context")
@@ -209,14 +209,14 @@ mod tests {
             .to_string()
             .contains("repo-local extension was not found"));
 
-        let extension = temp.path().join("extensions/tasker-pi/src/index.ts");
+        let extension = temp.path().join("extensions/spool-pi/src/index.ts");
         fs::create_dir_all(extension.parent().expect("extension parent")).expect("mkdir");
         fs::write(&extension, "// fake extension").expect("write extension");
 
         let resolved = resolve_delegate_pi_extension(None, temp.path()).expect("default extension");
         assert_eq!(
             resolved,
-            Some(PathBuf::from("extensions/tasker-pi/src/index.ts"))
+            Some(PathBuf::from("extensions/spool-pi/src/index.ts"))
         );
     }
 

@@ -676,7 +676,7 @@ fn write_pi_transcript(
 
 const DEFAULT_WORKER_ROLE_PROMPT: &str = "You are a Spool Worker Agent running unattended. Do not ask questions or open interactive UI. Use the Spool Pi Extension tools to read and update Spool state, Workpad Notes, requirements, child tasks, and transitions.";
 
-const WORKER_CONTEXT_BUNDLE_GUIDANCE: &str = "Run-start context discipline:\n- First call the Spool Pi Extension tool `tasker_get_task_context_bundle` for this Task Identifier before broad file/context discovery, repeated Spool CLI status/show reads, or Agent Run lookups.\n- Treat that bundle as the preferred source for the Task Brief, Acceptance Criteria, Validation Items, Workpad Note, Task Links, Task Conflict Hints, likely files/path guidance, recent Agent Runs, Task Queue/local workflow context, latest failure summary, and latest Integration Outcome summary. Structured Spool fields remain authoritative for gates and scheduling; Workpad Note Markdown is narrative/handoff context.\n- From the bundle, write and maintain a short context plan in your own reasoning before reading source files: identify the likely files/paths, ADRs, and docs to inspect, what you need from each, and any advisory conflict/overlap risks.\n- Preserve canonical project context reads in that plan: read `CONTEXT.md`, `ROADMAP.md`, and only the relevant ADRs or docs before changing architecture, workflow, persistence, delivery, launcher behavior, or domain language.\n- Then use targeted `rg`/`find` narrowing and narrow read ranges instead of broad rereads when revisiting known files. Avoid rereading unchanged files; keep track of files and symbols already inspected.\n- Reread only when necessary for correctness, such as after files changed, while resolving conflicts, or before precise edits that need exact current text. When a reread is necessary, briefly note the reason in reasoning or the Workpad Note handoff.\n- If an Agent Run exceeds efficiency budget warnings, summarize efficiency-relevant behavior in the Workpad Note handoff, including repeated file reads, large transcript/context, excessive shell/tool calls, or repeated Spool context fetches, alongside summary, changed files, validation, risks, and follow-up Task candidates. These efficiency notes are narrative and do not replace structured Acceptance Criterion or Validation Item statuses.\n- If the Spool Pi Extension tool is unavailable, use narrow safe fallback reads only: prefer the repo-local `bin/spool-local` wrapper from the Managed Source Repository root for `queue show <queue>` preflight and `task show <task>`; avoid bare `spool`, broad status loops, repeated show commands, raw SQL, or transcript scraping unless the Task explicitly requires them.\n- Do not expose raw Run Transcript bodies, raw launcher payloads, prompt bodies, secrets, or unrelated queue data.";
+const WORKER_CONTEXT_BUNDLE_GUIDANCE: &str = "Run-start context discipline:\n- First call the Spool Pi Extension tool `spool_get_task_context_bundle` for this Task Identifier before broad file/context discovery, repeated Spool CLI status/show reads, or Agent Run lookups.\n- Treat that bundle as the preferred source for the Task Brief, Acceptance Criteria, Validation Items, Workpad Note, Task Links, Task Conflict Hints, likely files/path guidance, recent Agent Runs, Task Queue/local workflow context, latest failure summary, and latest Integration Outcome summary. Structured Spool fields remain authoritative for gates and scheduling; Workpad Note Markdown is narrative/handoff context.\n- From the bundle, write and maintain a short context plan in your own reasoning before reading source files: identify the likely files/paths, ADRs, and docs to inspect, what you need from each, and any advisory conflict/overlap risks.\n- Preserve canonical project context reads in that plan: read `CONTEXT.md`, `ROADMAP.md`, and only the relevant ADRs or docs before changing architecture, workflow, persistence, delivery, launcher behavior, or domain language.\n- Then use targeted `rg`/`find` narrowing and narrow read ranges instead of broad rereads when revisiting known files. Avoid rereading unchanged files; keep track of files and symbols already inspected.\n- Reread only when necessary for correctness, such as after files changed, while resolving conflicts, or before precise edits that need exact current text. When a reread is necessary, briefly note the reason in reasoning or the Workpad Note handoff.\n- If an Agent Run exceeds efficiency budget warnings, summarize efficiency-relevant behavior in the Workpad Note handoff, including repeated file reads, large transcript/context, excessive shell/tool calls, or repeated Spool context fetches, alongside summary, changed files, validation, risks, and follow-up Task candidates. These efficiency notes are narrative and do not replace structured Acceptance Criterion or Validation Item statuses.\n- If the Spool Pi Extension tool is unavailable, use narrow safe fallback reads only: prefer the repo-local `bin/spool-local` wrapper from the Managed Source Repository root for `queue show <queue>` preflight and `task show <task>`; avoid bare `spool`, broad status loops, repeated show commands, raw SQL, or transcript scraping unless the Task explicitly requires them.\n- Do not expose raw Run Transcript bodies, raw launcher payloads, prompt bodies, secrets, or unrelated queue data.";
 
 fn build_worker_prompt(
     task: &spool_db::TaskDetail,
@@ -1311,7 +1311,7 @@ mod tests {
         )
         .expect("build prompt");
 
-        assert!(prompt.contains("tasker_get_task_context_bundle"));
+        assert!(prompt.contains("spool_get_task_context_bundle"));
         assert!(prompt.contains("Task Brief"));
         assert!(prompt.contains("Acceptance Criteria"));
         assert!(prompt.contains("Validation Items"));
@@ -1392,7 +1392,7 @@ mod tests {
         .expect("build prompt");
 
         assert!(prompt.starts_with("Custom worker instructions."));
-        assert!(prompt.contains("tasker_get_task_context_bundle"));
+        assert!(prompt.contains("spool_get_task_context_bundle"));
         assert!(prompt.contains("write and maintain a short context plan"));
         assert!(prompt.contains("`CONTEXT.md`"));
         assert!(prompt.contains("Avoid rereading unchanged files"));
@@ -1947,7 +1947,7 @@ mod tests {
         write_executable(
             &pi_bin,
             &format!(
-                "#!/bin/sh\ntest \"$1 $2 $3 $4\" = \"--mode rpc --extension extensions/tasker-pi/src/index.ts\" || exit 7\ntest -n \"$SPOOL_AGENT_RUN_ID\" || exit 8\ntest -n \"$CARGO_TARGET_DIR\" || exit 9\nprintf '%s' \"$CARGO_TARGET_DIR\" > {}\nread line\necho '{{\"type\":\"agent_end\"}}'\n",
+                "#!/bin/sh\ntest \"$1 $2 $3 $4\" = \"--mode rpc --extension extensions/spool-pi/src/index.ts\" || exit 7\ntest -n \"$SPOOL_AGENT_RUN_ID\" || exit 8\ntest -n \"$CARGO_TARGET_DIR\" || exit 9\nprintf '%s' \"$CARGO_TARGET_DIR\" > {}\nread line\necho '{{\"type\":\"agent_end\"}}'\n",
                 cargo_target_log.display()
             ),
         );
@@ -1966,7 +1966,7 @@ mod tests {
                 api_url: "http://127.0.0.1:4317".to_string(),
                 api_token: "token".to_string(),
                 pi_bin: pi_bin.display().to_string(),
-                pi_extension: Some(PathBuf::from("extensions/tasker-pi/src/index.ts")),
+                pi_extension: Some(PathBuf::from("extensions/spool-pi/src/index.ts")),
                 worker_prompt: None,
             },
         )

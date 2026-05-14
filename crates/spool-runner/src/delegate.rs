@@ -175,10 +175,10 @@ pub fn build_delegation_prompt(context: DelegationPromptContext<'_>) -> Result<S
 
     let session_target = match (context.queue_key, context.refine_task_identifier) {
         (_, Some(identifier)) => format!(
-            "Refinement target: {identifier}\nMode: refine an existing Backlog Task only. Do not revise active work in Ready, In Progress, Human Review, Rework, Integrating, Done, or Canceled. Use the Spool Pi Extension tool `tasker_refine_backlog_task` for deterministic refinement."
+            "Refinement target: {identifier}\nMode: refine an existing Backlog Task only. Do not revise active work in Ready, In Progress, Human Review, Rework, Integrating, Done, or Canceled. Use the Spool Pi Extension tool `spool_refine_backlog_task` for deterministic refinement."
         ),
         (Some(queue_key), None) => format!(
-            "Task Queue Key: {queue_key}\nMode: create one new Root Task. The Task defaults to Backlog unless Ready is explicitly justified with structured Acceptance Criteria and Validation Items. Use the Spool Pi Extension tool `tasker_create_delegated_root_task` for deterministic creation."
+            "Task Queue Key: {queue_key}\nMode: create one new Root Task. The Task defaults to Backlog unless Ready is explicitly justified with structured Acceptance Criteria and Validation Items. Use the Spool Pi Extension tool `spool_create_delegated_root_task` for deterministic creation."
         ),
         (None, None) => "Task Queue Key: not selected yet\nMode: create one new Root Task after selecting the intended Task Queue.".to_string(),
     };
@@ -294,7 +294,7 @@ mod tests {
         assert!(prompt.contains("Task Conflict Hints"));
         assert!(prompt.contains("Blocking Tasks"));
         assert!(prompt.contains("Task Queue Key: TASKER"));
-        assert!(prompt.contains("tasker_create_delegated_root_task"));
+        assert!(prompt.contains("spool_create_delegated_root_task"));
         assert!(prompt.contains("Root Task"));
         assert!(prompt.contains("Agent-Gated Integration"));
         assert!(prompt.contains("not a Worker Agent"));
@@ -345,7 +345,7 @@ mod tests {
         .expect("prompt");
 
         assert!(prompt.contains("Refinement target: TASKER-1"));
-        assert!(prompt.contains("tasker_refine_backlog_task"));
+        assert!(prompt.contains("spool_refine_backlog_task"));
         assert!(prompt.contains("Backlog Task only"));
         assert!(prompt.contains("Do not revise active work"));
         assert!(prompt
@@ -428,7 +428,7 @@ printf '%s\n' "$SPOOL_ACTOR_KIND:$SPOOL_ACTOR_ID:$SPOOL_API_URL" >> "{capture}"
         assert!(outcome.completed);
         let captured = fs::read_to_string(capture).expect("capture");
         assert!(captured.contains("Spool Delegating Agent"));
-        assert!(captured.contains("tasker_create_delegated_root_task"));
+        assert!(captured.contains("spool_create_delegated_root_task"));
         assert!(captured.contains("delegating_agent:delegator:http://spool.test"));
     }
 }

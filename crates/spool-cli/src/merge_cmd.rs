@@ -708,7 +708,7 @@ fn print_manual_merge_inspection(
     println!("Suggested validation commands:");
     println!("  cargo test");
     println!("  cargo clippy --all-targets --all-features -- -D warnings");
-    println!("  if TypeScript extension files changed: (cd extensions/tasker-pi && bun test && bun run build)");
+    println!("  if TypeScript extension files changed: (cd extensions/spool-pi && bun test && bun run build)");
     println!();
     println!("Post-merge batch validation:");
     for line in post_merge_batch_validation_guidance() {

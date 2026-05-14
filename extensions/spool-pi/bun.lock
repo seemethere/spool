@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "@tasker/pi-extension",
+      "name": "@spool/pi-extension",
       "dependencies": {
         "typebox": "^1.0.55",
       },

@@ -1,5 +1,5 @@
 {
-  "name": "@tasker/pi-extension",
+  "name": "@spool/pi-extension",
   "private": true,
   "type": "module",
   "scripts": {

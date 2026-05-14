@@ -1,12 +1,12 @@
 import { execFileSync } from "node:child_process";
 import { appendFileSync, existsSync } from "node:fs";
-import type { Actor, CreateChildTaskInput, DelegationTaskDraftInput, RefineBacklogTaskInput, RequirementStatusInput, ReviewDecisionInput, TaskerExtensionConfig, TaskLinkInput, WorkerStatusReportInput } from "./types";
+import type { Actor, CreateChildTaskInput, DelegationTaskDraftInput, RefineBacklogTaskInput, RequirementStatusInput, ReviewDecisionInput, SpoolExtensionConfig, TaskLinkInput, WorkerStatusReportInput } from "./types";
 
-export class TaskerClient {
+export class SpoolClient {
   private readonly apiUrl: string;
   private readonly apiToken: string;
 
-  constructor(config: Pick<TaskerExtensionConfig, "apiUrl" | "apiToken">) {
+  constructor(config: Pick<SpoolExtensionConfig, "apiUrl" | "apiToken">) {
     this.apiUrl = config.apiUrl.replace(/\/+$/, "");
     this.apiToken = config.apiToken;
   }
@@ -150,7 +150,7 @@ export class TaskerClient {
 
   reportWorkerStatus(input: WorkerStatusReportInput, actor: Actor, workerStatusPath?: string): unknown {
     const report = {
-      tasker_worker_status: true,
+      spool_worker_status: true,
       task_identifier: input.identifier,
       agent_run_id: input.agent_run_id ?? null,
       status: input.status,
@@ -176,7 +176,7 @@ export class TaskerClient {
     });
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`Tasker API ${method} ${path} failed (${response.status}): ${text}`);
+      throw new Error(`Spool API ${method} ${path} failed (${response.status}): ${text}`);
     }
     if (response.status === 204) return null;
     return response.json();
@@ -315,20 +315,20 @@ function rejectForbiddenContextKeys(value: unknown): void {
   }
 }
 
-export function configFromEnv(env: Record<string, string | undefined> = process.env): TaskerExtensionConfig {
-  const apiUrl = env.TASKER_API_URL ?? "http://127.0.0.1:3000";
-  const apiToken = env.TASKER_API_TOKEN;
-  if (!apiToken) throw new Error("TASKER_API_TOKEN is required for the Tasker Pi Extension");
-  const actorId = env.TASKER_ACTOR_ID ?? env.TASKER_ACTOR ?? "pi-worker";
+export function configFromEnv(env: Record<string, string | undefined> = process.env): SpoolExtensionConfig {
+  const apiUrl = env.SPOOL_API_URL ?? "http://127.0.0.1:3000";
+  const apiToken = env.SPOOL_API_TOKEN;
+  if (!apiToken) throw new Error("SPOOL_API_TOKEN is required for the Spool Pi Extension");
+  const actorId = env.SPOOL_ACTOR_ID ?? env.SPOOL_ACTOR ?? "pi-worker";
   return {
     apiUrl,
     apiToken,
     actor: {
-      kind: env.TASKER_ACTOR_KIND ?? "worker_agent",
+      kind: env.SPOOL_ACTOR_KIND ?? "worker_agent",
       id: actorId,
-      display_name: env.TASKER_ACTOR_DISPLAY_NAME ?? actorId,
+      display_name: env.SPOOL_ACTOR_DISPLAY_NAME ?? actorId,
     },
-    agentRunId: env.TASKER_AGENT_RUN_ID,
-    workerStatusPath: env.TASKER_WORKER_STATUS_PATH,
+    agentRunId: env.SPOOL_AGENT_RUN_ID,
+    workerStatusPath: env.SPOOL_WORKER_STATUS_PATH,
   };
 }

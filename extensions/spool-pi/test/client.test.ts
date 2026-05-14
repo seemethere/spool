@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { TaskerClient, configFromEnv } from "../src/client";
+import { SpoolClient, configFromEnv } from "../src/client";
 
 const originalFetch = globalThis.fetch;
 const requests: Array<{ url: string; init: RequestInit }> = [];
@@ -59,11 +59,11 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
 });
 
-describe("TaskerClient", () => {
+describe("SpoolClient", () => {
   const actor = { kind: "worker_agent", id: "worker", display_name: "Worker" };
 
   it("sends auth header and fetches a task", async () => {
-    const client = new TaskerClient({ apiUrl: "http://tasker.test/", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://tasker.test/", apiToken: "token" });
 
     await client.getTask("TASK-1");
 
@@ -73,7 +73,7 @@ describe("TaskerClient", () => {
   });
 
   it("fetches the task context bundle from the narrow run-start endpoint", async () => {
-    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
 
     const bundle = await client.getTaskContextBundle("TASK-1") as { advisory_hints: { likely_files_or_paths: string[] } };
 
@@ -108,7 +108,7 @@ describe("TaskerClient", () => {
         headers: { "content-type": "application/json" },
       });
     }) as typeof fetch;
-    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
 
     const bundle = await client.getTaskContextBundle("TASK-1") as { advisory_hints: { task_conflict_hints: unknown[] } };
 
@@ -130,13 +130,13 @@ describe("TaskerClient", () => {
         headers: { "content-type": "application/json" },
       });
     }) as typeof fetch;
-    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
 
     await expect(client.getTaskContextBundle("TASK-1")).rejects.toThrow("forbidden field raw_json");
   });
 
   it("updates workpad with actor", async () => {
-    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
 
     await client.updateWorkpad("TASK-1", actor, "notes");
 
@@ -145,7 +145,7 @@ describe("TaskerClient", () => {
   });
 
   it("appends workpad text by fetching the current note before updating", async () => {
-    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
 
     await client.appendWorkpad("TASK-1", actor, "new notes");
 
@@ -162,7 +162,7 @@ describe("TaskerClient", () => {
         headers: { "content-type": "application/json" },
       });
     }) as typeof fetch;
-    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
 
     await client.appendWorkpad("TASK-1", actor, "new notes");
 
@@ -170,7 +170,7 @@ describe("TaskerClient", () => {
   });
 
   it("sends validated base commit when setting validation status", async () => {
-    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
 
     await client.setValidationItemStatus({
       identifier: "TASK-1",
@@ -189,7 +189,7 @@ describe("TaskerClient", () => {
   });
 
   it("creates child tasks through the parent task endpoint", async () => {
-    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
 
     await client.createChildTask({
       parent_identifier: "TASK-1",
@@ -207,7 +207,7 @@ describe("TaskerClient", () => {
   });
 
   it("requests transitions with an agent run id", async () => {
-    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
 
     await client.requestTransition("TASK-1", "done", actor, "run-1");
 
@@ -220,7 +220,7 @@ describe("TaskerClient", () => {
   });
 
   it("records Review Decisions through the deterministic endpoint", async () => {
-    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
     const reviewer = { kind: "review_agent", id: "reviewer", display_name: "Reviewer" };
 
     await client.recordReviewDecision({
@@ -239,7 +239,7 @@ describe("TaskerClient", () => {
   });
 
   it("upserts Task Links with actor attribution through the narrow endpoint", async () => {
-    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
 
     await client.upsertTaskLink("TASK-1", {
       kind: "change_artifact",
@@ -262,7 +262,7 @@ describe("TaskerClient", () => {
   });
 
   it("defaults omitted Task Link label and primary selection in request body", async () => {
-    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
 
     await client.upsertTaskLink("TASK-1", {
       kind: "chat_thread",
@@ -281,7 +281,7 @@ describe("TaskerClient", () => {
   });
 
   it("creates delegated Root Tasks through the deterministic draft endpoint", async () => {
-    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
     const delegator = { kind: "delegating_agent", id: "delegator", display_name: "Delegator" };
 
     await client.createDelegatedRootTask({
@@ -314,7 +314,7 @@ describe("TaskerClient", () => {
   });
 
   it("refines Backlog Tasks through the deterministic refinement endpoint", async () => {
-    const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
     const delegator = { kind: "delegating_agent", id: "delegator", display_name: "Delegator" };
 
     await client.refineBacklogTask({
@@ -348,7 +348,7 @@ describe("TaskerClient", () => {
     const dir = mkdtempSync(join(tmpdir(), "tasker-status-"));
     try {
       const path = join(dir, "worker.jsonl");
-      const client = new TaskerClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+      const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
 
       const report = client.reportWorkerStatus(
         { identifier: "TASK-1", status: "completion_intent", message: "handed off", agent_run_id: "run-1" },
@@ -356,10 +356,10 @@ describe("TaskerClient", () => {
         path,
       ) as any;
 
-      expect(report.tasker_worker_status).toBe(true);
+      expect(report.spool_worker_status).toBe(true);
       const line = JSON.parse(readFileSync(path, "utf8"));
       expect(line).toMatchObject({
-        tasker_worker_status: true,
+        spool_worker_status: true,
         task_identifier: "TASK-1",
         agent_run_id: "run-1",
         status: "completion_intent",
@@ -373,15 +373,15 @@ describe("TaskerClient", () => {
 
 describe("configFromEnv", () => {
   it("requires token", () => {
-    expect(() => configFromEnv({})).toThrow("TASKER_API_TOKEN");
+    expect(() => configFromEnv({})).toThrow("SPOOL_API_TOKEN");
   });
 
   it("builds worker actor config", () => {
     const config = configFromEnv({
-      TASKER_API_URL: "http://localhost:9999",
-      TASKER_API_TOKEN: "token",
-      TASKER_ACTOR_ID: "worker-1",
-      TASKER_AGENT_RUN_ID: "run-1",
+      SPOOL_API_URL: "http://localhost:9999",
+      SPOOL_API_TOKEN: "token",
+      SPOOL_ACTOR_ID: "worker-1",
+      SPOOL_AGENT_RUN_ID: "run-1",
     });
 
     expect(config.actor.kind).toBe("worker_agent");
@@ -391,8 +391,8 @@ describe("configFromEnv", () => {
 
   it("captures the supervisor worker status path", () => {
     const config = configFromEnv({
-      TASKER_API_TOKEN: "token",
-      TASKER_WORKER_STATUS_PATH: "/tmp/status.jsonl",
+      SPOOL_API_TOKEN: "token",
+      SPOOL_WORKER_STATUS_PATH: "/tmp/status.jsonl",
     });
 
     expect(config.workerStatusPath).toBe("/tmp/status.jsonl");

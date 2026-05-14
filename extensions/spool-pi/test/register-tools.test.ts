@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import registerTaskerExtension from "../src/index";
+import registerSpoolExtension from "../src/index";
 import type { ExtensionAPI } from "../src/types";
 
 const originalEnv = { ...process.env };
@@ -22,9 +22,9 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
 });
 
-describe("registerTaskerExtension", () => {
-  it("registers the minimal Tasker tool set", () => {
-    process.env.TASKER_API_TOKEN = "token";
+describe("registerSpoolExtension", () => {
+  it("registers the minimal Spool tool set", () => {
+    process.env.SPOOL_API_TOKEN = "token";
     const tools: Array<{ name: string; parameters: any; execute: Function }> = [];
     const pi: ExtensionAPI = {
       registerTool(tool) {
@@ -32,27 +32,27 @@ describe("registerTaskerExtension", () => {
       },
     };
 
-    registerTaskerExtension(pi);
+    registerSpoolExtension(pi);
 
     expect(tools.map((tool) => tool.name).sort()).toEqual([
-      "tasker_append_workpad",
-      "tasker_attach_task_link",
-      "tasker_create_child_task",
-      "tasker_create_delegated_root_task",
-      "tasker_get_task",
-      "tasker_get_task_context_bundle",
-      "tasker_record_review_decision",
-      "tasker_report_worker_status",
-      "tasker_request_transition",
-      "tasker_refine_backlog_task",
-      "tasker_set_acceptance_criterion_status",
-      "tasker_set_validation_item_status",
-      "tasker_update_workpad",
+      "spool_append_workpad",
+      "spool_attach_task_link",
+      "spool_create_child_task",
+      "spool_create_delegated_root_task",
+      "spool_get_task",
+      "spool_get_task_context_bundle",
+      "spool_record_review_decision",
+      "spool_report_worker_status",
+      "spool_request_transition",
+      "spool_refine_backlog_task",
+      "spool_set_acceptance_criterion_status",
+      "spool_set_validation_item_status",
+      "spool_update_workpad",
     ].sort());
   });
 
   it("constrains status and transition parameters", () => {
-    process.env.TASKER_API_TOKEN = "token";
+    process.env.SPOOL_API_TOKEN = "token";
     const tools: Array<{ name: string; parameters: any }> = [];
     const pi: ExtensionAPI = {
       registerTool(tool) {
@@ -60,45 +60,45 @@ describe("registerTaskerExtension", () => {
       },
     };
 
-    registerTaskerExtension(pi);
+    registerSpoolExtension(pi);
 
     const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool.parameters]));
-    expect(byName.tasker_get_task_context_bundle.properties.identifier.description).toBe("Task Identifier, such as TASKER-1");
-    expect(Object.keys(byName.tasker_attach_task_link.properties).sort()).toEqual([
+    expect(byName.spool_get_task_context_bundle.properties.identifier.description).toBe("Task Identifier, such as TASKER-1");
+    expect(Object.keys(byName.spool_attach_task_link.properties).sort()).toEqual([
       "identifier",
       "is_primary",
       "kind",
       "label",
       "target",
     ].sort());
-    expect(byName.tasker_attach_task_link.properties.is_primary.type).toBe("boolean");
-    expect(byName.tasker_set_acceptance_criterion_status.properties.status.anyOf.map((item: any) => item.const)).toEqual([
+    expect(byName.spool_attach_task_link.properties.is_primary.type).toBe("boolean");
+    expect(byName.spool_set_acceptance_criterion_status.properties.status.anyOf.map((item: any) => item.const)).toEqual([
       "pending",
       "satisfied",
       "waived",
     ]);
-    expect(byName.tasker_set_validation_item_status.properties.status.anyOf.map((item: any) => item.const)).toEqual([
+    expect(byName.spool_set_validation_item_status.properties.status.anyOf.map((item: any) => item.const)).toEqual([
       "pending",
       "passed",
       "failed",
       "waived",
     ]);
-    expect(byName.tasker_request_transition.properties.to_state.anyOf.map((item: any) => item.const)).toContain(
+    expect(byName.spool_request_transition.properties.to_state.anyOf.map((item: any) => item.const)).toContain(
       "integrating",
     );
-    expect(byName.tasker_record_review_decision.properties.decision.anyOf.map((item: any) => item.const)).toEqual([
+    expect(byName.spool_record_review_decision.properties.decision.anyOf.map((item: any) => item.const)).toEqual([
       "approve",
       "rework",
     ]);
-    expect(byName.tasker_create_delegated_root_task.properties.initial_state.anyOf.map((item: any) => item.const)).toEqual([
+    expect(byName.spool_create_delegated_root_task.properties.initial_state.anyOf.map((item: any) => item.const)).toEqual([
       "backlog",
       "ready",
     ]);
-    expect(byName.tasker_refine_backlog_task.properties.target_state.anyOf.map((item: any) => item.const)).toEqual([
+    expect(byName.spool_refine_backlog_task.properties.target_state.anyOf.map((item: any) => item.const)).toEqual([
       "backlog",
       "ready",
     ]);
-    expect(byName.tasker_report_worker_status.properties.status.anyOf.map((item: any) => item.const)).toEqual([
+    expect(byName.spool_report_worker_status.properties.status.anyOf.map((item: any) => item.const)).toEqual([
       "completion_intent",
       "blocked",
       "retryable_failure",
@@ -106,11 +106,11 @@ describe("registerTaskerExtension", () => {
   });
 
   it("executes delegated Root Task creation through the extension tool with a Delegating Agent actor", async () => {
-    process.env.TASKER_API_URL = "http://tasker.test";
-    process.env.TASKER_API_TOKEN = "token";
-    process.env.TASKER_ACTOR_KIND = "delegating_agent";
-    process.env.TASKER_ACTOR_ID = "delegate-session";
-    process.env.TASKER_ACTOR_DISPLAY_NAME = "Delegation Session";
+    process.env.SPOOL_API_URL = "http://tasker.test";
+    process.env.SPOOL_API_TOKEN = "token";
+    process.env.SPOOL_ACTOR_KIND = "delegating_agent";
+    process.env.SPOOL_ACTOR_ID = "delegate-session";
+    process.env.SPOOL_ACTOR_DISPLAY_NAME = "Delegation Session";
     const tools: Array<{ name: string; parameters: any; execute: Function }> = [];
     const pi: ExtensionAPI = {
       registerTool(tool) {
@@ -118,8 +118,8 @@ describe("registerTaskerExtension", () => {
       },
     };
 
-    registerTaskerExtension(pi);
-    const createTool = tools.find((tool) => tool.name === "tasker_create_delegated_root_task");
+    registerSpoolExtension(pi);
+    const createTool = tools.find((tool) => tool.name === "spool_create_delegated_root_task");
     expect(createTool).toBeDefined();
 
     const result = await createTool!.execute("tool-1", {
@@ -130,9 +130,9 @@ describe("registerTaskerExtension", () => {
       initial_state: "ready",
       review_required: false,
       tags: ["dogfood"],
-      conflict_hints: ["extensions/tasker-pi"],
+      conflict_hints: ["extensions/spool-pi"],
       blocking_task_identifiers: [],
-      acceptance_criteria: ["The Task is created through the Tasker Pi Extension."],
+      acceptance_criteria: ["The Task is created through the Spool Pi Extension."],
       validation_items: ["Fake-extension test observes the delegated-root API call."],
     }, new AbortController().signal);
 
@@ -154,19 +154,19 @@ describe("registerTaskerExtension", () => {
         initial_state: "ready",
         review_required: false,
         tags: ["dogfood"],
-        conflict_hints: ["extensions/tasker-pi"],
+        conflict_hints: ["extensions/spool-pi"],
         blocking_task_identifiers: [],
-        acceptance_criteria: ["The Task is created through the Tasker Pi Extension."],
+        acceptance_criteria: ["The Task is created through the Spool Pi Extension."],
         validation_items: ["Fake-extension test observes the delegated-root API call."],
       },
     });
   });
 
   it("executes Task Link attachment through the extension tool with the configured actor", async () => {
-    process.env.TASKER_API_URL = "http://tasker.test";
-    process.env.TASKER_API_TOKEN = "token";
-    process.env.TASKER_ACTOR_ID = "worker-1";
-    process.env.TASKER_ACTOR_DISPLAY_NAME = "Worker One";
+    process.env.SPOOL_API_URL = "http://tasker.test";
+    process.env.SPOOL_API_TOKEN = "token";
+    process.env.SPOOL_ACTOR_ID = "worker-1";
+    process.env.SPOOL_ACTOR_DISPLAY_NAME = "Worker One";
     const tools: Array<{ name: string; parameters: any; execute: Function }> = [];
     const pi: ExtensionAPI = {
       registerTool(tool) {
@@ -174,8 +174,8 @@ describe("registerTaskerExtension", () => {
       },
     };
 
-    registerTaskerExtension(pi);
-    const linkTool = tools.find((tool) => tool.name === "tasker_attach_task_link");
+    registerSpoolExtension(pi);
+    const linkTool = tools.find((tool) => tool.name === "spool_attach_task_link");
     expect(linkTool).toBeDefined();
 
     const result = await linkTool!.execute("tool-1", {

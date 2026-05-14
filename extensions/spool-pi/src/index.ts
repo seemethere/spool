@@ -1,6 +1,6 @@
 import { Type } from "typebox";
-import { TaskerClient, configFromEnv } from "./client";
-import type { ExtensionAPI, TaskerToolResult } from "./types";
+import { SpoolClient, configFromEnv } from "./client";
+import type { ExtensionAPI, SpoolToolResult } from "./types";
 
 const Identifier = Type.String({ description: "Task Identifier, such as TASKER-1" });
 const CriterionStatus = Type.Union([Type.Literal("pending"), Type.Literal("satisfied"), Type.Literal("waived")]);
@@ -69,7 +69,7 @@ const TransitionParams = Type.Object({
 const ReviewDecisionParams = Type.Object({
   identifier: Identifier,
   decision: Type.Union([Type.Literal("approve"), Type.Literal("rework")]),
-  feedback: Type.Optional(Type.String({ description: "Concise human feedback; required by Tasker for rework decisions." })),
+  feedback: Type.Optional(Type.String({ description: "Concise human feedback; required by Spool for rework decisions." })),
 });
 const DelegationTaskDraftParams = Type.Object({
   queue_key: Type.String({ description: "Task Queue Key for the new Root Task." }),
@@ -109,21 +109,21 @@ const WorkerStatusParams = Type.Object({
   agent_run_id: Type.Optional(Type.String()),
 });
 
-function asToolResult(details: unknown): TaskerToolResult {
+function asToolResult(details: unknown): SpoolToolResult {
   return {
     content: [{ type: "text", text: JSON.stringify(details, null, 2) }],
     details,
   };
 }
 
-export default function registerTaskerExtension(pi: ExtensionAPI) {
+export default function registerSpoolExtension(pi: ExtensionAPI) {
   const config = configFromEnv();
-  const client = new TaskerClient(config);
+  const client = new SpoolClient(config);
 
   pi.registerTool({
-    name: "tasker_get_task",
-    label: "Tasker: Get Task",
-    description: "Fetch full Tasker Task context by Task Identifier.",
+    name: "spool_get_task",
+    label: "Spool: Get Task",
+    description: "Fetch full Spool Task context by Task Identifier.",
     parameters: Type.Object({ identifier: Identifier }),
     async execute(_id, params, signal) {
       return asToolResult(await client.getTask(params.identifier, signal));
@@ -131,10 +131,10 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "tasker_get_task_context_bundle",
-    label: "Tasker: Get Task Context Bundle",
+    name: "spool_get_task_context_bundle",
+    label: "Spool: Get Task Context Bundle",
     description:
-      "Fetch the read-only Tasker-owned run-start context bundle, including advisory Task Conflict Hints and likely files/path guidance, for a Worker Agent without raw transcripts, raw launcher payloads, secrets, or unrelated queue data.",
+      "Fetch the read-only Spool-owned run-start context bundle, including advisory Task Conflict Hints and likely files/path guidance, for a Worker Agent without raw transcripts, raw launcher payloads, secrets, or unrelated queue data.",
     parameters: Type.Object({ identifier: Identifier }),
     async execute(_id, params, signal) {
       return asToolResult(await client.getTaskContextBundle(params.identifier, signal));
@@ -142,8 +142,8 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "tasker_update_workpad",
-    label: "Tasker: Update Workpad",
+    name: "spool_update_workpad",
+    label: "Spool: Update Workpad",
     description: "Replace the Task's singleton Workpad Note body.",
     parameters: WorkpadParams,
     async execute(_id, params, signal) {
@@ -152,8 +152,8 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "tasker_append_workpad",
-    label: "Tasker: Append Workpad",
+    name: "spool_append_workpad",
+    label: "Spool: Append Workpad",
     description: "Append Markdown to the current Workpad Note without manually replacing the whole note.",
     parameters: AppendWorkpadParams,
     async execute(_id, params, signal) {
@@ -164,8 +164,8 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "tasker_set_acceptance_criterion_status",
-    label: "Tasker: Set Acceptance Criterion Status",
+    name: "spool_set_acceptance_criterion_status",
+    label: "Spool: Set Acceptance Criterion Status",
     description: "Set an Acceptance Criterion status by 1-based position.",
     parameters: AcceptanceCriterionStatusParams,
     async execute(_id, params, signal) {
@@ -174,8 +174,8 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "tasker_set_validation_item_status",
-    label: "Tasker: Set Validation Item Status",
+    name: "spool_set_validation_item_status",
+    label: "Spool: Set Validation Item Status",
     description: "Set a Validation Item status by 1-based position.",
     parameters: ValidationItemStatusParams,
     async execute(_id, params, signal) {
@@ -184,8 +184,8 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "tasker_create_child_task",
-    label: "Tasker: Create Child Task",
+    name: "spool_create_child_task",
+    label: "Spool: Create Child Task",
     description: "Create a same-queue Child Task from the current Task context.",
     parameters: ChildTaskParams,
     async execute(_id, params, signal) {
@@ -194,8 +194,8 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "tasker_attach_task_link",
-    label: "Tasker: Attach Task Link",
+    name: "spool_attach_task_link",
+    label: "Spool: Attach Task Link",
     description:
       "Attach or upsert a typed Task Link collaboration/delivery reference on a Task. Task Links are not authoritative Acceptance Criteria, Validation Items, or scheduling gates.",
     parameters: TaskLinkParams,
@@ -217,9 +217,9 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "tasker_request_transition",
-    label: "Tasker: Request State Transition",
-    description: "Request a normal Task State Transition through Tasker gates.",
+    name: "spool_request_transition",
+    label: "Spool: Request State Transition",
+    description: "Request a normal Task State Transition through Spool gates.",
     parameters: TransitionParams,
     async execute(_id, params, signal) {
       return asToolResult(
@@ -235,9 +235,9 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "tasker_record_review_decision",
-    label: "Tasker: Record Review Decision",
-    description: "Record a human approve or rework Review Decision for a Task in Human Review through the deterministic Tasker API path.",
+    name: "spool_record_review_decision",
+    label: "Spool: Record Review Decision",
+    description: "Record a human approve or rework Review Decision for a Task in Human Review through the deterministic Spool API path.",
     parameters: ReviewDecisionParams,
     async execute(_id, params, signal) {
       return asToolResult(await client.recordReviewDecision(params, config.actor, signal));
@@ -245,8 +245,8 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "tasker_create_delegated_root_task",
-    label: "Tasker: Create Delegated Root Task",
+    name: "spool_create_delegated_root_task",
+    label: "Spool: Create Delegated Root Task",
     description:
       "Create one Root Task from a Delegation Session through the deterministic Delegation Task draft helper. Use only in human-present Interactive Agent Sessions.",
     parameters: DelegationTaskDraftParams,
@@ -256,8 +256,8 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "tasker_refine_backlog_task",
-    label: "Tasker: Refine Backlog Task",
+    name: "spool_refine_backlog_task",
+    label: "Spool: Refine Backlog Task",
     description:
       "Refine an existing Backlog Task from a Delegation Session through the deterministic Backlog Task refinement helper. Use only in human-present Interactive Agent Sessions.",
     parameters: RefineBacklogTaskParams,
@@ -267,9 +267,9 @@ export default function registerTaskerExtension(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "tasker_report_worker_status",
-    label: "Tasker: Report Worker Status",
-    description: "Report completion intent, blocked state, or retryable failure to the Worker Loop supervisor without changing Tasker state.",
+    name: "spool_report_worker_status",
+    label: "Spool: Report Worker Status",
+    description: "Report completion intent, blocked state, or retryable failure to the Worker Loop supervisor without changing Spool state.",
     parameters: WorkerStatusParams,
     async execute(_id, params) {
       return asToolResult(

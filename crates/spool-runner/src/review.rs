@@ -145,7 +145,7 @@ fn build_review_prompt(
         DEFAULT_REVIEW_ROLE_PROMPT.to_string()
     };
     Ok(format!(
-        "{base}\n\nTask Identifier: {identifier}\nReview Session type: Interactive Agent Session\n\nQuestion UI is allowed in this Review Session because a human is intentionally present. Do not apply Unattended Worker Session question-failure handling here; that behavior remains only for Worker Loop launches.\n\nReview Agent instructions:\n- Present or summarize the Review Packet below for the human.\n- Ask the human for exactly one explicit Review Decision: approve or rework.\n- If the decision is rework, collect concise human feedback.\n- Record the Review Decision through the deterministic Spool review-decision path, preferably the Spool Pi Extension tool `tasker_record_review_decision`.\n- Use Review Agent actor attribution and do not claim to be a Worker Agent or Subagent Review Loop reviewer.\n\nReview Packet:\n{review_packet}\n"
+        "{base}\n\nTask Identifier: {identifier}\nReview Session type: Interactive Agent Session\n\nQuestion UI is allowed in this Review Session because a human is intentionally present. Do not apply Unattended Worker Session question-failure handling here; that behavior remains only for Worker Loop launches.\n\nReview Agent instructions:\n- Present or summarize the Review Packet below for the human.\n- Ask the human for exactly one explicit Review Decision: approve or rework.\n- If the decision is rework, collect concise human feedback.\n- Record the Review Decision through the deterministic Spool review-decision path, preferably the Spool Pi Extension tool `spool_record_review_decision`.\n- Use Review Agent actor attribution and do not claim to be a Worker Agent or Subagent Review Loop reviewer.\n\nReview Packet:\n{review_packet}\n"
     ))
 }
 
@@ -213,7 +213,7 @@ mod tests {
         assert!(prompt.contains("Interactive Agent Session"));
         assert!(prompt.contains("Question UI is allowed"));
         assert!(prompt.contains("approve or rework"));
-        assert!(prompt.contains("tasker_record_review_decision"));
+        assert!(prompt.contains("spool_record_review_decision"));
         assert!(prompt.contains("Review Packet\nTask: TASK-1"));
     }
 
