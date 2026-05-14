@@ -1,17 +1,17 @@
 [workspace]
 members = [
-    "crates/tasker-cli",
-    "crates/tasker-config",
-    "crates/tasker-db",
-    "crates/tasker-runner",
-    "crates/tasker-server",
+    "crates/spool-cli",
+    "crates/spool-config",
+    "crates/spool-db",
+    "crates/spool-runner",
+    "crates/spool-server",
 ]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/seemethere/tasker"
+repository = "https://github.com/seemethere/spool"
 
 [workspace.dependencies]
 anyhow = "1.0.100"

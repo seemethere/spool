@@ -1729,6 +1729,78 @@ dependencies = [
 ]
 
 [[package]]
+name = "spool-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossterm",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "spool-config",
+ "spool-db",
+ "spool-runner",
+ "spool-server",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "spool-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "spool-db"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "spool-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "spool-db",
+ "sqlx",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "spool-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "serde",
+ "serde_json",
+ "spool-db",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "sqlx"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1998,78 +2070,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "tasker-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "crossterm",
- "ratatui",
- "serde",
- "serde_json",
- "serde_yaml",
- "sqlx",
- "tasker-config",
- "tasker-db",
- "tasker-runner",
- "tasker-server",
- "tempfile",
- "tokio",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "tasker-config"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "tempfile",
- "toml",
-]
-
-[[package]]
-name = "tasker-db"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "sqlx",
- "tempfile",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "tasker-runner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "sqlx",
- "tasker-db",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "tasker-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "serde",
- "serde_json",
- "sqlx",
- "tasker-db",
- "tempfile",
- "tokio",
- "tower",
 ]
 
 [[package]]
