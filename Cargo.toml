@@ -5,6 +5,7 @@ members = [
     "crates/spool-db",
     "crates/spool-runner",
     "crates/spool-server",
+    "crates/spool-symphony",
 ]
 resolver = "2"
 

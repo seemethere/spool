@@ -1,0 +1,10 @@
+[package]
+name = "spool-symphony"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+spool-db = { path = "../spool-db" }

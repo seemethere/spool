@@ -17,7 +17,7 @@ Initial scope:
 Transitional boundary:
 
 - The first extraction keeps direct `spool-db` calls to preserve existing behavior and make the move reviewable.
-- This is not the long-term target boundary for the **Symphony Adapter**. The documented target remains interaction through the **Spool API**.
+- This is not the long-term target boundary for the **Symphony Integration**. The documented target remains interaction through the **Spool API**.
 - A later design slice should decide when and how to introduce an HTTP Spool API client boundary for runner-side workflow code.
 
 Out of scope for the first extraction:

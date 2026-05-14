@@ -1801,6 +1801,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "spool-symphony"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "spool-db",
+]
+
+[[package]]
 name = "sqlx"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

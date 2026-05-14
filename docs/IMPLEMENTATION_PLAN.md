@@ -33,7 +33,7 @@ crates/
   spool-core/        # domain enums, transition/gate logic, shared API structs
   spool-db/          # SQLite migrations, repository methods, explicit transactions
   spool-server/      # axum router and HTTP handlers
-  spool-worker/      # Worker Loop, Symphony Adapter boundary, launchers, delivery adapters
+  spool-worker/      # Worker Loop, Symphony Integration boundary, launchers, delivery adapters
   spool-cli/         # clap binary: init, serve, queue, task, work, status, run
 extensions/
   spool-pi/          # TypeScript Spool Pi Extension
