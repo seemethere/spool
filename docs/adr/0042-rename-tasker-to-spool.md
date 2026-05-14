@@ -1,0 +1,5 @@
+# Rename Tasker to Spool and isolate Symphony integration
+
+The project will be renamed from Tasker to Spool because the old name over-emphasized generic task management while the product is a local-first agent workflow system for queued work, handoff, and delivery. The rename is a clean full rename rather than a lasting compatibility alias: public and internal surfaces move to `spool`, including CLI, crates, `.spool` control files, `spool.db`, `SPOOL_*` environment variables, `spool_*` pi extension tools, `Spool-*` Git trailers, `spool/{task_identifier}` branch templates, and the dogfood `SPOOL` Task Queue Key; migration from the old local state is an explicit one-time Operator action.
+
+Spool's core language and API are integration-neutral. Symphony-specific adapter and mapping code belongs in a thin `spool-symphony` crate, while Spool core crates, runner workflow, service, persistence, and domain documentation avoid treating Symphony or Linear-shaped concepts as canonical Spool language.

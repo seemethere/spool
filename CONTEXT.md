@@ -1,35 +1,39 @@
-# Tasker
+# Spool
 
-Tasker provides a minimal local-first task backend for Symphony-style agent orchestration without making Linear or GitHub a required dependency. Tasker should become useful enough to dogfood on its own development as quickly as possible.
+Spool provides a minimal local-first task and workflow backend for agent-driven development without making Linear or GitHub a required dependency. Spool should become useful enough to dogfood on its own development as quickly as possible, while keeping Symphony compatibility as an integration boundary rather than the whole product identity.
 
 ## Language
 
 **Task Backend**:
-A local-first Symphony-compatible task source and sink that owns the task records and collaboration data needed by agent runs.
+A local-first task source and sink that owns the task records and collaboration data needed by agent workflows.
 _Avoid_: Linear clone, issue tracker clone, project management system, pull-request workflow manager
 
-**Tasker API**:
-The first-class contract Symphony uses to read and update Tasker-owned task data.
+**Spool API**:
+The first-class contract local agents, runner components, operator tools, and integrations use to read and update Spool-owned task data.
 _Avoid_: Linear-compatible GraphQL facade, fake Linear API
 
-**Tasker Service**:
+**Spool Service**:
 The HTTP service that owns **Tasks**, **Task Queues**, **Task States**, **Agent Runs**, and delivery records.
 _Avoid_: Agent runner
 
-**Symphony Adapter**:
-The thin runner-side integration layer that uses the **Tasker API** to run the local Tasker workflow end-to-end.
-_Avoid_: Linear shim, API-only proof
+**Symphony Integration**:
+The thin integration boundary that maps Symphony orchestration needs onto the integration-neutral **Spool API**.
+_Avoid_: Linear shim, core Spool domain language, API-only proof
+
+**Symphony Integration Crate**:
+The `spool-symphony` crate that contains Symphony-specific adapter and mapping code outside Spool's core service, runner, and persistence crates.
+_Avoid_: leaking Symphony or Linear-shaped concepts into the Spool API
 
 **Worker Loop**:
-The `tasker work` process that claims eligible **Tasks** from a **Task Queue** and runs them through the **Symphony Adapter**.
-_Avoid_: Hidden worker inside Tasker Service
+The `spool work` process that claims eligible **Tasks** from a **Task Queue** and runs them through the runner-side workflow.
+_Avoid_: Hidden worker inside Spool Service
 
 **Dogfooding Readiness**:
-The early milestone where Tasker can run useful Tasks against its own repository.
+The early milestone where Spool can run useful Tasks against its own repository.
 _Avoid_: Waiting for full polish before self-use
 
 **Pre-Dogfooding Development Loop**:
-The temporary manual human/agent workflow used to build Tasker until **Dogfooding Cutover**.
+The temporary manual human/agent workflow used to build Spool until **Dogfooding Cutover**.
 _Avoid_: Permanent delivery workflow, ad hoc forever process
 
 **Implementation Slice**:
@@ -46,14 +50,14 @@ _Avoid_: Unbounded autonomous development, mixed mega-commit
 
 **Subagent Review Loop**:
 The pre-dogfooding practice of using advisory subagents to review diffs and escalate decision conflicts before committing an **Implementation Slice**.
-_Avoid_: Parallel implementation, replacing human approval, Tasker Review Session
+_Avoid_: Parallel implementation, replacing human approval, Spool Review Session
 
 **Oracle Escalation**:
 A **Subagent Review Loop** step where an oracle subagent resolves documented decision conflicts or stop-condition ambiguity before implementation continues.
 _Avoid_: Guessing through architecture/security/domain contradictions
 
 **Dogfooding Cutover**:
-The point where Tasker development work starts being managed as real Tasker **Tasks**.
+The point where Spool development work starts being managed as real Spool **Tasks**.
 _Avoid_: Full v1 completion, polished launch
 
 **Bootstrap Task Creation**:
@@ -61,7 +65,7 @@ A temporary dogfooding reason for the early **File-backed Task Creation** implem
 _Avoid_: Permanent manual intake model
 
 **File-backed Task Creation**:
-Creating a **Task** from a Markdown file with YAML front matter for structured **Task** fields and a Markdown body for the **Task Brief**. The preferred CLI shape is `tasker task create --queue <key> --from-file task.md`.
+Creating a **Task** from a Markdown file with YAML front matter for structured **Task** fields and a Markdown body for the **Task Brief**. The preferred CLI shape is `spool task create --queue <key> --from-file task.md`.
 _Avoid_: Bootstrap as user-facing command language, separate intake workflow
 
 **Manual Dogfood Merge**:
@@ -77,11 +81,11 @@ An operator-managed named grouping of Tasks that a Symphony workflow polls for w
 _Avoid_: Project, Linear project, team, milestone, cycle, agent-created queue
 
 **Operator**:
-The deployment owner who manages Tasker infrastructure boundaries such as **Task Queues** and repair actions.
+The deployment owner who manages Spool infrastructure boundaries such as **Task Queues** and repair actions.
 _Avoid_: Task author
 
 **Actor**:
-The attributed source of a Tasker mutation, identified by stable ID, kind, and display name, and supplied explicitly by the caller.
+The attributed source of a Spool mutation, identified by stable ID, kind, and display name, and supplied explicitly by the caller.
 _Avoid_: Anonymous mutation, bearer token identity
 
 **Worker Agent**:
@@ -89,12 +93,12 @@ An **Actor** that executes an **Agent Run** for a **Task**.
 _Avoid_: Delegating Agent, Review Agent
 
 **Worker Agent Contribution Surface**:
-The repository-facing instructions, module boundaries, and deterministic checks that let **Worker Agents** complete Tasker development **Tasks** with minimal rediscovery.
+The repository-facing instructions, module boundaries, and deterministic checks that let **Worker Agents** complete Spool development **Tasks** with minimal rediscovery.
 _Avoid_: General code cleanup, feature deletion as simplification, pre-dogfooding-only ergonomics
 
 **Agent Launcher**:
 A pluggable runner-side integration that starts and communicates with a coding agent for an **Agent Run**.
-_Avoid_: Tasker-owned agent protocol
+_Avoid_: Spool-owned agent protocol
 
 **Pi Launcher**:
 The v1 **Agent Launcher** that runs Worker Agents through pi RPC mode.
@@ -104,8 +108,8 @@ _Avoid_: Codex-only launcher, one-shot print mode
 A `pi --mode rpc` process controlled by the **Pi Launcher** over JSONL stdin/stdout.
 _Avoid_: TypeScript SDK dependency in the Rust adapter
 
-**Tasker Pi Extension**:
-A pi extension that exposes narrow Tasker workflow tools to Worker Agents.
+**Spool Pi Extension**:
+A pi extension that exposes narrow Spool workflow tools to Worker Agents.
 _Avoid_: Shelling out to broad CLI commands for core workflow updates
 
 **Run Transcript**:
@@ -149,7 +153,7 @@ An agent that creates or updates a **Task** so another agent can perform the wor
 _Avoid_: Human task author
 
 **Delegation Session**:
-A human-present pi interaction where a **Delegating Agent** turns human intent into a **Root Task** through **Tasker Pi Extension** delegation tools. `tasker delegate` may host or wrap this flow, but the dogfood path can happen directly in an ordinary pi session.
+A human-present pi interaction where a **Delegating Agent** turns human intent into a **Root Task** through **Spool Pi Extension** delegation tools. `spool delegate` may host or wrap this flow, but the dogfood path can happen directly in an ordinary pi session.
 _Avoid_: Manual task form
 
 **Delegation Interview**:
@@ -157,12 +161,12 @@ A one-question-at-a-time clarification flow, modeled on grill-with-docs, used du
 _Avoid_: Bulk intake form, vague task dump, hidden source edit
 
 **Review Agent**:
-An agent that translates external human approval or feedback into Tasker **State Transitions**.
-_Avoid_: Human Tasker operator
+An agent that translates external human approval or feedback into Spool **State Transitions**.
+_Avoid_: Human Spool operator
 
 **Review Session**:
-A local `tasker review` interaction where a **Review Agent** prepares a **Review Packet** and records a human **Review Decision**.
-_Avoid_: GitHub review dependency, Tasker web UI
+A local `spool review` interaction where a **Review Agent** prepares a **Review Packet** and records a human **Review Decision**.
+_Avoid_: GitHub review dependency, Spool web UI
 
 **Review Decision**:
 A recorded approval or feedback outcome that moves a **Task** out of **Human Review**.
@@ -170,7 +174,7 @@ _Avoid_: Unrecorded review signal
 
 **Review Packet**:
 A concise artifact prepared by a **Review Agent** to help a human decide whether a **Task** should be reworked or integrated.
-_Avoid_: Tasker review UI
+_Avoid_: Spool review UI
 
 **Review Policy**:
 A queue or task rule that decides whether completed work requires **Human Review** or may proceed through **Agent-Gated Integration**.
@@ -234,10 +238,10 @@ _Avoid_: Task Backend, hard-coded PR workflow
 
 **Delivery Adapter**:
 The Symphony-side component that performs the filesystem or external-system operations for a **Delivery Backend**.
-_Avoid_: Tasker-run Git command
+_Avoid_: Spool-run Git command
 
 **Delivery Record**:
-Tasker's record of delivery-related facts and outcomes for a **Task**.
+Spool's record of delivery-related facts and outcomes for a **Task**.
 _Avoid_: Execution script
 
 **Local Worktree Delivery**:
@@ -245,11 +249,11 @@ The v1 **Delivery Backend** where work happens in per-Task Git worktrees and is 
 _Avoid_: GitHub delivery, pull-request delivery
 
 **Managed Source Repository**:
-The local Git repository treated as the source of truth for **Local Worktree Delivery** and owned by the Tasker/Symphony workflow.
+The local Git repository treated as the source of truth for **Local Worktree Delivery** and owned by the Spool/Symphony workflow.
 _Avoid_: Casual working copy, unrelated manual worktree
 
 **Managed Source Repository Operation Lock**:
-A queue-scoped local filesystem lock under the active Tasker data directory that tells supervisors and Worker Loops not to start claims while the **Managed Source Repository** is being mutated by a **Delivery Adapter** or Manual Dogfood Merge.
+A queue-scoped local filesystem lock under the active Spool data directory that tells supervisors and Worker Loops not to start claims while the **Managed Source Repository** is being mutated by a **Delivery Adapter** or Manual Dogfood Merge.
 _Avoid_: Task scheduling dependency, database Claim Lease, Git index lock
 
 **Worktree Root**:
@@ -285,7 +289,7 @@ Instructions for a Delegating Agent, Worker Agent, or Review Agent.
 _Avoid_: Runtime configuration
 
 **Prompt Override**:
-A repo-owned replacement for a built-in **Role Prompt** under `.tasker/prompts/`.
+A repo-owned replacement for a built-in **Role Prompt** under `.spool/prompts/`.
 _Avoid_: Hidden global prompt
 
 **Local Worktree**:
@@ -345,7 +349,7 @@ A non-blocking **Child Task** that records discovered work without expanding the
 _Avoid_: Nice-to-have inside current task
 
 **Task State**:
-One of Tasker's fixed v1 lifecycle labels: **Backlog**, **Ready**, **In Progress**, **Human Review**, **Rework**, **Integrating**, **Done**, or **Canceled**.
+One of Spool's fixed v1 lifecycle labels: **Backlog**, **Ready**, **In Progress**, **Human Review**, **Rework**, **Integrating**, **Done**, or **Canceled**.
 _Avoid_: Linear status, issue status, custom workflow state, Todo
 
 **Backlog**:
@@ -361,7 +365,7 @@ A **Task State** for work in its active execution phase, whether or not a live a
 _Avoid_: Started, running process
 
 **Agent Run**:
-A Tasker-persisted claim lease for a live agent execution attempt of a **Task**.
+A Spool-persisted claim lease for a live agent execution attempt of a **Task**.
 _Avoid_: Task State, In Progress, agent subprocess
 
 **Claim Lease**:
@@ -421,7 +425,7 @@ An operator-only state or requirement change that bypasses normal workflow rules
 _Avoid_: Admin shortcut, agent tool
 
 **Audit Event**:
-An append-only history record of a Tasker domain mutation.
+An append-only history record of a Spool domain mutation.
 _Avoid_: Event-sourced state source, task-only event
 
 **Workpad Note**:
@@ -435,7 +439,7 @@ _Avoid_: Separate progress comment
 ## Relationships
 
 - A **Task Backend** contains many **Task Queues**.
-- An **Operator** manages **Task Queues** through `tasker queue create`, `tasker queue update`, and `tasker queue show`.
+- An **Operator** manages **Task Queues** through `spool queue create`, `spool queue update`, and `spool queue show`.
 - Creating a **Task Queue** for **Local Worktree Delivery** warns that the repository becomes a **Managed Source Repository**.
 - A **Task Queue** has exactly one **Task Queue Key**.
 - A **Task Queue** may have one **Queue Concurrency Limit**.
@@ -464,8 +468,8 @@ _Avoid_: Separate progress comment
 - Operators use **Task Conflict Hints** during dogfooding to sequence or review overlapping Ready or In Progress Tasks more deliberately.
 - **File-backed Task Creation** may populate **Task Conflict Hints** from structured YAML front matter; Workpad Note Markdown remains narrative and is not authoritative for gates or scheduling.
 - A **Task** may have many **Task Links**.
-- A **Delivery Adapter** performs **Delivery Backend** operations outside Tasker.
-- Tasker stores **Delivery Records** and **Integration Outcomes**.
+- A **Delivery Adapter** performs **Delivery Backend** operations outside Spool.
+- Spool stores **Delivery Records** and **Integration Outcomes**.
 - **Local Worktree Delivery** is the only v1 **Delivery Backend**.
 - Individual **Tasks** do not choose their own **Delivery Backend** in v1.
 - A **Task** may have one **Local Worktree**.
@@ -477,7 +481,7 @@ _Avoid_: Separate progress comment
 - A **Local Merge** integrates a **Local Worktree** into the **Main Branch**.
 - **Squash Merge** is the default **Local Merge** strategy.
 - A **Final Commit** uses the **Managed Source Repository**'s configured Git identity.
-- A **Final Commit** includes Tasker metadata such as **Task Identifier**, title, and optionally run ID in its commit message.
+- A **Final Commit** includes Spool metadata such as **Task Identifier**, title, and optionally run ID in its commit message.
 - **Integrating** requires a clean **Local Worktree** with changes committed as **Task Commits** on the **Task Branch**.
 - A **Local Merge** requires the **Task Branch** to include the current **Main Branch** or the **Validated Base Commit** to equal the current **Main Branch**.
 - If the **Validated Base Commit** is stale or the **Local Worktree** has uncommitted changes, the **Integration Outcome** is a **Work-Change Delivery Failure**.
@@ -487,35 +491,35 @@ _Avoid_: Separate progress comment
 - **Rework** continues from the existing **Local Worktree** and **Task Branch** by default.
 - **Reset Rework** discards the current **Local Worktree** and restarts from the **Main Branch**.
 - A retryable **Operational Delivery Failure** leaves a **Task** in **Integrating** with a recorded next integration retry time and bounded backoff attempts before operator intervention is required.
-- Tasker does not run arbitrary Git commands for **Local Worktree Delivery**.
-- Configuring **Local Worktree Delivery** opts the **Operator** into Tasker/Symphony mutating the **Managed Source Repository**.
-- The **Managed Source Repository** may contain **Prompt Overrides** at `.tasker/prompts/delegate.md`, `.tasker/prompts/worker.md`, and `.tasker/prompts/review.md`.
+- Spool does not run arbitrary Git commands for **Local Worktree Delivery**.
+- Configuring **Local Worktree Delivery** opts the **Operator** into Spool/Symphony mutating the **Managed Source Repository**.
+- The **Managed Source Repository** may contain **Prompt Overrides** at `.spool/prompts/delegate.md`, `.spool/prompts/worker.md`, and `.spool/prompts/review.md`.
 - Unexpected uncommitted changes in the **Managed Source Repository** are an **Operational Delivery Failure**.
-- A **Managed Source Repository Operation Lock** is scoped by **Task Queue Key** and stored under the active Tasker data directory.
+- A **Managed Source Repository Operation Lock** is scoped by **Task Queue Key** and stored under the active Spool data directory.
 - **Delivery Adapters** acquire a **Managed Source Repository Operation Lock** before mutating the **Managed Source Repository** and release it when the operation completes.
 - Manual Dogfood Merge operators may acquire and release a **Managed Source Repository Operation Lock** to protect manual integration windows.
 - A **Managed Source Repository Operation Lock** records pid, operation, queue, optional Task context, and whether it is a manual lock; stale automatic locks whose recorded process has exited may be removed safely, while manual locks require explicit release.
 - Supervisors and Worker Loops check the **Managed Source Repository Operation Lock** before spawning workers or claiming Tasks; watch-mode supervisors pause and poll while the lock is held, and bounded batches report the blocked condition clearly.
-- Every Tasker mutation is attributed to an **Actor** or the system.
+- Every Spool mutation is attributed to an **Actor** or the system.
 - The **Worker Agent Contribution Surface** is optimized for **Worker Agents** after **Dogfooding Cutover**, while preserving the **Pre-Dogfooding Development Loop**.
-- Simplifying the **Worker Agent Contribution Surface** means making Tasker development changes easier to locate, validate, and hand off, not reducing domain scope by default.
+- Simplifying the **Worker Agent Contribution Surface** means making Spool development changes easier to locate, validate, and hand off, not reducing domain scope by default.
 - Authentication identifies the API client; **Actor** identifies the source of the domain change.
-- Every Tasker domain mutation produces an **Audit Event**.
-- Current Tasker state is read from current records, not reconstructed from **Audit Events**.
-- The preferred dogfood **Delegation Session** runs in an ordinary human-present pi session with the **Tasker Pi Extension** loaded.
-- `tasker delegate` remains a CLI wrapper or fallback for starting a **Delegation Session**.
-- `tasker delegate --refine` remains a CLI wrapper or fallback for starting a **Delegation Session** for an existing **Backlog** **Task**.
-- A **Delegation Session** uses a **Delegation Interview** and the **Tasker Pi Extension** delegation tools.
+- Every Spool domain mutation produces an **Audit Event**.
+- Current Spool state is read from current records, not reconstructed from **Audit Events**.
+- The preferred dogfood **Delegation Session** runs in an ordinary human-present pi session with the **Spool Pi Extension** loaded.
+- `spool delegate` remains a CLI wrapper or fallback for starting a **Delegation Session**.
+- `spool delegate --refine` remains a CLI wrapper or fallback for starting a **Delegation Session** for an existing **Backlog** **Task**.
+- A **Delegation Session** uses a **Delegation Interview** and the **Spool Pi Extension** delegation tools.
 - A **Delegation Interview** may read repository context docs but does not edit them by default.
 - Repository doc changes discovered during delegation become **Acceptance Criteria** or **Child Tasks**.
 - A **Delegating Agent** creates **Delegated Tasks**.
 - A **Worker Agent** executes **Agent Runs**.
-- `tasker review` starts a **Review Session**.
+- `spool review` starts a **Review Session**.
 - A **Review Agent** may prepare a **Review Packet**.
 - A **Review Agent** records **Review Decisions**.
 - A **Review Decision** moves a **Task** from **Human Review** to **Rework** or **Integrating**.
 - Local-first queues default to **Agent-Gated Integration**.
-- Tasker's own dogfood **Task Queue** follows the local-first default: ordinary Tasker development **Tasks** proceed to **Integrating** after structured gates pass instead of entering **Human Review**.
+- Spool's own dogfood **Task Queue** follows the local-first default: ordinary Spool development **Tasks** proceed to **Integrating** after structured gates pass instead of entering **Human Review**.
 - A **Worker Agent** may move **In Progress** or **Rework** work to **Integrating** when structured gates pass and **Review Policy** does not require **Human Review**.
 - When the same **Agent Run** still owns the **Claim Lease**, it may perform **Integrating** immediately after the **State Transition**.
 - **Human Review** requires a human decision when **Review Policy** requires review or an agent explicitly requests review.
@@ -528,7 +532,7 @@ _Avoid_: Separate progress comment
 - A **Blocked Task** is excluded from normal agent pickup.
 - A **Blocked Task** cannot transition to **Human Review**, **Integrating**, or **Done** without resolving its **Blocking Tasks** or using a **Repair Override**.
 - A **Task** cannot transition to **Human Review**, **Integrating**, or **Done** unless all **Acceptance Criteria** are satisfied or waived and all **Validation Items** are passed or waived.
-- Structured Tasker fields, not **Workpad Note** Markdown, are authoritative for gates and scheduling.
+- Structured Spool fields, not **Workpad Note** Markdown, are authoritative for gates and scheduling.
 - A **Follow-up Task** does not block its parent.
 - A **Follow-up Task** starts in **Backlog** by default.
 - A **Task** belongs to exactly one **Task Queue**.
@@ -544,36 +548,38 @@ _Avoid_: Separate progress comment
 - Worker and Delegating Agents cannot use **Repair Overrides**.
 - A **Task** has at most one active **Workpad Note**.
 - A **Workpad Note** may have many **Workpad Revisions**.
-- Symphony reads from and writes to the **Task Backend** through the **Tasker API**.
-- `tasker init` creates XDG-style local config and data directories and may apply SQLite migrations for a new or explicitly initialized Task Backend.
-- Tasker config defaults to `~/.config/tasker/config.toml`.
-- Tasker data defaults to `~/.local/share/tasker/`, with SQLite at `tasker.db` and run transcripts under `runs/<run_id>/`; when using a repository-local `.tasker/config.toml` without an explicit data override, the active data directory is `.tasker/data/` beside that config.
-- When a repository-local `.tasker/config.toml` is present but not the resolved active Tasker config, unsafe mutating CLI commands refuse to run unless the operator explicitly selects a config or data/database override.
+- Spool is described as a local agent workflow system first, with Symphony compatibility as an integration boundary.
+- Symphony reads from and writes to the **Task Backend** through the **Spool API**.
+- `spool init` creates XDG-style local config and data directories and may apply SQLite migrations for a new or explicitly initialized Task Backend.
+- Spool config defaults to `~/.config/spool/config.toml`.
+- The Spool rename from the former Tasker name is handled as an explicit one-time Operator migration, not as a lasting `tasker` command alias.
+- Spool data defaults to `~/.local/share/spool/`, with SQLite at `spool.db` and run transcripts under `runs/<run_id>/`; when using a repository-local `.spool/config.toml` without an explicit data override, the active data directory is `.spool/data/` beside that config.
+- When a repository-local `.spool/config.toml` is present but not the resolved active Spool config, unsafe mutating CLI commands refuse to run unless the operator explicitly selects a config or data/database override.
 - In that inactive project-config case, read-only CLI commands warn with the active config and database paths so operators can diagnose wrong-database mistakes.
 - Normal commands validate SQLite migration compatibility but do not apply pending migrations to the Task Backend.
-- `tasker db migrate` is an explicit **Operator** path for applying SQLite migrations from the trusted **Managed Source Repository** **Main Branch**.
-- `tasker db migrate` refuses by default when invoked from a **Local Worktree** or **Task Branch**, because unintegrated Task Branch migrations must not mutate the project Task Backend before integration.
+- `spool db migrate` is an explicit **Operator** path for applying SQLite migrations from the trusted **Managed Source Repository** **Main Branch**.
+- `spool db migrate` refuses by default when invoked from a **Local Worktree** or **Task Branch**, because unintegrated Task Branch migrations must not mutate the project Task Backend before integration.
 - Applied-but-missing SQLite migration drift is reported as migration compatibility failure with guidance to restore the missing migration file or migrate from **Main Branch** after integration.
 - **Worker Loop** and supervisor startup check migration compatibility before creating **Agent Runs**.
 - For **Local Worktree Delivery** **Task Queues**, **Worker Loops** and supervisors run local preflight checks before claiming **Tasks**; failures such as a dirty **Managed Source Repository**, held **Managed Source Repository Operation Lock**, inaccessible **Worktree Root**, missing Git, or invalid **Main Branch** block claims with Operator guidance instead of creating doomed **Agent Runs**.
-- `tasker serve` starts the **Tasker Service**.
-- `tasker work` starts a **Worker Loop**.
+- `spool serve` starts the **Spool Service**.
+- `spool work` starts a **Worker Loop**.
 - A **Worker Loop** has default **Worker Concurrency** of 1.
-- `tasker work --concurrency N` raises **Worker Concurrency** up to the **Queue Concurrency Limit**.
+- `spool work --concurrency N` raises **Worker Concurrency** up to the **Queue Concurrency Limit**.
 - The **Queue Concurrency Limit** counts active **Agent Runs** across agent-eligible **Task States**, including **Integrating**.
-- `tasker work --once` claims and runs at most one **Task**.
-- `tasker work --max-run-seconds N` bounds one launcher execution and fails the **Agent Run** if the **Pi Launcher** does not emit `agent_end` before the duration elapses.
-- `tasker status` shows queue counts, running work, and retry holds.
-- `tasker task show` shows full **Task** state.
-- `tasker task retry` is an **Operator** recovery command that clears a **Retry Hold** and moves a resolved failed, canceled, or stuck **Task** back to **Ready** without changing normal completion gates.
-- `tasker run show` shows **Agent Run**, **Run Transcript**, and **Launcher Session Data** metadata.
-- `tasker run fail` is an **Operator** recovery command that fails an active **Agent Run** with an explicit reason and records a **Retry Hold**.
-- `tasker cleanup local-worktrees`, `tasker cleanup cargo-targets`, and `tasker cleanup runs` are explicit **Operator** cleanup commands for local dogfood storage artifacts; they default to dry-run reporting and require `--delete` before removing verified-safe Done/Canceled **Local Worktrees** and **Task Branches**, rebuildable Cargo target directories, or saved Run Transcript/Launcher Session Data files.
-- `tasker supervise` uses a local per-**Task Queue** supervisor lock to prevent overlapping supervisors from starting duplicate **Worker Loop** claims; stale locks from crashed supervisors are removed when the recorded process is gone, and `--allow-overlap` is an explicit recovery override.
-- `tasker merge lock acquire/status/release --queue <key>` manages the queue-scoped **Managed Source Repository Operation Lock** for Manual Dogfood Merge windows.
-- `tasker merge retry` is an **Operator** recovery command that retries Local Worktree Delivery for an **Integrating** **Task** after a retryable **Operational Delivery Failure** without launching a new **Agent Run**.
-- `tasker supervise --watch` keeps polling a **Task Queue** for newly eligible **Tasks** until timeout or interruption instead of exiting when a bounded batch drains.
-- `tasker supervise` retries due **Integrating** Tasks after retryable **Operational Delivery Failures** without launching a new **Agent Run**.
+- `spool work --once` claims and runs at most one **Task**.
+- `spool work --max-run-seconds N` bounds one launcher execution and fails the **Agent Run** if the **Pi Launcher** does not emit `agent_end` before the duration elapses.
+- `spool status` shows queue counts, running work, and retry holds.
+- `spool task show` shows full **Task** state.
+- `spool task retry` is an **Operator** recovery command that clears a **Retry Hold** and moves a resolved failed, canceled, or stuck **Task** back to **Ready** without changing normal completion gates.
+- `spool run show` shows **Agent Run**, **Run Transcript**, and **Launcher Session Data** metadata.
+- `spool run fail` is an **Operator** recovery command that fails an active **Agent Run** with an explicit reason and records a **Retry Hold**.
+- `spool cleanup local-worktrees`, `spool cleanup cargo-targets`, and `spool cleanup runs` are explicit **Operator** cleanup commands for local dogfood storage artifacts; they default to dry-run reporting and require `--delete` before removing verified-safe Done/Canceled **Local Worktrees** and **Task Branches**, rebuildable Cargo target directories, or saved Run Transcript/Launcher Session Data files.
+- `spool supervise` uses a local per-**Task Queue** supervisor lock to prevent overlapping supervisors from starting duplicate **Worker Loop** claims; stale locks from crashed supervisors are removed when the recorded process is gone, and `--allow-overlap` is an explicit recovery override.
+- `spool merge lock acquire/status/release --queue <key>` manages the queue-scoped **Managed Source Repository Operation Lock** for Manual Dogfood Merge windows.
+- `spool merge retry` is an **Operator** recovery command that retries Local Worktree Delivery for an **Integrating** **Task** after a retryable **Operational Delivery Failure** without launching a new **Agent Run**.
+- `spool supervise --watch` keeps polling a **Task Queue** for newly eligible **Tasks** until timeout or interruption instead of exiting when a bounded batch drains.
+- `spool supervise` retries due **Integrating** Tasks after retryable **Operational Delivery Failures** without launching a new **Agent Run**.
 - Dogfooding API covers health/version, queue create/show/list, file-backed task create, task show, claim-next, heartbeat, finish-run, Workpad Note update, criterion/validation status update, child task creation, state transition request, local worktree/delivery metadata, status summary, run show, and operator recovery for failed or stuck work.
 - Search, bulk edits, review sessions, metrics export, and token admin APIs are deferred until after **Dogfooding Readiness**.
 - Dogfooding persistence includes queues, tasks, acceptance criteria, validation items, workpad notes/revisions, task links, task relationships, agent runs/heartbeats, delivery records, launcher session data, audit events, and API tokens.
@@ -586,43 +592,44 @@ _Avoid_: Separate progress comment
 - **Slice Acceptance Checks** include relevant targeted tests plus formatting and linting when configured and reasonably cheap to run.
 - A **Pre-Dogfooding Development Loop** inspects docs/code, proposes an **Implementation Slice**, confirms **Slice Acceptance Checks**, implements, runs deterministic checks, updates docs when domain or behavior changes, and summarizes the result.
 - Documentation changes are part of an **Implementation Slice** when domain language, workflow behavior, persistence meaning, delivery behavior, launcher behavior, or milestone sequencing changes.
-- Pre-dogfooding loop rules and cutover criteria are recorded in `docs/PRE_DOGFOODING_LOOP.md` until Tasker can track real development **Tasks**.
+- Pre-dogfooding loop rules and cutover criteria are recorded in `docs/PRE_DOGFOODING_LOOP.md` until Spool can track real development **Tasks**.
 - A completed **Pre-Dogfooding Development Loop** normally ends with unstaged or staged working tree changes, a concise summary, and a recommended Conventional Commit message; the human decides whether the agent commits.
 - In an **Approved Slice Sequence**, the agent may implement and commit multiple approved low-risk **Implementation Slices** in order, stopping when scope, architecture, security, persistence semantics, task lifecycle, delivery behavior, launcher behavior, or unresolved check failures require human input.
 - A **Subagent Review Loop** runs before committing implementation slices during pre-dogfooding work.
-- During dogfooding, a **Subagent Review Loop** is the preferred advisory review mechanism for Tasker development when extra confidence is needed before committing or requesting **Integrating**.
-- **Subagent Review Loop** reviewers are advisory development helpers and are distinct from Tasker's domain **Review Agent**, **Review Session**, and **Review Decision**.
+- During dogfooding, a **Subagent Review Loop** is the preferred advisory review mechanism for Spool development when extra confidence is needed before committing or requesting **Integrating**.
+- **Subagent Review Loop** reviewers are advisory development helpers and are distinct from Spool's domain **Review Agent**, **Review Session**, and **Review Decision**.
 - **Oracle Escalation** is used when a reviewer finding, implementation discovery, or user instruction exposes a conflict with documented architecture, security, persistence semantics, task lifecycle, delivery behavior, launcher behavior, or domain language.
-- **Dogfooding Cutover** occurs when Tasker development work starts being created and tracked as real Tasker **Tasks**.
-- The first **Dogfooding Cutover** target is after roadmap Milestone 2, when **File-backed Task Creation**, **Task Queues**, task show/status, **Workpad Notes**, and **Audit Events** are usable for real Tasker development work.
-- **Dogfooding Readiness** requires enough init/config, queue setup, delegation or temporary task creation, one-shot work, local worktree handling, work updates, and status visibility to build Tasker with Tasker.
+- **Dogfooding Cutover** occurs when Spool development work starts being created and tracked as real Spool **Tasks**.
+- The first **Dogfooding Cutover** target is after roadmap Milestone 2, when **File-backed Task Creation**, **Task Queues**, task show/status, **Workpad Notes**, and **Audit Events** are usable for real Spool development work.
+- **Dogfooding Readiness** requires enough init/config, queue setup, delegation or temporary task creation, one-shot work, local worktree handling, work updates, and status visibility to build Spool with Spool.
 - **Dogfooding Readiness** uses single-worker execution only.
 - During dogfooding, active **Agent Runs** for **Integrating** **Tasks** share the same **Queue Concurrency Limit** as coding and rework runs; operators unblock saturation by waiting for completion or **Claim Lease** expiry, failing stuck runs, or raising/clearing the limit only if local resources permit.
-- **File-backed Task Creation** uses `tasker task create --queue <key> --from-file task.md` as the preferred CLI shape.
-- The existing `tasker task create --bootstrap --queue <key> --file task.md` command remains a compatibility path for the temporary **Bootstrap Task Creation** escape hatch until a deliberate migration removes or aliases the old spelling.
-- A file-backed Task definition uses YAML front matter for title, acceptance criteria, validation items, priority, state, tags, review requirement, advisory conflict hints, and blocking Task identifiers, with the Markdown body as the **Task Brief**. Priority values are stored canonically as **urgent**, **high**, **normal**, or **low**; File-backed Task Creation accepts the safe priority alias `medium` and normalizes it to **normal** with a CLI warning. The canonical example currently lives at `.tasker/bootstrap-tasks/TEMPLATE.md`.
+- **File-backed Task Creation** uses `spool task create --queue <key> --from-file task.md` as the preferred CLI shape.
+- The existing `spool task create --bootstrap --queue <key> --file task.md` command remains a compatibility path for the temporary **Bootstrap Task Creation** escape hatch until a deliberate migration removes or aliases the old spelling.
+- A file-backed Task definition uses YAML front matter for title, acceptance criteria, validation items, priority, state, tags, review requirement, advisory conflict hints, and blocking Task identifiers, with the Markdown body as the **Task Brief**. Priority values are stored canonically as **urgent**, **high**, **normal**, or **low**; File-backed Task Creation accepts the safe priority alias `medium` and normalizes it to **normal** with a CLI warning. The canonical example currently lives at `.spool/bootstrap-tasks/TEMPLATE.md`.
 - **File-backed Task Creation** defaults to **Ready** when the task file does not specify state.
 - Dependency-aware multi-file Task creation should extend **File-backed Task Creation** input handling by reading multiple file definitions and recording explicit blocking **Task** relationships; it is not a separate workflow concept.
 - **Bootstrap Task Creation** does not replace long-term agent-mediated intake.
 - **Manual Dogfood Merge** may be used before automatic **Integrating** is implemented.
 - **Manual Dogfood Merge** does not replace the full MVP requirement for Agent-Gated **Integrating** and **Squash Merge**.
-- The **Tasker Service** owns **Tasks**, **Task Queues**, **Task States**, **Agent Runs**, and delivery records.
-- The **Symphony Adapter** translates Symphony orchestration needs into **Tasker API** operations.
-- The **Symphony Adapter** claims **Tasks**, prepares **Local Worktrees**, runs agents through an **Agent Launcher**, records work updates, and performs **Integrating** through a **Delivery Adapter**.
+- The **Spool Service** owns **Tasks**, **Task Queues**, **Task States**, **Agent Runs**, and delivery records.
+- The **Symphony Integration** translates Symphony orchestration needs into **Spool API** operations.
+- The **Symphony Integration Crate** contains Symphony-specific adapter and mapping code and remains separate from Spool core crates.
+- Generic runner-side workflow claims **Tasks**, prepares **Local Worktrees**, runs agents through an **Agent Launcher**, records work updates, and performs **Integrating** through a **Delivery Adapter**.
 - **Pi Launcher** is the v1 **Agent Launcher**.
 - **Pi Launcher** uses one fresh **Pi RPC Session** per **Agent Run**.
-- **Pi Launcher** loads the **Tasker Pi Extension** for Tasker-aware Worker Agent runs.
-- The dogfooding **Tasker Pi Extension** tool set includes task lookup, **Workpad Note** updates, requirement status updates, **Child Task** creation, and **State Transition** requests.
-- The full **Tasker Pi Extension** exposes tools for Task context, **Workpad Note** updates, criteria/validation statuses, **Child Tasks**, **Task Links**, and **State Transitions**.
+- **Pi Launcher** loads the **Spool Pi Extension** for Spool-aware Worker Agent runs.
+- The dogfooding **Spool Pi Extension** tool set includes task lookup, **Workpad Note** updates, requirement status updates, **Child Task** creation, and **State Transition** requests.
+- The full **Spool Pi Extension** exposes tools for Task context, **Workpad Note** updates, criteria/validation statuses, **Child Tasks**, **Task Links**, and **State Transitions**.
 - Question UI is allowed in **Interactive Agent Sessions**.
 - Unexpected question UI in an **Unattended Worker Session** fails the **Agent Run** with a clear reason.
 - A **Pi Launcher** max-run timeout fails the **Agent Run** with a clear reason and structured timeout **Agent Run Failure Reason Code** while preserving the **Run Transcript** and **Launcher Session Data**.
-- Tasker may store a **Run Transcript** for each **Agent Run** under the active Tasker data directory, usually `runs/<run_id>/`.
-- Tasker stores **Launcher Session Data** with common fields and launcher-specific raw data.
-- Tasker does not automatically upload or share **Launcher Session Data**.
-- Tasker does not automatically delete dogfood storage artifacts during normal **Worker Loop** execution; artifact cleanup is an explicit **Operator** action and does not delete authoritative Task, Agent Run, Launcher Session Data database rows, or Audit Events.
-- **Workflow Metrics** are derived from Tasker events and run data rather than a separate metrics database.
-- Tasker records **Agent Runs** and optional launcher metadata, not agent-protocol-specific control state.
+- Spool may store a **Run Transcript** for each **Agent Run** under the active Spool data directory, usually `runs/<run_id>/`.
+- Spool stores **Launcher Session Data** with common fields and launcher-specific raw data.
+- Spool does not automatically upload or share **Launcher Session Data**.
+- Spool does not automatically delete dogfood storage artifacts during normal **Worker Loop** execution; artifact cleanup is an explicit **Operator** action and does not delete authoritative Task, Agent Run, Launcher Session Data database rows, or Audit Events.
+- **Workflow Metrics** are derived from Spool events and run data rather than a separate metrics database.
+- Spool records **Agent Runs** and optional launcher metadata, not agent-protocol-specific control state.
 - A **Task** may have many **Agent Runs** over its lifetime.
 - An **Agent Run** owns one **Claim Lease** while its worker is alive.
 - A **Worker Loop** sends a **Lease Heartbeat** every 30 seconds during an **Agent Run**.
@@ -637,7 +644,7 @@ _Avoid_: Separate progress comment
 - A **Task** with an **Expired Agent Run** may be claimed again when its **Task State** is agent-eligible, it is not blocked, it has no active **Claim Lease**, and no **Retry Hold** is active.
 - **Retry Holds** reset when **Task State** changes or an **Agent Run** completes successfully.
 - Continuity across **Agent Runs** comes from **Local Worktree**, **Workpad Note**, structured Task data, and **Audit Events**, not reused chat history.
-- Symphony executes agent processes; Tasker records **Agent Runs** and **Claim Leases** but does not run agents.
+- Symphony executes agent processes; Spool records **Agent Runs** and **Claim Leases** but does not run agents.
 
 ## Example dialogue
 
@@ -646,31 +653,35 @@ _Avoid_: Separate progress comment
 
 ## Flagged ambiguities
 
+- "Task Backend" could be defined as Symphony-specific infrastructure — resolved: **Task Backend** is integration-neutral core Spool language, while Symphony compatibility is described through **Symphony Integration** relationships.
+- "Symphony-compatible" could make Spool sound like only a Symphony adapter — resolved: Spool is a local agent workflow system first, while Symphony compatibility remains an integration boundary.
+- "Symphony Adapter" could imply Symphony-specific concepts belong in core runner/service crates — resolved: use **Symphony Integration** for the boundary and keep Symphony-specific adapter/mapping code in the thin **Symphony Integration Crate** `spool-symphony`.
+- "Tasker" is the former project name — resolved: use **Spool** for the product, CLI, API, extension, local paths, Git trailers, and dogfood **Task Queue Key**; do not preserve a lasting `tasker` command alias.
 - "task backend" could mean a general-purpose issue tracker or a narrow Symphony-compatible backend — resolved: it is the narrow backend, not a Linear clone.
-- "Linear-compatible" could mean preserving Linear's API surface — resolved: Tasker exposes a first-class **Tasker API** instead of a fake Linear GraphQL facade.
-- "eliminate Linear dependency" could imply importing or syncing Linear issues in v1 — resolved: v1 is greenfield local Tasker only; future imports use the **Tasker API**.
-- "v1 backend" could mean API-only storage — resolved: v1 includes the **Tasker Service** plus a thin **Symphony Adapter** to validate the local workflow end-to-end.
-- "MVP" could imply finishing every planned v1 feature before self-use — resolved: **Dogfooding Readiness** is an earlier milestone focused on using Tasker to build Tasker.
-- "development loop until dogfooding" could mean either the temporary manual workflow or the Tasker-powered self-use workflow — resolved: use **Pre-Dogfooding Development Loop** before **Dogfooding Cutover**, then Tasker-managed dogfooding after cutover.
-- "task" before Tasker can dogfood could conflict with the domain **Task** — resolved: use **Implementation Slice** for pre-dogfooding planning units and reserve **Task** for Tasker-managed work.
-- "reviewer" during pre-dogfooding could mean either an advisory subagent or Tasker's domain **Review Agent** — resolved: use **Subagent Review Loop** for pre-dogfooding advisory review and reserve **Review Agent** for Tasker-managed review sessions.
+- "Linear-compatible" could mean preserving Linear's API surface — resolved: Spool exposes a first-class **Spool API** instead of a fake Linear GraphQL facade.
+- "eliminate Linear dependency" could imply importing or syncing Linear issues in v1 — resolved: v1 is greenfield local Spool only; future imports use the **Spool API**.
+- "v1 backend" could mean API-only storage — resolved: v1 includes the **Spool Service**, generic runner-side workflow, and the thin **Symphony Integration** boundary to validate the local workflow end-to-end.
+- "MVP" could imply finishing every planned v1 feature before self-use — resolved: **Dogfooding Readiness** is an earlier milestone focused on using Spool to build Spool.
+- "development loop until dogfooding" could mean either the temporary manual workflow or the Spool-powered self-use workflow — resolved: use **Pre-Dogfooding Development Loop** before **Dogfooding Cutover**, then Spool-managed dogfooding after cutover.
+- "task" before Spool can dogfood could conflict with the domain **Task** — resolved: use **Implementation Slice** for pre-dogfooding planning units and reserve **Task** for Spool-managed work.
+- "reviewer" during pre-dogfooding could mean either an advisory subagent or Spool's domain **Review Agent** — resolved: use **Subagent Review Loop** for pre-dogfooding advisory review and reserve **Review Agent** for Spool-managed review sessions.
 - "manual merge" during dogfooding could redefine delivery — resolved: **Manual Dogfood Merge** is a temporary sequencing compromise, not the target delivery model.
-- "serve" could imply workers run automatically — resolved: `tasker serve` only serves the API; `tasker work` runs the **Worker Loop** explicitly.
-- "issue", "label", and "blocked_by" are Linear-shaped API terms — resolved: canonical Tasker language is **Task**, **Task Tag**, and **Blocking Task**.
+- "serve" could imply workers run automatically — resolved: `spool serve` only serves the API; `spool work` runs the **Worker Loop** explicitly.
+- "issue", "label", and "blocked_by" are Linear-shaped API terms — resolved: canonical Spool language is **Task**, **Task Tag**, and **Blocking Task**.
 - "project" could mean a Linear-style planning object or a routing key for agent work — resolved: use **Task Queue** for the routing key and avoid **Project** in v1.
 - "scheduling" could imply due dates, estimates, milestones, or calendars — resolved: v1 scheduling is limited to queues, states, priority, blockers, leases, concurrency, and retry holds.
 - "queue creation" could mean normal task delegation — resolved: **Task Queues** are **Operator**-managed infrastructure boundaries, not agent-created work data.
-- "concurrency limit" could mean only Symphony's process limit — resolved: **Queue Concurrency Limit** is enforced by Tasker during claims, while Symphony may still enforce a global worker limit.
+- "concurrency limit" could mean only Symphony's process limit — resolved: **Queue Concurrency Limit** is enforced by Spool during claims, while Symphony may still enforce a global worker limit.
 - "Integrating capacity" could mean a separate delivery-only lane — resolved for v1 dogfooding: **Integrating** consumes ordinary **Queue Concurrency Limit** capacity while an **Agent Run** is active.
 - "identifier" could mean internal database ID or human key — resolved: use an immutable UUID internally and **Task Identifier** for human/operator-facing references.
 - "description" could mean an unstructured blob containing hidden requirements — resolved: use a **Task Brief** for narrative context and first-class **Acceptance Criteria** plus **Validation Items** for required outcomes/proof.
-- "completion evidence" could live only in the **Workpad Note** — resolved: **Criterion Status**, **Validation Status**, and **Waivers** are structured Tasker data.
+- "completion evidence" could live only in the **Workpad Note** — resolved: **Criterion Status**, **Validation Status**, and **Waivers** are structured Spool data.
 - "requirement edits" could weaken the task contract — resolved: Worker Agents may add/clarify requirements, but removals and waivers require Review Agent or Operator action.
 - "waiver" could mean a worker self-exception — resolved: **Waivers** are created by **Review Agents** or **Operators** only.
 - "priority" could mean arbitrary scoring or queue rank — resolved: use the fixed **Priority** labels urgent, high, normal, and low.
 - "tag" could imply scheduling behavior — resolved: **Task Tags** are metadata only in v1.
-- "PR link" could imply a GitHub dependency — resolved: v1 is local-first; Tasker stores generic typed **Task Links** such as **Local Worktree** paths and can add PR-like abstractions later.
-- "backend" could mean Tasker itself or an integration strategy — resolved: **Task Backend** is Tasker; **Delivery Backend** is the pluggable work handoff/integration strategy.
+- "PR link" could imply a GitHub dependency — resolved: v1 is local-first; Spool stores generic typed **Task Links** such as **Local Worktree** paths and can add PR-like abstractions later.
+- "backend" could mean Spool itself or an integration strategy — resolved: **Task Backend** is Spool; **Delivery Backend** is the pluggable work handoff/integration strategy.
 - "Merging" could mean a specific Git/PR operation or a lifecycle state — resolved: use **Integrating** for the backend-neutral **Task State** and **Local Merge** for the v1 local-worktree operation.
 - "integration failure" could mean bad work or bad infrastructure — resolved: use **Work-Change Delivery Failure** for Rework and **Operational Delivery Failure** for retry-in-Integrating.
 - "Rework" could imply discarding the current attempt — resolved: local **Rework** revises the existing worktree unless **Reset Rework** is explicit.
@@ -678,17 +689,17 @@ _Avoid_: Separate progress comment
 - "validation passed" could become stale if **Main Branch** moves — resolved: record a **Validated Base Commit** and reject stale integration as a **Work-Change Delivery Failure**.
 - "worktree changes" could imply uncommitted files are deliverable — resolved: **Integrating** requires committed **Task Commits** and a clean **Local Worktree**.
 - "merge strategy" could imply preserving all agent iteration commits on **Main Branch** — resolved: default **Local Merge** is **Squash Merge**, one **Final Commit** per Task.
-- "Delivery Backend" could imply Tasker executes Git or external commands — resolved: Tasker records delivery configuration/outcomes, while a Symphony-side **Delivery Adapter** performs operations.
+- "Delivery Backend" could imply Spool executes Git or external commands — resolved: Spool records delivery configuration/outcomes, while a Symphony-side **Delivery Adapter** performs operations.
 - "local delivery config" could grow into build/test workflow config — resolved: **Local Worktree Delivery** config is limited to managed source repository, main branch, worktree root, branch template, and done-worktree retention.
-- "agent prompt" could be hidden global behavior — resolved: use built-in **Role Prompts** with optional repo-owned **Prompt Overrides** under `.tasker/prompts/`.
-- "local repo" could mean a personal working copy — resolved: **Local Worktree Delivery** uses a **Managed Source Repository** that the operator opts into Tasker/Symphony mutating.
+- "agent prompt" could be hidden global behavior — resolved: use built-in **Role Prompts** with optional repo-owned **Prompt Overrides** under `.spool/prompts/`.
+- "local repo" could mean a personal working copy — resolved: **Local Worktree Delivery** uses a **Managed Source Repository** that the operator opts into Spool/Symphony mutating.
 - "Todo" could mean a generic task list label or an agent-eligible state — resolved: use **Ready** for queued agent work.
 - "ready" could mean merely queued — resolved: **Ready** requires enough Acceptance Criteria and Validation Items for autonomous execution.
-- "custom workflow" is out of scope for v1 — resolved: Tasker has a fixed **Task State** lifecycle first.
+- "custom workflow" is out of scope for v1 — resolved: Spool has a fixed **Task State** lifecycle first.
 - "state update" could mean free-form mutation or a lifecycle event — resolved: normal clients use enforced **State Transitions**, while operators use **Repair Overrides** for exceptional fixes.
 - "event log" could mean event sourcing — resolved: **Audit Events** are an audit log, while current records remain the authoritative read model.
 - "In Progress" could mean a live process or an active work phase — resolved: **In Progress** is a **Task State**; **Agent Run** tracks live execution.
-- "agent run" could mean Tasker launches agents — resolved: Tasker only records **Agent Runs** and **Claim Leases**; Symphony still executes agents through an **Agent Launcher**.
+- "agent run" could mean Spool launches agents — resolved: Spool only records **Agent Runs** and **Claim Leases**; Symphony still executes agents through an **Agent Launcher**.
 - "liveness" could mean agent output activity — resolved: **Lease Heartbeats** come from the **Worker Loop**, independent of Pi output.
 - "v1 launcher" could default to the reference Codex app-server — resolved: the launcher is pluggable, but v1 ships **Pi Launcher**.
 - "Pi integration" could mean SDK, JSON mode, print mode, or RPC — resolved: **Pi Launcher** uses **Pi RPC Sessions** for language-neutral streaming control.
@@ -696,24 +707,24 @@ _Avoid_: Separate progress comment
 - "session data" could also imply telemetry upload — resolved: **Launcher Session Data** is local-only by default and never automatically shared.
 - "metrics" could imply a separate observability database — resolved: **Workflow Metrics** are derived from **Audit Events**, **Agent Runs**, **Launcher Session Data**, and **Integration Outcomes**.
 - "agent questions" could stall unattended work — resolved: question UI is only for **Interactive Agent Sessions**, not **Unattended Worker Sessions**.
-- "Tasker updates from pi" could mean shelling out through bash — resolved: Worker Agents use the **Tasker Pi Extension** for core workflow updates, with CLI reserved for operator/debug use.
+- "Spool updates from pi" could mean shelling out through bash — resolved: Worker Agents use the **Spool Pi Extension** for core workflow updates, with CLI reserved for operator/debug use.
 - "local config" could mean the XDG default or a repository-local dogfooding config — resolved: the CLI warns on inactive project configs and refuses unsafe mutations unless the operator explicitly selects the intended config/data target.
-- "running a command from a Task Branch with a new migration" could imply upgrading the shared project Task Backend from unintegrated code — resolved: normal commands are check-only for migrations, and explicit `tasker db migrate` is guarded to run from the Managed Source Repository Main Branch by default.
-- "retry continuity" could mean resuming hidden pi chat history — resolved: each **Agent Run** starts a fresh **Pi RPC Session**; durable continuity lives in Tasker/worktree data.
+- "running a command from a Task Branch with a new migration" could imply upgrading the shared project Task Backend from unintegrated code — resolved: normal commands are check-only for migrations, and explicit `spool db migrate` is guarded to run from the Managed Source Repository Main Branch by default.
+- "retry continuity" could mean resuming hidden pi chat history — resolved: each **Agent Run** starts a fresh **Pi RPC Session**; durable continuity lives in Spool/worktree data.
 - "failed run retry" could mean immediate re-claim — resolved: failed or expired runs create **Retry Holds** with backoff.
 - "task intake" could mean humans entering work directly — resolved: normal v1 intake is agent delegation through an extension-native **Delegation Session**; humans delegate to agents rather than creating Tasks themselves.
 - "bootstrap task creation" could become permanent manual intake — resolved: **File-backed Task Creation** is the fallback compatibility concept, while **Bootstrap Task Creation** is only the temporary dogfooding reason it exists before full delegation.
-- "Backlog refinement" could mean manual field editing — resolved: use a **Delegation Session** with deterministic refinement tooling; `tasker delegate --refine` remains a wrapper/fallback.
-- "grill-me-with-docs" refers to the existing grill-with-docs-style interaction — resolved: call the Tasker intake flow a **Delegation Interview**.
-- "documentation-aware delegation" could imply editing docs on the main repository during intake — resolved: delegation reads docs and creates Tasker work; repo edits happen in Worker Agent worktrees.
+- "Backlog refinement" could mean manual field editing — resolved: use a **Delegation Session** with deterministic refinement tooling; `spool delegate --refine` remains a wrapper/fallback.
+- "grill-me-with-docs" refers to the existing grill-with-docs-style interaction — resolved: call the Spool intake flow a **Delegation Interview**.
+- "documentation-aware delegation" could imply editing docs on the main repository during intake — resolved: delegation reads docs and creates Spool work; repo edits happen in Worker Agent worktrees.
 - "agent" could mean creator, executor, or reviewer — resolved: use **Delegating Agent**, **Worker Agent**, and **Review Agent** as distinct **Actor** roles.
 - "future agents" in codebase simplification could mean pre-dogfooding coding assistants or post-cutover **Worker Agents** — resolved: optimize the **Worker Agent Contribution Surface** for post-cutover **Worker Agents** first.
 - "identity" could mean API authentication or domain attribution — resolved: bearer tokens authenticate clients, while **Actor** records domain attribution.
-- "human review" could imply humans operate Tasker directly — resolved: humans review through a **Review Session** or another external channel, and a **Review Agent** records the **Review Decision** in Tasker.
+- "human review" could imply humans operate Spool directly — resolved: humans review through a **Review Session** or another external channel, and a **Review Agent** records the **Review Decision** in Spool.
 - "review required" could imply every Task blocks on a human — resolved: local-first queues default to **Agent-Gated Integration**, and **Human Review** is required only by **Review Policy** or explicit agent request.
 - "workpad" could mean an ordinary comment to search for — resolved: **Workpad Note** is a first-class singleton with **Workpad Revisions**.
-- "workpad checkbox" could imply authoritative completion state — resolved: structured Tasker fields are authoritative; the **Workpad Note** is narrative/handoff context.
-- "root work" could imply manual Tasker entry — resolved: a **Root Task** is still created by a **Delegating Agent** from an out-of-band human request.
+- "workpad checkbox" could imply authoritative completion state — resolved: structured Spool fields are authoritative; the **Workpad Note** is narrative/handoff context.
+- "root work" could imply manual Spool entry — resolved: a **Root Task** is still created by a **Delegating Agent** from an out-of-band human request.
 - "child task" could imply automatic dependency — resolved: parentage records delegation lineage only; blocking is explicit through a **Blocking Task** relationship.
 - "cross-queue dependency" could imply multi-repo orchestration in v1 — resolved: **Child Tasks** and **Blocking Tasks** stay within one **Task Queue** for v1.
 - "follow-up" could imply immediate agent pickup — resolved: a **Follow-up Task** starts in **Backlog** unless explicitly promoted to **Ready**.
