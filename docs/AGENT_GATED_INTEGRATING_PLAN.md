@@ -6,12 +6,12 @@ Manual Dogfood Merge is the current delivery bottleneck. The smallest safe path 
 
 No ADR change is needed for the first slice. Existing ADRs already require the important boundaries:
 
-- The **Tasker Service** owns Task records, **Task States**, **Delivery Records**, **Integration Outcomes**, and **Audit Events**.
+- The **Spool Service** owns Task records, **Task States**, **Delivery Records**, **Integration Outcomes**, and **Audit Events**.
 - A runner-side **Delivery Adapter** performs filesystem and Git operations.
 - **Local Worktree Delivery** is the only v1 **Delivery Backend**.
 - **Integrating** is backend-neutral; local Git merge is only the v1 adapter behavior.
 
-The first implementation should therefore live in worker/CLI-side adapter code, not in `tasker-server` HTTP handlers or `tasker-db` repository functions that shell out to Git.
+The first implementation should therefore live in worker/CLI-side adapter code, not in `spool-server` HTTP handlers or `spool-db` repository functions that shell out to Git.
 
 ## First implementation slice
 
@@ -20,10 +20,10 @@ The first implementation should therefore live in worker/CLI-side adapter code, 
 Suggested command shape:
 
 ```bash
-tasker merge integrate <task-identifier>
+spool merge integrate <task-identifier>
 ```
 
-The command is not the final UX; it is a safe, reviewable adapter slice. It replaces most Manual Dogfood Merge shell steps while preserving a narrow boundary: the CLI/worker process runs Git, while Tasker persistence records only state, delivery facts, and outcomes.
+The command is not the final UX; it is a safe, reviewable adapter slice. It replaces most Manual Dogfood Merge shell steps while preserving a narrow boundary: the CLI/worker process runs Git, while Spool persistence records only state, delivery facts, and outcomes.
 
 ### In scope
 
@@ -31,17 +31,17 @@ The command is not the final UX; it is a safe, reviewable adapter slice. It repl
 2. Require the Task to already be **Integrating** so existing structured gates and Review Policy remain authoritative.
 3. Run all Git/filesystem checks in a Local Worktree Delivery Adapter module owned by runner-side code.
 4. Detect **No-Change Integration** and move the Task to **Done** after recording the outcome.
-5. For changed work, perform a **Squash Merge** from the **Task Branch** into the **Main Branch**, create one **Final Commit** with Tasker metadata, record the successful **Integration Outcome**, and move the Task to **Done**.
+5. For changed work, perform a **Squash Merge** from the **Task Branch** into the **Main Branch**, create one **Final Commit** with Spool metadata, record the successful **Integration Outcome**, and move the Task to **Done**.
 6. On work-change failures, record a work-change outcome and move the Task to **Rework**.
 7. On operational failures, record an operational outcome and leave the Task in **Integrating** for retry.
 8. Remove the **Local Worktree** and delete the **Task Branch** after successful integration unless **Done Worktree Retention** is enabled.
 
 ### Out of scope for this slice
 
-- Automatically invoking integration from `tasker work --once` after a pi run.
+- Automatically invoking integration from `spool work --once` after a pi run.
 - Adding new Review Session behavior.
 - Supporting remote pull requests or non-local delivery backends.
-- Adding arbitrary build/test workflow configuration to Tasker.
+- Adding arbitrary build/test workflow configuration to Spool.
 - Changing structured gate semantics or letting Worker Agents waive requirements.
 
 ## Required safety checks
@@ -70,17 +70,17 @@ For squash merge rollback:
 1. Save `pre_merge_head = git rev-parse <main-branch>`.
 2. Run the squash merge without committing until the index is prepared.
 3. If merge or commit fails before a **Final Commit** is recorded, reset the **Managed Source Repository** back to `pre_merge_head` only after confirming it still points at the expected repository and branch.
-4. If Tasker cannot record a success after the Git commit succeeds, leave the Git commit in place and report an operational failure requiring operator repair; do not try to silently rewrite Main Branch history.
+4. If Spool cannot record a success after the Git commit succeeds, leave the Git commit in place and report an operational failure requiring operator repair; do not try to silently rewrite Main Branch history.
 5. Cleanup of worktree/branch happens only after the success outcome and **Done** transition have been recorded.
 
 ## Follow-up slices
 
 The adapter slice is intentionally not the whole feature. Follow-up Tasks should cover:
 
-1. **TASKER-40**: implement the runner-side Local Worktree integrate command.
-2. **TASKER-41**: wire the Worker Loop to call the adapter immediately after a Worker Agent transitions to **Integrating** and still owns the **Claim Lease**.
-3. Persist richer delivery records/outcomes and expose them in `tasker task show`, `tasker status`, and `tasker run show` as needed.
-4. **TASKER-42**: add or finalize **Validated Base Commit** recording so integration rejects stale validation deterministically. (Implemented during dogfooding; keep expanding delivery evidence as needed.)
+1. **SPOOL-40**: implement the runner-side Local Worktree integrate command.
+2. **SPOOL-41**: wire the Worker Loop to call the adapter immediately after a Worker Agent transitions to **Integrating** and still owns the **Claim Lease**.
+3. Persist richer delivery records/outcomes and expose them in `spool task show`, `spool status`, and `spool run show` as needed.
+4. **SPOOL-42**: add or finalize **Validated Base Commit** recording so integration rejects stale validation deterministically. (Implemented during dogfooding; keep expanding delivery evidence as needed.)
 5. Add a repo-level integration lock or equivalent serialization if queue concurrency allows more than one **Integrating** Task to attempt local merge at the same time; coordinate with the separate Integrating capacity policy work.
 
 ## Deterministic test strategy
@@ -100,7 +100,7 @@ Targeted tests for the first slice:
 Cheap slice checks:
 
 ```bash
-cargo test -p tasker-cli merge
-cargo test -p tasker-db delivery
-cargo clippy -p tasker-cli --all-targets -- -D warnings
+cargo test -p spool-cli merge
+cargo test -p spool-db delivery
+cargo clippy -p spool-cli --all-targets -- -D warnings
 ```

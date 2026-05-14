@@ -1,4 +1,4 @@
-Our goal is to build a minimal task backend for a symphony type system to eliminate linear as a strict dependency.
+Our goal is to build Spool, a minimal local-first **Task Backend** for Symphony-style agent workflows that eliminates Linear as a strict dependency.
 
 We should probably use rust and sqlite as our db.
 

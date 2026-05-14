@@ -1,10 +1,10 @@
 # Pre-Dogfooding Development Loop
 
-Tasker uses this temporary loop to build Tasker until **Dogfooding Cutover**. The loop should stay lightweight and disappear as the primary planning mechanism once real Tasker **Tasks** can manage Tasker development work.
+Spool uses this temporary loop to build Spool until **Dogfooding Cutover**. The loop should stay lightweight and disappear as the primary planning mechanism once real Spool **Tasks** can manage Spool development work.
 
 ## Purpose
 
-The **Pre-Dogfooding Development Loop** exists to keep early implementation work small, documented, and testable before Tasker can dogfood its own workflow.
+The **Pre-Dogfooding Development Loop** exists to keep early implementation work small, documented, and testable before Spool can dogfood its own workflow.
 
 ## Loop stages
 
@@ -27,12 +27,12 @@ For each **Implementation Slice**:
 - An **Approved Slice Sequence** may contain multiple low-risk slices that the agent implements and commits one-by-one without pausing after each slice.
 - Each slice should advance exactly one current roadmap milestone.
 - Each slice proposal should include intent, likely files touched, and proposed **Slice Acceptance Checks**.
-- For **File-backed Task Creation**, prefer `tasker task create --queue <key> --from-file task.md` and start from the canonical template at `.tasker/bootstrap-tasks/TEMPLATE.md` so front matter uses valid values for `priority`, `state`, **Acceptance Criteria**, **Validation Items**, tags, review requirement, blockers, and advisory `conflict_hints`. The older `tasker task create --bootstrap --queue <key> --file task.md` spelling remains a compatibility path for the temporary dogfooding escape hatch.
-- During dogfooding, Delegating Agents should put likely file paths or documentation areas in structured file-backed `conflict_hints` (aliases: `anticipated_touched_files`, `touched_files`) when creating parallel-ready Tasks. Recommended hotspot names include `crates/tasker-db`, `crates/tasker-cli`, `worker-loop`, `local-worktree-delivery`, `tasker-pi-extension`, `telemetry`, `monitor`, `docs`, and `migrations`; prefer concrete repository paths when known. Operators should inspect `tasker status`, `tasker monitor --plain`, or `tasker task show <task_identifier>` for advisory overlap before starting parallel batches. These hints are a coordination aid only; they do not block claims and are not a full dependency planner.
+- For **File-backed Task Creation**, prefer `spool task create --queue <key> --from-file task.md` and start from the canonical template at `.spool/bootstrap-tasks/TEMPLATE.md` so front matter uses valid values for `priority`, `state`, **Acceptance Criteria**, **Validation Items**, tags, review requirement, blockers, and advisory `conflict_hints`. The older `spool task create --bootstrap --queue <key> --file task.md` spelling remains a compatibility path for the temporary dogfooding escape hatch.
+- During dogfooding, Delegating Agents should put likely file paths or documentation areas in structured file-backed `conflict_hints` (aliases: `anticipated_touched_files`, `touched_files`) when creating parallel-ready Tasks. Recommended hotspot names include `crates/spool-db`, `crates/spool-cli`, `worker-loop`, `local-worktree-delivery`, `spool-pi-extension`, `telemetry`, `monitor`, `docs`, and `migrations`; prefer concrete repository paths when known. Operators should inspect `spool status`, `spool monitor --plain`, or `spool task show <task_identifier>` for advisory overlap before starting parallel batches. These hints are a coordination aid only; they do not block claims and are not a full dependency planner.
 - Prefer small, reviewable changes over whole-milestone batches.
-- Avoid using Tasker **Task** language for pre-dogfooding planning units; use **Implementation Slice** instead.
+- Avoid using Spool **Task** language for pre-dogfooding planning units; use **Implementation Slice** instead.
 - Keep implementation single-slice and single-writer by default before dogfooding.
-- Parallel agents or sessions may help with research, review, or code auditing, but should not implement separate slices concurrently before Tasker provides workflow coordination.
+- Parallel agents or sessions may help with research, review, or code auditing, but should not implement separate slices concurrently before Spool provides workflow coordination.
 - If a slice discovers extra work that changes scope, architecture, workflow meaning, or acceptance checks, pause and ask whether to expand, split, or defer the work.
 - During an **Approved Slice Sequence**, stop for human input when scope, architecture, security, persistence semantics, task lifecycle, delivery behavior, launcher behavior, or unresolved check failures exceed the approved plan.
 - Small local fixes that preserve the approved scope may remain inside the current slice.
@@ -41,7 +41,7 @@ For each **Implementation Slice**:
 
 Use advisory subagents to improve pre-dogfooding implementation quality without creating parallel implementation streams.
 
-After **Dogfooding Cutover**, Tasker's own development **Tasks** should keep using the same advisory pattern when extra confidence is needed, but the advisory review does not put the **Task** into **Human Review**. For the Tasker dogfood **Task Queue**, the default is **Agent-Gated Integration**: once structured **Acceptance Criteria** and **Validation Items** pass, a **Worker Agent** should request **Integrating** unless the **Task** explicitly requires **Human Review** or a human/**Operator** asks for it.
+After **Dogfooding Cutover**, Spool's own development **Tasks** should keep using the same advisory pattern when extra confidence is needed, but the advisory review does not put the **Task** into **Human Review**. For the Spool dogfood **Task Queue**, the default is **Agent-Gated Integration**: once structured **Acceptance Criteria** and **Validation Items** pass, a **Worker Agent** should request **Integrating** unless the **Task** explicitly requires **Human Review** or a human/**Operator** asks for it.
 
 Default loop for implementation slices:
 
@@ -55,7 +55,7 @@ Default loop for implementation slices:
 
 Reviewer subagents should focus on correctness, domain language, test coverage, API shape, persistence safety, security/authentication, and whether the diff stays within the approved slice.
 
-A reviewer subagent is an advisory development helper, not Tasker's domain **Review Agent**. It does not prepare a **Review Packet** or record a **Review Decision**; those remain part of optional **Review Session** workflows for **Tasks** that actually enter **Human Review**.
+A reviewer subagent is an advisory development helper, not Spool's domain **Review Agent**. It does not prepare a **Review Packet** or record a **Review Decision**; those remain part of optional **Review Session** workflows for **Tasks** that actually enter **Human Review**.
 
 ### Oracle Escalation
 
@@ -80,7 +80,7 @@ Use risk-based review before **Dogfooding Cutover**.
 
 Agent self-review is enough for low-risk slices. Human review is required for slices that affect persistence schema, task lifecycle or state transitions, Local Worktree Delivery behavior, launcher/pi behavior, authentication, or ADR-worthy architectural decisions, unless the human explicitly approved those details as part of an **Approved Slice Sequence**.
 
-This pre-dogfooding human-review standard is not the default Tasker dogfood workflow. After cutover, Human Review remains an optional product workflow for queues or **Tasks** whose **Review Policy** requires it; ordinary Tasker repository work should use **Agent-Gated Integration** plus an advisory **Subagent Review Loop** when useful.
+This pre-dogfooding human-review standard is not the default Spool dogfood workflow. After cutover, Human Review remains an optional product workflow for queues or **Tasks** whose **Review Policy** requires it; ordinary Spool repository work should use **Agent-Gated Integration** plus an advisory **Subagent Review Loop** when useful.
 
 ## ADR policy
 
@@ -100,6 +100,6 @@ Docs-only slices may have documentation review as their only check.
 
 ## Dogfooding Cutover
 
-The first **Dogfooding Cutover** target is after roadmap Milestone 2, when Tasker can create and show real development **Tasks** using **File-backed Task Creation**, **Task Queues**, task show/status, **Workpad Notes**, and **Audit Events**.
+The first **Dogfooding Cutover** target is after roadmap Milestone 2, when Spool can create and show real development **Tasks** using **File-backed Task Creation**, **Task Queues**, task show/status, **Workpad Notes**, and **Audit Events**.
 
-After cutover, new Tasker development work should be represented as real Tasker **Tasks** whenever practical, even if execution still relies on manual or partially automated implementation.
+After cutover, new Spool development work should be represented as real Spool **Tasks** whenever practical, even if execution still relies on manual or partially automated implementation.

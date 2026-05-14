@@ -1,4 +1,4 @@
-# Tasker Agent Instructions
+# Spool Agent Instructions
 
 ## Always read first
 
@@ -10,17 +10,17 @@ Use the terms from `CONTEXT.md` exactly. Avoid Linear/GitHub/PR-shaped language 
 
 ## Product direction
 
-Tasker is a local-first task backend for speeding up agent-driven development. The first priority is Dogfooding Readiness: Tasker should become useful enough to build Tasker with Tasker as quickly as possible.
+Spool is a local-first task backend for speeding up agent-driven development. The first priority is Dogfooding Readiness: Spool should become useful enough to build Spool with Spool as quickly as possible.
 
 Keep v1 focused on:
 
-- Tasker Service + Tasker API
+- Spool Service + Spool API
 - Task Queues
 - Tasks, Task States, requirements, Workpad Notes
 - Agent Runs and Claim Leases
 - Local Worktree Delivery
 - Pi Launcher using `pi --mode rpc`
-- Minimal Tasker Pi Extension
+- Minimal Spool Pi Extension
 - CLI-first observability
 
 Do not expand v1 into:
@@ -34,7 +34,7 @@ Do not expand v1 into:
 
 ## Implementation stack
 
-Core Tasker implementation:
+Core Spool implementation:
 
 - Rust
 - `axum` for HTTP
@@ -48,9 +48,9 @@ Core Tasker implementation:
 
 Pi integration:
 
-- TypeScript Tasker Pi Extension
-- Communicate with Tasker through the HTTP API
-- Do not share in-process code between Rust Tasker and the extension
+- TypeScript Spool Pi Extension
+- Communicate with Spool through the HTTP API
+- Do not share in-process code between Rust Spool and the extension
 
 ## Dogfooding Readiness path
 
@@ -59,21 +59,21 @@ Prioritize these milestones in order:
 1. Rust skeleton, config/init/migrations, health/version.
 2. Queues, Tasks, requirements, Workpad Notes, Audit Events, bootstrap creation, show/status CLI.
 3. Claim/lease/run lifecycle and fake launcher worker loop.
-4. Local Worktree Delivery setup, Pi Launcher RPC, minimal Tasker Pi Extension.
+4. Local Worktree Delivery setup, Pi Launcher RPC, minimal Spool Pi Extension.
 5. Run transcripts/session data, status/run show, manual dogfood merge or first Integrating implementation, deterministic tests.
 
 Temporary dogfooding escape hatches are allowed only when clearly marked:
 
-- `tasker task create --bootstrap --queue <key> --file task.md`
+- `spool task create --bootstrap --queue <key> --file task.md`
 - Manual Dogfood Merge before automatic Integrating is implemented
 
 These do not replace the target model.
 
 ## Dogfood review and integration default
 
-Tasker's own dogfood **Task Queue** defaults to **Agent-Gated Integration**, not **Human Review**. After structured **Acceptance Criteria** are satisfied or waived and **Validation Items** are passed or waived, ordinary dogfood **Tasks** should proceed to **Integrating**.
+Spool's own dogfood **Task Queue** defaults to **Agent-Gated Integration**, not **Human Review**. After structured **Acceptance Criteria** are satisfied or waived and **Validation Items** are passed or waived, ordinary dogfood **Tasks** should proceed to **Integrating**.
 
-Use **Human Review** only when the **Task** or **Task Queue** explicitly requires it, such as `review_required: true`, or when a human/**Operator** asks for it. When extra confidence is needed for Tasker development, prefer an advisory **Subagent Review Loop** before committing or requesting **Integrating**. Advisory subagents do not replace Tasker's domain **Review Agent**, **Review Session**, or **Review Decision**.
+Use **Human Review** only when the **Task** or **Task Queue** explicitly requires it, such as `review_required: true`, or when a human/**Operator** asks for it. When extra confidence is needed for Spool development, prefer an advisory **Subagent Review Loop** before committing or requesting **Integrating**. Advisory subagents do not replace Spool's domain **Review Agent**, **Review Session**, or **Review Decision**.
 
 ## Agent efficiency rules
 
@@ -85,7 +85,7 @@ Before broad exploration:
 - Use the Task Brief, Acceptance Criteria, Validation Items, Task Links, Workpad Note, and Task Conflict Hints to make a short context plan before reading many files.
 - Prefer targeted `rg`/`find` queries and narrow `read` ranges over opening large files end-to-end.
 - Avoid rereading unchanged files. Keep notes in your reasoning about files and symbols already inspected.
-- Avoid broad SQL, transcript parsing, or repeated `tasker status`/`task show` loops unless the Task is explicitly about observability or telemetry.
+- Avoid broad SQL, transcript parsing, or repeated `spool status`/`spool task show` loops unless the Task is explicitly about observability or telemetry.
 
 During implementation:
 
@@ -94,38 +94,40 @@ During implementation:
 - Do not run expensive commands repeatedly after unrelated edits; batch validation when safe.
 - Keep Workpad Notes concise: summary, changed files, validation, risks, and follow-up Task candidates.
 
-For Tasker workflow updates, prefer Tasker Pi Extension tools when available. Use `bin/tasker-local` for operator/debug reads and fallback workflow mutations only when needed.
+For Spool workflow updates, prefer Spool Pi Extension tools when available. Use `bin/spool-local` for operator/debug reads and fallback workflow mutations only when needed.
 
-When investigating efficiency, cite numeric summaries and local artifact paths, not raw prompt bodies, raw transcripts, secrets, or large pasted logs. Token/cache/context metrics are local-only and should come from Tasker telemetry when available.
+When investigating efficiency, cite numeric summaries and local artifact paths, not raw prompt bodies, raw transcripts, secrets, or large pasted logs. Token/cache/context metrics are local-only and should come from Spool telemetry when available.
 
 ## Project dogfooding command safety
 
-Project dogfooding commands must use the project Tasker database, not the default user Tasker database. Prefer the repo-local `bin/tasker-local` wrapper for project dogfood CLI reads and operator/debug commands. It runs `cargo run -p tasker-cli --bin tasker` from the Managed Source Repository root with the repository's `.tasker/config.toml`, so the CLI rebuilds automatically when needed. This favors correctness over fastest startup during dogfooding; there is no separate fast path currently.
+Project dogfooding commands must use the project Spool database, not the default user Spool database. Prefer the repo-local `bin/spool-local` wrapper for project dogfood CLI reads and operator/debug commands. It runs `cargo run -p spool-cli --bin spool` from the Managed Source Repository root with the repository's `.spool/config.toml`, so the CLI rebuilds automatically when needed. This favors correctness over fastest startup during dogfooding; there is no separate fast path currently.
 
-If the wrapper is unavailable, run Tasker CLI commands from the Managed Source Repository root and pass the project config explicitly:
-
-```bash
-cargo run -p tasker-cli -- --config .tasker/config.toml --data-dir .tasker/data <tasker-args>
-```
-
-Do not run bare `tasker task create`, `tasker status`, `tasker work`, or `tasker supervise` from this repository. Bare commands can read or mutate the wrong Task Backend.
-
-Before any Tasker mutation for project dogfooding, run this preflight and confirm it prints `key: TASKER`:
+If the wrapper is unavailable, run Spool CLI commands from the Managed Source Repository root and pass the project config explicitly:
 
 ```bash
-bin/tasker-local queue show TASKER
+cargo run -p spool-cli -- --config .spool/config.toml --data-dir .spool/data <spool-args>
 ```
 
-Only continue with project dogfooding mutations when the preflight shows the `TASKER` Task Queue from the project database.
+During the one-time rename migration from the old Tasker local state, this repository may temporarily still have `.tasker/`, `bin/tasker-local`, the `tasker-cli` package, and a `TASKER` dogfood **Task Queue Key** until the code/data migration lands. Use those old names only as migration fallback paths for repository dogfooding; do not introduce new canonical docs or APIs with the old name.
+
+Do not run bare `spool task create`, `spool status`, `spool work`, or `spool supervise` from this repository. Bare commands can read or mutate the wrong Task Backend.
+
+Before any Spool mutation for project dogfooding, run this preflight and confirm it prints `key: SPOOL`:
+
+```bash
+bin/spool-local queue show SPOOL
+```
+
+Only continue with project dogfooding mutations when the preflight shows the `SPOOL` Task Queue from the project database.
 
 ## Architectural rules
 
-- Tasker records delivery configuration and outcomes; Delivery Adapters perform filesystem/Git operations outside Tasker.
-- Tasker records Agent Runs and Launcher Session Data; Agent Launchers execute agents outside Tasker.
-- Local Worktree Delivery uses a Managed Source Repository. Warn operators that Tasker/Symphony may mutate it.
+- Spool records delivery configuration and outcomes; Delivery Adapters perform filesystem/Git operations outside Spool.
+- Spool records Agent Runs and Launcher Session Data; Agent Launchers execute agents outside Spool.
+- Local Worktree Delivery uses a Managed Source Repository. Warn operators that Spool/Symphony may mutate it.
 - Use explicit SQL for claim, lease, transition, and delivery transactions.
 - Current relational rows are authoritative; Audit Events are append-only history, not v1 event sourcing.
-- Structured Tasker fields are authoritative for gates and scheduling; Workpad Note Markdown is narrative/handoff context.
+- Structured Spool fields are authoritative for gates and scheduling; Workpad Note Markdown is narrative/handoff context.
 
 ## Testing strategy
 
@@ -135,7 +137,7 @@ Prefer deterministic tests:
 - Temp Git repositories
 - Fake Agent Launchers
 - Fake Delivery Adapter outcomes
-- Contract tests for the Tasker Pi Extension against a test Tasker server
+- Contract tests for the Spool Pi Extension against a test Spool server
 
 Keep real pi end-to-end tests opt-in because they require local model credentials and agent availability.
 

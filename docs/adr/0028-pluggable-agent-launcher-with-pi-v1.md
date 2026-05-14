@@ -1,6 +1,6 @@
 # Use a pluggable Agent Launcher with pi for v1
 
-The runner-side Symphony adapter will use a pluggable Agent Launcher boundary rather than baking one coding-agent protocol into Tasker. Tasker records Agent Runs, outcomes, and optional launcher metadata, while the adapter owns protocol-specific execution; the concrete v1 launcher will run Worker Agents through pi so the local workflow can be validated with the current development harness.
+The runner-side Symphony adapter will use a pluggable Agent Launcher boundary rather than baking one coding-agent protocol into Spool. Spool records Agent Runs, outcomes, and optional launcher metadata, while the adapter owns protocol-specific execution; the concrete v1 launcher will run Worker Agents through pi so the local workflow can be validated with the current development harness.
 
 Pi Launcher will use `pi --mode rpc` over JSONL stdin/stdout. RPC mode is language-neutral for the Rust adapter and supports streaming events, aborts, session control, and extension UI requests; one-shot print/JSON mode is too limited, and the TypeScript SDK would couple the adapter to Node.js.
 

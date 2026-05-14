@@ -2,18 +2,18 @@
 
 ## Purpose
 
-This spike reviews Tasker dogfooding **Agent Runs** to identify where unattended **Worker Agents** lose time, duplicate work, or get blocked. The recommendations stay local-first: improve Tasker, the **Tasker Pi Extension**, prompts, task structure, and CLI observability without requiring external telemetry upload, web dashboards, or GitHub/PR-dependent workflow.
+This spike reviews Spool dogfooding **Agent Runs** to identify where unattended **Worker Agents** lose time, duplicate work, or get blocked. The recommendations stay local-first: improve Spool, the **Spool Pi Extension**, prompts, task structure, and CLI observability without requiring external telemetry upload, web dashboards, or GitHub/PR-dependent workflow.
 
 ## Evidence reviewed
 
 Representative local evidence sources:
 
-- `tasker telemetry summary --queue TASKER` reported 99 Agent Runs, 36 duplicate or wasted runs across 24 Tasks, 28 post-Integrating Agent Runs, 9 failed/timed-out runs, and average completed-run duration of 226.5 seconds across 86 completed runs.
-- `tasker telemetry lifecycle --queue TASKER` showed recent Ready-to-Done latency dominated either by agent execution (for example TASKER-63, TASKER-57, TASKER-58, TASKER-61, TASKER-64, TASKER-65) or by Integrating / Manual Dogfood Merge wait (for example TASKER-62 and TASKER-60).
-- `tasker run show d1c053e3-2a31-4ae2-bde4-97b583748b0d` for TASKER-65 showed normalized efficiency data: 45 tool calls, a 52 MB Run Transcript, blocking extension UI detection, and optimization hints for excessive tool calls plus unexpected UI/questions.
-- Older transcript-only artifacts under `.tasker/data/runs/<agent_run_id>/pi.jsonl` were sampled for TASKER-26 through TASKER-65. These runs often lack normalized metrics but include captured pi stdout sufficient to count `tool_execution_start` events and inspect representative tool patterns without embedding raw transcript bodies.
-- Workpad Notes for TASKER-47 through TASKER-65 were sampled from Tasker state. Most final notes are concise implementation summaries with changed files and validation, while earlier plan/progress conventions vary.
-- Failure examples from Task history and run records include unexpected question UI in TASKER-5 (`6ea4edf4-f8b3-409b-a26e-7329ca153f19`) and TASKER-7, local setup failures from dirty Managed Source Repository state in TASKER-52, TASKER-57, TASKER-63, and TASKER-64, an expired Claim Lease in TASKER-63 (`f1e429cf-f45c-41dc-a08e-8476a89ade78`), and operator cleanup after interrupted or duplicated supervisor runs in TASKER-19 and TASKER-24.
+- `spool telemetry summary --queue SPOOL` reported 99 Agent Runs, 36 duplicate or wasted runs across 24 Tasks, 28 post-Integrating Agent Runs, 9 failed/timed-out runs, and average completed-run duration of 226.5 seconds across 86 completed runs.
+- `spool telemetry lifecycle --queue SPOOL` showed recent Ready-to-Done latency dominated either by agent execution (for example SPOOL-63, SPOOL-57, SPOOL-58, SPOOL-61, SPOOL-64, SPOOL-65) or by Integrating / Manual Dogfood Merge wait (for example SPOOL-62 and SPOOL-60).
+- `spool run show d1c053e3-2a31-4ae2-bde4-97b583748b0d` for SPOOL-65 showed normalized efficiency data: 45 tool calls, a 52 MB Run Transcript, blocking extension UI detection, and optimization hints for excessive tool calls plus unexpected UI/questions.
+- Older transcript-only artifacts under `.spool/data/runs/<agent_run_id>/pi.jsonl` were sampled for SPOOL-26 through SPOOL-65. These runs often lack normalized metrics but include captured pi stdout sufficient to count `tool_execution_start` events and inspect representative tool patterns without embedding raw transcript bodies.
+- Workpad Notes for SPOOL-47 through SPOOL-65 were sampled from Spool state. Most final notes are concise implementation summaries with changed files and validation, while earlier plan/progress conventions vary.
+- Failure examples from Task history and run records include unexpected question UI in SPOOL-5 (`6ea4edf4-f8b3-409b-a26e-7329ca153f19`) and SPOOL-7, local setup failures from dirty Managed Source Repository state in SPOOL-52, SPOOL-57, SPOOL-63, and SPOOL-64, an expired Claim Lease in SPOOL-63 (`f1e429cf-f45c-41dc-a08e-8476a89ade78`), and operator cleanup after interrupted or duplicated supervisor runs in SPOOL-19 and SPOOL-24.
 
 The investigation intentionally cites Task identifiers, Agent Run IDs, command summaries, and artifact paths rather than copying raw prompt or transcript bodies.
 
@@ -23,30 +23,30 @@ The investigation intentionally cites Task identifiers, Agent Run IDs, command s
 
 Worker Agents consistently read `CONTEXT.md` and `ROADMAP.md`, then run broad `find`/`rg` commands and inspect the same implementation files multiple times. This is appropriate for safety but creates repeated overhead:
 
-- TASKER-65 (`d1c053e3-2a31-4ae2-bde4-97b583748b0d`) used 45 tool calls; sampled transcript events show 13 `read`, 25 `bash`, and 7 `edit` calls, including repeated reads of `crates/tasker-cli/src/monitor.rs` and `crates/tasker-db/src/lib.rs`.
-- TASKER-58 (`2978eccc-1555-4fd5-8855-0e4eb8744057`) used 96 sampled tool calls and was the slowest recent completed Agent Run at 562 seconds; repeated reads included `crates/tasker-cli/src/worker.rs`, `crates/tasker-db/src/lib.rs`, and `crates/tasker-cli/src/main.rs`.
-- TASKER-62's first run (`814869c4-7d57-45b4-884c-db3ad37e5556`) used 81 sampled tool calls and repeatedly inspected telemetry, CLI, database, and worker files.
+- SPOOL-65 (`d1c053e3-2a31-4ae2-bde4-97b583748b0d`) used 45 tool calls; sampled transcript events show 13 `read`, 25 `bash`, and 7 `edit` calls, including repeated reads of `crates/spool-cli/src/monitor.rs` and `crates/spool-db/src/lib.rs`.
+- SPOOL-58 (`2978eccc-1555-4fd5-8855-0e4eb8744057`) used 96 sampled tool calls and was the slowest recent completed Agent Run at 562 seconds; repeated reads included `crates/spool-cli/src/worker.rs`, `crates/spool-db/src/lib.rs`, and `crates/spool-cli/src/main.rs`.
+- SPOOL-62's first run (`814869c4-7d57-45b4-884c-db3ad37e5556`) used 81 sampled tool calls and repeatedly inspected telemetry, CLI, database, and worker files.
 
-This pattern is recurring, evidence-backed, and not merely anecdotal. It suggests the Worker Agent prompt and Tasker Pi Extension should help agents form a narrower initial file map.
+This pattern is recurring, evidence-backed, and not merely anecdotal. It suggests the Worker Agent prompt and Spool Pi Extension should help agents form a narrower initial file map.
 
-### 2. Broad CLI usage fills gaps left by narrow Tasker Pi Extension tools
+### 2. Broad CLI usage fills gaps left by narrow Spool Pi Extension tools
 
-The unattended prompt correctly says Worker Agents should use Tasker Pi Extension tools for Tasker mutations, but the available workflow still pushes agents toward shell commands for context and observability:
+The unattended prompt correctly says Worker Agents should use Spool Pi Extension tools for Spool mutations, but the available workflow still pushes agents toward shell commands for context and observability:
 
-- Agents repeatedly invoke `bin/tasker-local task show <TASK>`, `queue show`, `status`, and telemetry commands to confirm state, requirements, and safe database targeting.
-- Agents use ad hoc SQLite or transcript parsing when answering cross-run questions because there is no first-class Tasker tool for recent Agent Run summaries, Workpad Note search, repeated failure patterns, or transcript-derived tool counts.
+- Agents repeatedly invoke `bin/spool-local task show <TASK>`, `queue show`, `status`, and telemetry commands to confirm state, requirements, and safe database targeting.
+- Agents use ad hoc SQLite or transcript parsing when answering cross-run questions because there is no first-class Spool tool for recent Agent Run summaries, Workpad Note search, repeated failure patterns, or transcript-derived tool counts.
 - Final requirement updates still often rely on CLI-compatible behavior in dogfood sessions when extension tool availability is unclear.
 
-The CLI is valuable for Operators, but repeated shell inspection is inefficient for Worker Agents and weakens the product direction that the Tasker Pi Extension should expose narrow Tasker workflow tools. The first mitigation is now the read-only `tasker_get_task_context_bundle` extension tool and matching Tasker API endpoint, which give Worker Agents one run-start source for Task context, advisory file/path hints, local workflow metadata, recent Agent Runs, and latest failure/integration summaries without raw Run Transcript bodies or launcher payloads.
+The CLI is valuable for Operators, but repeated shell inspection is inefficient for Worker Agents and weakens the product direction that the Spool Pi Extension should expose narrow Spool workflow tools. The first mitigation is now the read-only `spool_get_task_context_bundle` extension tool and matching Spool API endpoint, which give Worker Agents one run-start source for Task context, advisory file/path hints, local workflow metadata, recent Agent Runs, and latest failure/integration summaries without raw Run Transcript bodies or launcher payloads.
 
 ### 3. Operational blockers have been a larger waste source than unclear code tasks
 
 The biggest waste categories are not failed edits; they are workflow and local-state issues:
 
 - Telemetry summary reports 36 duplicate/wasted Agent Runs across 24 Tasks and 28 post-Integrating Agent Runs.
-- Dirty Managed Source Repository state caused immediate setup failures for TASKER-52, TASKER-57, TASKER-63, and TASKER-64.
-- Unexpected or blocking UI caused failures or warnings, including TASKER-5 and TASKER-7 failed runs and TASKER-65's blocking extension UI detection despite successful completion.
-- Manual Dogfood Merge / Integrating wait dominated some recent lifecycle latencies, especially TASKER-62 and TASKER-60.
+- Dirty Managed Source Repository state caused immediate setup failures for SPOOL-52, SPOOL-57, SPOOL-63, and SPOOL-64.
+- Unexpected or blocking UI caused failures or warnings, including SPOOL-5 and SPOOL-7 failed runs and SPOOL-65's blocking extension UI detection despite successful completion.
+- Manual Dogfood Merge / Integrating wait dominated some recent lifecycle latencies, especially SPOOL-62 and SPOOL-60.
 
 These are recurring workflow issues. Recent fixes have already targeted them, but the evidence supports further lightweight guardrails and status surfacing.
 
@@ -63,11 +63,11 @@ Task Conflict Hints and Workpad Notes can reduce this if consistently populated 
 
 ### 5. Current telemetry is useful but still incomplete for diagnosis
 
-Normalized Agent Run metrics are newly available and currently sparse. `tasker telemetry summary` reports only one run with normalized efficiency details at review time. Older runs require transcript parsing and cannot reliably expose:
+Normalized Agent Run metrics are newly available and currently sparse. `spool telemetry summary` reports only one run with normalized efficiency details at review time. Older runs require transcript parsing and cannot reliably expose:
 
 - Unique files read versus repeated reads.
 - Tool-call counts by command category.
-- Time spent waiting on cargo, git, locks, or Tasker CLI builds.
+- Time spent waiting on cargo, git, locks, or Spool CLI builds.
 - Token/context growth and cache behavior.
 - Whether repeated Agent Runs were productive continuation, duplicate supervisor work, integration retry, or pure waste.
 
@@ -77,16 +77,16 @@ The gap is expected for a young local-first system, but it means future efficien
 
 | Priority | Area | Recommendation | Expected impact | Complexity | Evidence |
 |---|---|---|---|---|---|
-| Done | Tools/extensions | Added the Tasker Pi Extension `tasker_get_task_context_bundle` tool and `/tasks/{identifier}/context-bundle` Tasker API endpoint. The bundle returns Task brief, Acceptance Criteria, Validation Items, Workpad Note, Task Links, advisory Task Conflict Hints / likely files-paths, queue and local workflow context, recent Agent Runs, and latest failure/integration summaries. | Fewer `task show`, `queue show`, `status`, and path-safety shell calls at run start. | Shipped | Repeated `bin/tasker-local task show` and preflight shell calls across sampled transcripts. |
-| P0 | Observability/telemetry | Extend normalized Agent Run metrics to count tool calls by tool name, tool errors, repeated reads of the same path, transcript byte size, blocking UI events, and shell-command categories. | Makes future diagnosis queryable without parsing huge transcripts. | Medium | TASKER-65 has 52 MB transcript and 45 tool calls; older runs require transcript parsing. |
-| P0 | Workflow safety | Keep improving pre-claim local-state guards: surface dirty Managed Source Repository and operation-lock status before claims consume Agent Runs. | Reduces zero-second failed runs and duplicate retries. | Low/Medium | Dirty repo setup failures in TASKER-52, TASKER-57, TASKER-63, TASKER-64. |
-| Done | Prompts/context | Updated the Worker Agent Role Prompt to require the context bundle first, maintain a short context plan that preserves canonical `CONTEXT.md`, `ROADMAP.md`, and relevant ADR/doc reads, avoid rereading unchanged files, prefer `rg`/`find` narrowing and narrow read ranges, use safe CLI fallback only when extension tools are unavailable, and summarize efficiency-budget overruns in the Workpad Note handoff. | Reduces repeated reads while preserving safety. | Shipped | Repeated reads in TASKER-58, TASKER-62, TASKER-65, TASKER-60, TASKER-33. |
+| Done | Tools/extensions | Added the Spool Pi Extension `spool_get_task_context_bundle` tool and `/tasks/{identifier}/context-bundle` Spool API endpoint. The bundle returns Task brief, Acceptance Criteria, Validation Items, Workpad Note, Task Links, advisory Task Conflict Hints / likely files-paths, queue and local workflow context, recent Agent Runs, and latest failure/integration summaries. | Fewer `spool task show`, `spool queue show`, `spool status`, and path-safety shell calls at run start. | Shipped | Repeated `bin/spool-local task show` and preflight shell calls across sampled transcripts. |
+| P0 | Observability/telemetry | Extend normalized Agent Run metrics to count tool calls by tool name, tool errors, repeated reads of the same path, transcript byte size, blocking UI events, and shell-command categories. | Makes future diagnosis queryable without parsing huge transcripts. | Medium | SPOOL-65 has 52 MB transcript and 45 tool calls; older runs require transcript parsing. |
+| P0 | Workflow safety | Keep improving pre-claim local-state guards: surface dirty Managed Source Repository and operation-lock status before claims consume Agent Runs. | Reduces zero-second failed runs and duplicate retries. | Low/Medium | Dirty repo setup failures in SPOOL-52, SPOOL-57, SPOOL-63, SPOOL-64. |
+| Done | Prompts/context | Updated the Worker Agent Role Prompt to require the context bundle first, maintain a short context plan that preserves canonical `CONTEXT.md`, `ROADMAP.md`, and relevant ADR/doc reads, avoid rereading unchanged files, prefer `rg`/`find` narrowing and narrow read ranges, use safe CLI fallback only when extension tools are unavailable, and summarize efficiency-budget overruns in the Workpad Note handoff. | Reduces repeated reads while preserving safety. | Shipped | Repeated reads in SPOOL-58, SPOOL-62, SPOOL-65, SPOOL-60, SPOOL-33. |
 | P1 | Task sizing/briefs | Add a bootstrap/delegation convention for `likely files`, `relevant ADRs`, and `expected validation commands` in the Task Brief or structured Task Conflict Hints. | Helps agents start narrow and choose checks earlier. | Low | Agents repeatedly infer file maps with broad `find`/`rg`; Task Conflict Hints are currently often empty. |
-| P1 | Tools/extensions | Add Tasker Pi Extension tools for requirement status updates, Workpad updates, Task Link creation, and transition requests that include current Agent Run attribution and validation base commit handling. | Reduces broad CLI mutation usage and enforces Worker Agent boundaries. | Medium | Worker prompt mandates extension tools; dogfood often falls back to CLI-compatible workflows. |
-| P1 | Observability/status | Add `tasker run summary --queue TASKER --recent N` or equivalent API/tool output showing recent failures, duplicate runs, blocking UI, and per-task run history. | Faster diagnosis before spawning more work. | Low/Medium | Telemetry summary is helpful but cross-run details require multiple commands or SQL. |
+| P1 | Tools/extensions | Add Spool Pi Extension tools for requirement status updates, Workpad updates, Task Link creation, and transition requests that include current Agent Run attribution and validation base commit handling. | Reduces broad CLI mutation usage and enforces Worker Agent boundaries. | Medium | Worker prompt mandates extension tools; dogfood often falls back to CLI-compatible workflows. |
+| P1 | Observability/status | Add `spool run summary --queue SPOOL --recent N` or equivalent API/tool output showing recent failures, duplicate runs, blocking UI, and per-task run history. | Faster diagnosis before spawning more work. | Low/Medium | Telemetry summary is helpful but cross-run details require multiple commands or SQL. |
 | P2 | Workflow | Add a post-Agent-Run handoff template in Workpad Notes: summary, files changed, validation, known risks, base commit, follow-up Task candidates. | Makes retry/rework continuation cheaper. | Low | Workpad Notes are concise but vary in structure and do not always expose continuation state uniformly. |
-| P2 | Telemetry | Capture elapsed time by phase where possible: setup, initial context loading, editing, validation, Tasker mutation, integration wait. | Separates agent reasoning cost from cargo/git/lock wait. | Medium/High | Lifecycle summary distinguishes high-level phases but not within-run causes. |
-| P2 | Monitor/status | Highlight recovered failures separately from active attention, with links to the later successful Agent Run and Task state. | Prevents operators/agents from chasing stale failures. | Low | TASKER-65 implemented part of this after monitor surfaced recovered failures. |
+| P2 | Telemetry | Capture elapsed time by phase where possible: setup, initial context loading, editing, validation, Spool mutation, integration wait. | Separates agent reasoning cost from cargo/git/lock wait. | Medium/High | Lifecycle summary distinguishes high-level phases but not within-run causes. |
+| P2 | Monitor/status | Highlight recovered failures separately from active attention, with links to the later successful Agent Run and Task state. | Prevents operators/agents from chasing stale failures. | Low | SPOOL-65 implemented part of this after monitor surfaced recovered failures. |
 | P3 | Larger post-Dogfooding work | Explore local-only aggregate efficiency reports over Audit Events, Agent Runs, Integration Outcomes, and launcher artifacts. | Helps long-term tuning without external telemetry. | Medium/High | Current summaries are useful but still young and sparse. |
 
 ## Suggested follow-up Task candidates
@@ -104,7 +104,7 @@ The gap is expected for a young local-first system, but it means future efficien
    - Validation idea: documentation-only check confirms terms match `CONTEXT.md` and no Workpad Markdown is described as authoritative gate state.
 
 4. **Populate Task Conflict Hints during bootstrap/delegation**
-   - Acceptance idea: bootstrap Task files can include likely paths/areas and `task show` surfaces them prominently for Worker Agents.
+   - Acceptance idea: bootstrap Task files can include likely paths/areas and `spool task show` surfaces them prominently for Worker Agents.
    - Validation idea: bootstrap parsing test and task-show snapshot verify hints remain advisory and do not block scheduling.
 
 5. **Pre-claim Managed Source Repository cleanliness check in supervisor output**
@@ -113,36 +113,36 @@ The gap is expected for a young local-first system, but it means future efficien
 
 ## Token and context telemetry spike update
 
-Local pi Run Transcripts do expose exact provider-style usage signals in JSONL stdout events. Recent sampled transcripts include `message.usage.input`, `message.usage.output`, `message.usage.totalTokens`, `message.usage.cacheRead`, and `message.usage.cacheWrite`, with the same fields repeated in streaming `assistantMessageEvent.partial.usage` payloads. Tasker now parses these fields, stores normalized input/output/total/cache-read/cache-write tokens, and treats the maximum observed `totalTokens` as the best available per-run context pressure signal. Raw prompt, transcript, and tool argument bodies remain in local Run Transcript artifacts only; human and JSON telemetry output expose numeric summaries rather than raw bodies.
+Local pi Run Transcripts do expose exact provider-style usage signals in JSONL stdout events. Recent sampled transcripts include `message.usage.input`, `message.usage.output`, `message.usage.totalTokens`, `message.usage.cacheRead`, and `message.usage.cacheWrite`, with the same fields repeated in streaming `assistantMessageEvent.partial.usage` payloads. Spool now parses these fields, stores normalized input/output/total/cache-read/cache-write tokens, and treats the maximum observed `totalTokens` as the best available per-run context pressure signal. Raw prompt, transcript, and tool argument bodies remain in local Run Transcript artifacts only; human and JSON telemetry output expose numeric summaries rather than raw bodies.
 
 Exact metrics currently available from local artifacts:
 
 - Input tokens, output tokens, total tokens, cache-read tokens, and cache-write tokens from pi usage events.
 - Maximum observed context pressure from `totalTokens` or explicit context-token fields when present.
 - Tool-call count, tool-error count, repeated failed tool attempts, assistant/user turn counts, blocking UI signals, Run Transcript byte size, and JSONL event count.
-- Per-tool call counts for safe tool names, repeated file-read counts by path within one Agent Run, repeated Tasker context fetch counts, and shell command category counts for Tasker CLI, cargo, git, search, and other commands.
+- Per-tool call counts for safe tool names, repeated file-read counts by path within one Agent Run, repeated Spool context fetch counts, and shell command category counts for Spool CLI, cargo, git, search, and other commands.
 
 Metrics still unavailable or approximate:
 
 - Provider context-window size / maximum possible context tokens is not present in sampled pi artifacts.
-- Shell output volume remains approximate through Run Transcript byte size and safe command categories; Tasker does not persist raw command output or tool argument payloads as metrics.
+- Shell output volume remains approximate through Run Transcript byte size and safe command categories; Spool does not persist raw command output or tool argument payloads as metrics.
 - Existing Agent Runs may need a metrics refresh path before old rows show newly parsed token/cache/tool-efficiency fields.
 
-Near-term dogfooding can continue, but broadening dogfooding should use the first-class proxy metrics to identify repeated file reads, repeated Tasker context fetches, broad shell/CLI inspection, duplicate Agent Runs, and local-state setup failures. Exact token telemetry and safe per-tool summaries now make these hypotheses testable on new Agent Runs.
+Near-term dogfooding can continue, but broadening dogfooding should use the first-class proxy metrics to identify repeated file reads, repeated Spool context fetches, broad shell/CLI inspection, duplicate Agent Runs, and local-state setup failures. Exact token telemetry and safe per-tool summaries now make these hypotheses testable on new Agent Runs.
 
 ## Dogfood efficiency budget defaults
 
-Tasker surfaces local dogfood efficiency budget warnings in `tasker telemetry summary` and `tasker run show` so regressions are visible without inspecting raw Run Transcripts. These thresholds are dogfooding tuning defaults, not permanent product policy: operators should adjust them as Tasker improves and new baselines emerge.
+Spool surfaces local dogfood efficiency budget warnings in `spool telemetry summary` and `spool run show` so regressions are visible without inspecting raw Run Transcripts. These thresholds are dogfooding tuning defaults, not permanent product policy: operators should adjust them as Spool improves and new baselines emerge.
 
-Current defaults flag warning/severe overruns at 150/250 tool calls, 80k/100k total tokens, 80k/100k max context tokens, 100 MiB/200 MiB Run Transcript byte size, 1/10 repeated file reads, 1/5 repeated Tasker context fetches, and 1h/2h run duration. Missing token and context metrics are reported as unknown rather than passing or failing as zero, and token budget output labels exact token metrics separately from proxy-only runs.
+Current defaults flag warning/severe overruns at 150/250 tool calls, 80k/100k total tokens, 80k/100k max context tokens, 100 MiB/200 MiB Run Transcript byte size, 1/10 repeated file reads, 1/5 repeated Spool context fetches, and 1h/2h run duration. Missing token and context metrics are reported as unknown rather than passing or failing as zero, and token budget output labels exact token metrics separately from proxy-only runs.
 
-Operators can keep those fixed defaults or opt `tasker telemetry summary` into an adaptive local baseline with `--efficiency-budget adaptive` or `[telemetry] efficiency_budget = "adaptive"` in config. Adaptive budgets derive warning/severe thresholds only from sanitized numeric Agent Run metrics over the recent local window: tool calls, total tokens, max context tokens, Run Transcript byte size, repeated file reads, repeated Tasker context fetches, and run duration. CLI output prints the active source, window size, minimum coverage, and each metric threshold. Metrics with missing or sparse coverage fall back to the fixed defaults with an explicit note. Adaptive budgets are dogfooding tuning aids only; they are not product policy, billing metrics, or external telemetry, and raw transcripts, prompts, tool arguments, and file contents remain local-only artifacts.
+Operators can keep those fixed defaults or opt `spool telemetry summary` into an adaptive local baseline with `--efficiency-budget adaptive` or `[telemetry] efficiency_budget = "adaptive"` in config. Adaptive budgets derive warning/severe thresholds only from sanitized numeric Agent Run metrics over the recent local window: tool calls, total tokens, max context tokens, Run Transcript byte size, repeated file reads, repeated Spool context fetches, and run duration. CLI output prints the active source, window size, minimum coverage, and each metric threshold. Metrics with missing or sparse coverage fall back to the fixed defaults with an explicit note. Adaptive budgets are dogfooding tuning aids only; they are not product policy, billing metrics, or external telemetry, and raw transcripts, prompts, tool arguments, and file contents remain local-only artifacts.
 
 ## Guidance for near-term dogfooding
 
 - Prefer small implementation Tasks with explicit relevant ADRs, likely files, and validation commands.
 - Treat Workpad Notes as handoff summaries, not authoritative requirement state; keep structured Acceptance Criteria and Validation Items current.
-- At Worker Agent run start, prefer `tasker_get_task_context_bundle` over repeated `task show`, `queue show`, status, or Agent Run lookups. Continue using `tasker telemetry summary`, `tasker telemetry lifecycle`, `tasker telemetry trend --queue TASKER --landing-task <TASK>`, `tasker run show`, and `.tasker/data/runs/<id>/pi.jsonl` as local Operator/debug evidence sources until narrower extension/API equivalents exist. Use `telemetry trend` to compare bounded before/after Agent Run windows around dogfood landing Tasks or timestamps without exposing raw transcripts, prompts, command output, or secrets.
+- At Worker Agent run start, prefer `spool_get_task_context_bundle` over repeated `spool task show`, `spool queue show`, `spool status`, or Agent Run lookups. Continue using `spool telemetry summary`, `spool telemetry lifecycle`, `spool telemetry trend --queue SPOOL --landing-task <TASK>`, `spool run show`, and `.spool/data/runs/<id>/pi.jsonl` as local Operator/debug evidence sources until narrower extension/API equivalents exist. Use `telemetry trend` to compare bounded before/after Agent Run windows around dogfood landing Tasks or timestamps without exposing raw transcripts, prompts, command output, or secrets.
 - Prioritize reducing duplicate Agent Runs and local-state setup failures before optimizing model-level behavior; the current evidence shows workflow waste is more measurable than token/context waste.
 - Keep all telemetry local by default and derive Workflow Metrics from Audit Events, Agent Runs, Launcher Session Data, and Integration Outcomes.
 
@@ -150,5 +150,5 @@ Operators can keep those fixed defaults or opt `tasker telemetry summary` into a
 
 - Only recent runs have normalized Agent Run efficiency metrics; older evidence is transcript-derived and may undercount or overcount if event formats changed.
 - Transcript files can be very large and contain prompt/tool content, so strategy documents should cite paths and summaries rather than embedding raw bodies.
-- Earlier Tasker metrics did not parse pi's camelCase usage fields, so older database rows may still show unknown token/cache values until their metrics are refreshed or new Agent Runs finish.
+- Earlier Spool metrics did not parse pi's camelCase usage fields, so older database rows may still show unknown token/cache values until their metrics are refreshed or new Agent Runs finish.
 - Some duplicate Agent Runs were caused by known dogfooding transitions and may not recur after recent supervisor, monitor, and integration fixes.

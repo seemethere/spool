@@ -14,11 +14,11 @@ Integration Outcomes store a structured `reason_code` alongside the existing hum
 - `auto_refresh_declined_missing_validation` — deterministic refresh was declined because no validation command source was available.
 - `task_branch_missing_main` — the Task Branch did not include current Main Branch and no current Validated Base Commit allowed integration.
 - `dirty_managed_source_repository` — the Managed Source Repository had unexpected uncommitted changes.
-- `repo_operation_lock_held` — a Git or Tasker Managed Source Repository operation lock blocked delivery.
+- `repo_operation_lock_held` — a Git or Spool Managed Source Repository operation lock blocked delivery.
 - `merge_conflict` — squash merge failed and the Task should return to Rework.
 - `cleanup_failure` — integration/no-change completion succeeded but Local Worktree or Task Branch cleanup needs operator repair.
 - `unknown_operational_failure` — retryable or operator-facing delivery failure without a more specific operational classification.
 - `unknown_work_change_failure` — work-change failure without a more specific classification.
 - `unknown_legacy` — older Integration Outcome row without a stored reason code.
 
-For deterministic auto-refresh of a stale Validated Base Commit, the current Local Worktree Delivery validation command source is `.tasker/validation-commands.txt` in the Managed Source Repository. Blank lines and `#` comments are ignored; each remaining line is run from the Local Worktree after the Task Branch is rebased onto current Main Branch.
+For deterministic auto-refresh of a stale Validated Base Commit, the current Local Worktree Delivery validation command source is `.spool/validation-commands.txt` in the Managed Source Repository. Blank lines and `#` comments are ignored; each remaining line is run from the Local Worktree after the Task Branch is rebased onto current Main Branch.
