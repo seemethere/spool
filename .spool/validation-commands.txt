@@ -1,0 +1,5 @@
+# Validation commands for deterministic Local Worktree Delivery auto-refresh.
+# Blank lines and comments are ignored.
+cargo test -p spool-db
+cargo test -p spool-cli telemetry
+cargo test -p spool-db check_migration_compatibility

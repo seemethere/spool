@@ -882,7 +882,7 @@ pub async fn get_task_context_bundle(
             agent_run_metrics.tool_error_count,
             agent_run_metrics.repeated_failed_tool_attempt_count,
             agent_run_metrics.repeated_read_count,
-            agent_run_metrics.repeated_tasker_context_fetch_count,
+            agent_run_metrics.repeated_spool_context_fetch_count,
             agent_run_metrics.total_tokens,
             agent_run_metrics.max_context_tokens,
             agent_run_metrics.efficiency_hints_json

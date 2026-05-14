@@ -120,7 +120,7 @@ pub async fn get_agent_run_metrics(
                transcript_byte_size, transcript_jsonl_event_count, input_tokens, output_tokens,
                total_tokens, cache_read_tokens, cache_write_tokens, tool_call_count, tool_error_count,
                repeated_failed_tool_attempt_count, tool_call_counts_json, repeated_read_count,
-               repeated_tasker_context_fetch_count, shell_command_counts_json,
+               repeated_spool_context_fetch_count, shell_command_counts_json,
                assistant_turn_count, user_turn_count, max_context_tokens, efficiency_hints_json,
                warnings_json, created_at, updated_at
         FROM agent_run_metrics
@@ -200,7 +200,7 @@ pub async fn compute_agent_run_metrics(
         repeated_failed_tool_attempt_count: summary.repeated_failed_tool_attempt_count,
         tool_call_counts_json,
         repeated_read_count: summary.repeated_read_count,
-        repeated_tasker_context_fetch_count: summary.repeated_tasker_context_fetch_count,
+        repeated_spool_context_fetch_count: summary.repeated_spool_context_fetch_count,
         shell_command_counts_json,
         assistant_turn_count: summary.assistant_turn_count,
         user_turn_count: summary.user_turn_count,
@@ -225,7 +225,7 @@ pub async fn refresh_agent_run_metrics(
             transcript_byte_size, transcript_jsonl_event_count, input_tokens, output_tokens,
             total_tokens, cache_read_tokens, cache_write_tokens, tool_call_count, tool_error_count,
             repeated_failed_tool_attempt_count, tool_call_counts_json, repeated_read_count,
-            repeated_tasker_context_fetch_count, shell_command_counts_json,
+            repeated_spool_context_fetch_count, shell_command_counts_json,
             assistant_turn_count, user_turn_count, max_context_tokens, efficiency_hints_json, warnings_json
         )
         SELECT
@@ -255,7 +255,7 @@ pub async fn refresh_agent_run_metrics(
             repeated_failed_tool_attempt_count = excluded.repeated_failed_tool_attempt_count,
             tool_call_counts_json = excluded.tool_call_counts_json,
             repeated_read_count = excluded.repeated_read_count,
-            repeated_tasker_context_fetch_count = excluded.repeated_tasker_context_fetch_count,
+            repeated_spool_context_fetch_count = excluded.repeated_spool_context_fetch_count,
             shell_command_counts_json = excluded.shell_command_counts_json,
             assistant_turn_count = excluded.assistant_turn_count,
             user_turn_count = excluded.user_turn_count,
@@ -286,7 +286,7 @@ pub async fn refresh_agent_run_metrics(
     .bind(metrics.repeated_failed_tool_attempt_count)
     .bind(&metrics.tool_call_counts_json)
     .bind(metrics.repeated_read_count)
-    .bind(metrics.repeated_tasker_context_fetch_count)
+    .bind(metrics.repeated_spool_context_fetch_count)
     .bind(&metrics.shell_command_counts_json)
     .bind(metrics.assistant_turn_count)
     .bind(metrics.user_turn_count)
@@ -321,7 +321,7 @@ struct AgentRunMetricsSummary {
     repeated_failed_tool_attempt_count: Option<i64>,
     tool_call_counts: std::collections::BTreeMap<String, i64>,
     repeated_read_count: Option<i64>,
-    repeated_tasker_context_fetch_count: Option<i64>,
+    repeated_spool_context_fetch_count: Option<i64>,
     shell_command_counts: std::collections::BTreeMap<String, i64>,
     read_paths: std::collections::HashMap<String, i64>,
     spool_context_fetch_signatures: std::collections::HashMap<String, i64>,
@@ -670,8 +670,8 @@ impl AgentRunMetricsSummary {
                         .or_insert(0);
                     *count += 1;
                     if *count > 1 {
-                        self.repeated_tasker_context_fetch_count =
-                            Some(self.repeated_tasker_context_fetch_count.unwrap_or(0) + 1);
+                        self.repeated_spool_context_fetch_count =
+                            Some(self.repeated_spool_context_fetch_count.unwrap_or(0) + 1);
                     }
                 }
                 return true;
@@ -684,8 +684,8 @@ impl AgentRunMetricsSummary {
                 .or_insert(0);
             *count += 1;
             if *count > 1 {
-                self.repeated_tasker_context_fetch_count =
-                    Some(self.repeated_tasker_context_fetch_count.unwrap_or(0) + 1);
+                self.repeated_spool_context_fetch_count =
+                    Some(self.repeated_spool_context_fetch_count.unwrap_or(0) + 1);
             }
             return true;
         }
@@ -713,7 +713,7 @@ impl AgentRunMetricsSummary {
         if self.repeated_read_count.unwrap_or(0) > 0 {
             hints.push("repeated file reads".to_string());
         }
-        if self.repeated_tasker_context_fetch_count.unwrap_or(0) > 0 {
+        if self.repeated_spool_context_fetch_count.unwrap_or(0) > 0 {
             hints.push("repeated Spool context fetches".to_string());
         }
         if self.transcript_byte_size.unwrap_or(0) >= 10_000_000 {
@@ -838,7 +838,7 @@ fn shell_command_category(command: &str) -> &'static str {
                 && window[3] == "spool-cli"
         })
     {
-        "tasker_cli"
+        "spool_cli"
     } else if has_shell_invocation(&tokens, &["cargo"])
         || tokens
             .iter()
@@ -1117,7 +1117,7 @@ mod shell_command_category_tests {
     #[test]
     fn classifies_common_dogfood_shell_commands_without_raw_command_storage() {
         let cases = [
-            ("bin/spool-local task show TASKER-86", "tasker_cli"),
+            ("bin/spool-local task show TASKER-86", "spool_cli"),
             (
                 "cargo test -p spool-db agent_run_metrics",
                 "cargo_build_test",

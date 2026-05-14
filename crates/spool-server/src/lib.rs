@@ -1723,7 +1723,7 @@ mod tests {
                 agent_run_id, derivation_version, duration_ms, launcher_kind, final_status,
                 total_tokens, tool_call_count, tool_error_count,
                 repeated_failed_tool_attempt_count, repeated_read_count,
-                repeated_tasker_context_fetch_count, max_context_tokens, efficiency_hints_json
+                repeated_spool_context_fetch_count, max_context_tokens, efficiency_hints_json
             ) VALUES (?, 1, 1200, 'pi', 'running', 42, 7, 0, 0, 1, 0, 1000, '["repeated file reads"]')
             ON CONFLICT(agent_run_id) DO UPDATE SET
                 derivation_version = excluded.derivation_version,
@@ -1734,7 +1734,7 @@ mod tests {
                 tool_error_count = excluded.tool_error_count,
                 repeated_failed_tool_attempt_count = excluded.repeated_failed_tool_attempt_count,
                 repeated_read_count = excluded.repeated_read_count,
-                repeated_tasker_context_fetch_count = excluded.repeated_tasker_context_fetch_count,
+                repeated_spool_context_fetch_count = excluded.repeated_spool_context_fetch_count,
                 max_context_tokens = excluded.max_context_tokens,
                 efficiency_hints_json = excluded.efficiency_hints_json
             "#,
@@ -1822,7 +1822,7 @@ mod tests {
         assert_eq!(json["agent_runs"][0]["tool_call_count"], 7);
         assert_eq!(json["agent_runs"][0]["repeated_read_count"], 1);
         assert_eq!(
-            json["agent_runs"][0]["repeated_tasker_context_fetch_count"],
+            json["agent_runs"][0]["repeated_spool_context_fetch_count"],
             0
         );
         assert_eq!(json["agent_runs"][0]["total_tokens"], 42);

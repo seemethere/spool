@@ -26,13 +26,42 @@ async fn migrations_are_idempotent() {
     run_migrations(&pool).await.expect("first migrate");
     run_migrations(&pool).await.expect("second migrate");
 
-    let row = sqlx::query("select value from tasker_metadata where key = 'schema_version'")
+    let row = sqlx::query("select value from spool_metadata where key = 'schema_version'")
         .fetch_one(&pool)
         .await
         .expect("metadata row");
     let value: String = row.get("value");
 
     assert_eq!(value, "1");
+
+    let legacy_table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'tasker_metadata'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("legacy metadata table lookup");
+    assert_eq!(legacy_table_count, 0);
+}
+
+#[tokio::test]
+async fn spool_rename_migration_updates_metadata_and_metric_schema() {
+    let (_temp, pool) = migrated_pool().await;
+
+    let metadata_table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'spool_metadata'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("spool metadata table lookup");
+    assert_eq!(metadata_table_count, 1);
+
+    let metric_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('agent_run_metrics') WHERE name LIKE 'repeated_%_context_fetch_count' ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("metric columns");
+    assert_eq!(metric_columns, vec!["repeated_spool_context_fetch_count"]);
 }
 
 #[tokio::test]
@@ -2894,7 +2923,7 @@ async fn persists_agent_run_metrics_for_pi_launcher_outcome() {
     assert_eq!(metrics.tool_error_count, Some(2));
     assert_eq!(metrics.repeated_failed_tool_attempt_count, Some(1));
     assert_eq!(metrics.repeated_read_count, Some(2));
-    assert_eq!(metrics.repeated_tasker_context_fetch_count, Some(2));
+    assert_eq!(metrics.repeated_spool_context_fetch_count, Some(2));
     let tool_counts: std::collections::BTreeMap<String, i64> =
         serde_json::from_str(&metrics.tool_call_counts_json).expect("tool counts");
     assert_eq!(tool_counts.get("read"), Some(&4));
@@ -2904,7 +2933,7 @@ async fn persists_agent_run_metrics_for_pi_launcher_outcome() {
     assert_eq!(tool_counts.get("tasker.get_task_context"), Some(&1));
     let shell_counts: std::collections::BTreeMap<String, i64> =
         serde_json::from_str(&metrics.shell_command_counts_json).expect("shell counts");
-    assert_eq!(shell_counts.get("tasker_cli"), Some(&4));
+    assert_eq!(shell_counts.get("spool_cli"), Some(&4));
     assert_eq!(shell_counts.get("cargo_build_test"), Some(&1));
     assert_eq!(shell_counts.get("git"), Some(&1));
     assert_eq!(shell_counts.get("search"), Some(&1));

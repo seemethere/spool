@@ -39,7 +39,7 @@ beforeEach(() => {
             duration_ms: 1000,
             tool_call_count: 4,
             repeated_read_count: 0,
-            repeated_tasker_context_fetch_count: 0,
+            repeated_spool_context_fetch_count: 0,
             total_tokens: 100,
             max_context_tokens: 200,
             efficiency_hints_json: "[]",

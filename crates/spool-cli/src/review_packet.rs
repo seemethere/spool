@@ -553,7 +553,7 @@ mod tests {
                 tool_error_count: Some(0),
                 repeated_failed_tool_attempt_count: Some(0),
                 repeated_read_count: Some(1),
-                repeated_tasker_context_fetch_count: Some(1),
+                repeated_spool_context_fetch_count: Some(1),
                 total_tokens: Some(1000),
                 max_context_tokens: Some(5000),
                 efficiency_hints_json: None,

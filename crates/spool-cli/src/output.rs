@@ -621,12 +621,12 @@ pub fn write_run_detail(mut writer: impl Write, detail: &spool_db::AgentRunDetai
         {
             writeln!(
                 writer,
-                "  efficiency: tool_calls={} tool_errors={} repeated_failed_tools={} repeated_reads={} repeated_tasker_context_fetches={} assistant_turns={} user_turns={} max_context_tokens={}",
+                "  efficiency: tool_calls={} tool_errors={} repeated_failed_tools={} repeated_reads={} repeated_spool_context_fetches={} assistant_turns={} user_turns={} max_context_tokens={}",
                 metrics.tool_call_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
                 metrics.tool_error_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
                 metrics.repeated_failed_tool_attempt_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
                 metrics.repeated_read_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
-                metrics.repeated_tasker_context_fetch_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                metrics.repeated_spool_context_fetch_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
                 metrics.assistant_turn_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
                 metrics.user_turn_count.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
                 metrics.max_context_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string())
@@ -671,7 +671,7 @@ fn budget_status_for_metrics(metrics: &spool_db::AgentRunMetrics) -> EfficiencyB
         max_context_tokens: metrics.max_context_tokens,
         transcript_byte_size: metrics.transcript_byte_size,
         repeated_read_count: metrics.repeated_read_count,
-        repeated_tasker_context_fetch_count: metrics.repeated_tasker_context_fetch_count,
+        repeated_spool_context_fetch_count: metrics.repeated_spool_context_fetch_count,
         duration_seconds: metrics.duration_ms.map(|ms| ms / 1000),
         has_proxy_metrics: metrics.tool_call_count.is_some()
             || metrics.transcript_byte_size.is_some()
@@ -986,7 +986,7 @@ mod tests {
             repeated_failed_tool_attempt_count: Some(0),
             tool_call_counts_json: "{}".to_string(),
             repeated_read_count: Some(1),
-            repeated_tasker_context_fetch_count: Some(0),
+            repeated_spool_context_fetch_count: Some(0),
             shell_command_counts_json: "{}".to_string(),
             assistant_turn_count: Some(1),
             user_turn_count: Some(1),

@@ -163,8 +163,8 @@ const REPEATED_READ_BUDGET: EfficiencyBudgetThreshold = EfficiencyBudgetThreshol
     warning: 1,
     severe: 10,
 };
-const REPEATED_TASKER_CONTEXT_BUDGET: EfficiencyBudgetThreshold = EfficiencyBudgetThreshold {
-    metric: "repeated_tasker_context_fetches",
+const REPEATED_SPOOL_CONTEXT_BUDGET: EfficiencyBudgetThreshold = EfficiencyBudgetThreshold {
+    metric: "repeated_spool_context_fetches",
     warning: 1,
     severe: 5,
 };
@@ -197,7 +197,7 @@ const WORKFLOW_REGRESSION_THRESHOLDS: [WorkflowRegressionThreshold; 6] = [
         minimum_delta: 1,
     },
     WorkflowRegressionThreshold {
-        metric: "repeated_tasker_context_fetches",
+        metric: "repeated_spool_context_fetches",
         minimum_delta: 1,
     },
     WorkflowRegressionThreshold {
@@ -217,7 +217,7 @@ pub struct EfficiencyBudgetThresholdSet {
     max_context_tokens: EfficiencyBudgetThreshold,
     transcript_bytes: EfficiencyBudgetThreshold,
     repeated_reads: EfficiencyBudgetThreshold,
-    repeated_tasker_context_fetches: EfficiencyBudgetThreshold,
+    repeated_spool_context_fetches: EfficiencyBudgetThreshold,
     duration_seconds: EfficiencyBudgetThreshold,
 }
 
@@ -228,7 +228,7 @@ fn fixed_budget_thresholds() -> EfficiencyBudgetThresholdSet {
         max_context_tokens: MAX_CONTEXT_BUDGET,
         transcript_bytes: TRANSCRIPT_BYTE_BUDGET,
         repeated_reads: REPEATED_READ_BUDGET,
-        repeated_tasker_context_fetches: REPEATED_TASKER_CONTEXT_BUDGET,
+        repeated_spool_context_fetches: REPEATED_SPOOL_CONTEXT_BUDGET,
         duration_seconds: RUN_DURATION_BUDGET,
     }
 }
@@ -240,7 +240,7 @@ pub struct EfficiencyBudgetInput {
     pub max_context_tokens: Option<i64>,
     pub transcript_byte_size: Option<i64>,
     pub repeated_read_count: Option<i64>,
-    pub repeated_tasker_context_fetch_count: Option<i64>,
+    pub repeated_spool_context_fetch_count: Option<i64>,
     pub duration_seconds: Option<i64>,
     pub has_proxy_metrics: bool,
 }
@@ -305,8 +305,8 @@ pub fn evaluate_efficiency_budget_with_thresholds(
     );
     push_budget(
         &mut status.warnings,
-        thresholds.repeated_tasker_context_fetches,
-        input.repeated_tasker_context_fetch_count,
+        thresholds.repeated_spool_context_fetches,
+        input.repeated_spool_context_fetch_count,
         None,
     );
     push_budget(
@@ -399,7 +399,7 @@ pub struct TelemetryRun {
     pub repeated_failed_tool_attempt_count: Option<i64>,
     pub tool_call_counts: BTreeMap<String, i64>,
     pub repeated_read_count: Option<i64>,
-    pub repeated_tasker_context_fetch_count: Option<i64>,
+    pub repeated_spool_context_fetch_count: Option<i64>,
     pub shell_command_counts: BTreeMap<String, i64>,
     pub assistant_turn_count: Option<i64>,
     pub user_turn_count: Option<i64>,
@@ -428,7 +428,7 @@ pub struct EfficiencyTelemetrySummary {
     pub total_repeated_failed_tool_attempts: i64,
     pub tool_call_counts: BTreeMap<String, i64>,
     pub total_repeated_reads: i64,
-    pub total_repeated_tasker_context_fetches: i64,
+    pub total_repeated_spool_context_fetches: i64,
     pub shell_command_counts: BTreeMap<String, i64>,
     pub top_shell_command_categories: Vec<CountSummary>,
     pub total_assistant_turns: i64,
@@ -460,7 +460,7 @@ struct TelemetryRunRow {
     repeated_failed_tool_attempt_count: Option<i64>,
     tool_call_counts_json: Option<String>,
     repeated_read_count: Option<i64>,
-    repeated_tasker_context_fetch_count: Option<i64>,
+    repeated_spool_context_fetch_count: Option<i64>,
     shell_command_counts_json: Option<String>,
     assistant_turn_count: Option<i64>,
     user_turn_count: Option<i64>,
@@ -656,8 +656,8 @@ fn metrics_changed(
             != computed.repeated_failed_tool_attempt_count
         || existing.tool_call_counts_json != computed.tool_call_counts_json
         || existing.repeated_read_count != computed.repeated_read_count
-        || existing.repeated_tasker_context_fetch_count
-            != computed.repeated_tasker_context_fetch_count
+        || existing.repeated_spool_context_fetch_count
+            != computed.repeated_spool_context_fetch_count
         || existing.shell_command_counts_json != computed.shell_command_counts_json
         || existing.assistant_turn_count != computed.assistant_turn_count
         || existing.user_turn_count != computed.user_turn_count
@@ -775,7 +775,7 @@ pub async fn summarize_agent_runs(
             agent_run_metrics.repeated_failed_tool_attempt_count AS repeated_failed_tool_attempt_count,
             agent_run_metrics.tool_call_counts_json AS tool_call_counts_json,
             agent_run_metrics.repeated_read_count AS repeated_read_count,
-            agent_run_metrics.repeated_tasker_context_fetch_count AS repeated_tasker_context_fetch_count,
+            agent_run_metrics.repeated_spool_context_fetch_count AS repeated_spool_context_fetch_count,
             agent_run_metrics.shell_command_counts_json AS shell_command_counts_json,
             agent_run_metrics.assistant_turn_count AS assistant_turn_count,
             agent_run_metrics.user_turn_count AS user_turn_count,
@@ -949,7 +949,7 @@ fn run_from_row(row: &TelemetryRunRow, thresholds: EfficiencyBudgetThresholdSet)
         repeated_failed_tool_attempt_count: row.repeated_failed_tool_attempt_count,
         tool_call_counts: json_counts(row.tool_call_counts_json.as_deref()),
         repeated_read_count: row.repeated_read_count,
-        repeated_tasker_context_fetch_count: row.repeated_tasker_context_fetch_count,
+        repeated_spool_context_fetch_count: row.repeated_spool_context_fetch_count,
         shell_command_counts: json_counts(row.shell_command_counts_json.as_deref()),
         assistant_turn_count: row.assistant_turn_count,
         user_turn_count: row.user_turn_count,
@@ -976,7 +976,7 @@ fn budget_status_for_row(
             max_context_tokens: row.max_context_tokens,
             transcript_byte_size: row.transcript_byte_size,
             repeated_read_count: row.repeated_read_count,
-            repeated_tasker_context_fetch_count: row.repeated_tasker_context_fetch_count,
+            repeated_spool_context_fetch_count: row.repeated_spool_context_fetch_count,
             duration_seconds: row.duration_seconds,
             has_proxy_metrics: row.tool_call_count.is_some()
                 || row.transcript_byte_size.is_some()
@@ -1063,9 +1063,9 @@ fn active_efficiency_budget(
         min_metric_coverage,
         &mut threshold_summaries,
     );
-    threshold_set.repeated_tasker_context_fetches = adaptive_threshold(
-        REPEATED_TASKER_CONTEXT_BUDGET,
-        values_for(&recent, |row| row.repeated_tasker_context_fetch_count),
+    threshold_set.repeated_spool_context_fetches = adaptive_threshold(
+        REPEATED_SPOOL_CONTEXT_BUDGET,
+        values_for(&recent, |row| row.repeated_spool_context_fetch_count),
         min_metric_coverage,
         &mut threshold_summaries,
     );
@@ -1110,7 +1110,7 @@ fn row_has_any_budget_metric(row: &TelemetryRunRow) -> bool {
         || row.max_context_tokens.is_some()
         || row.transcript_byte_size.is_some()
         || row.repeated_read_count.is_some()
-        || row.repeated_tasker_context_fetch_count.is_some()
+        || row.repeated_spool_context_fetch_count.is_some()
         || row.duration_seconds.is_some()
 }
 
@@ -1177,7 +1177,7 @@ fn budget_summary(
         thresholds.max_context_tokens,
         thresholds.transcript_bytes,
         thresholds.repeated_reads,
-        thresholds.repeated_tasker_context_fetches,
+        thresholds.repeated_spool_context_fetches,
         thresholds.duration_seconds,
     ];
     ActiveEfficiencyBudget {
@@ -1295,7 +1295,7 @@ fn build_efficiency_summary(
         total_repeated_failed_tool_attempts: 0,
         tool_call_counts: BTreeMap::new(),
         total_repeated_reads: 0,
-        total_repeated_tasker_context_fetches: 0,
+        total_repeated_spool_context_fetches: 0,
         shell_command_counts: BTreeMap::new(),
         top_shell_command_categories: Vec::new(),
         total_assistant_turns: 0,
@@ -1320,7 +1320,7 @@ fn build_efficiency_summary(
             || row.cache_write_tokens.is_some()
             || row.max_context_tokens.is_some()
             || row.repeated_read_count.is_some()
-            || row.repeated_tasker_context_fetch_count.is_some()
+            || row.repeated_spool_context_fetch_count.is_some()
             || row.tool_call_counts_json.is_some()
             || row.shell_command_counts_json.is_some();
         if has_metrics {
@@ -1335,8 +1335,8 @@ fn build_efficiency_summary(
             json_counts(row.tool_call_counts_json.as_deref()),
         );
         summary.total_repeated_reads += row.repeated_read_count.unwrap_or(0);
-        summary.total_repeated_tasker_context_fetches +=
-            row.repeated_tasker_context_fetch_count.unwrap_or(0);
+        summary.total_repeated_spool_context_fetches +=
+            row.repeated_spool_context_fetch_count.unwrap_or(0);
         merge_counts(
             &mut summary.shell_command_counts,
             json_counts(row.shell_command_counts_json.as_deref()),
@@ -1374,7 +1374,7 @@ fn build_efficiency_summary(
             || row.tool_call_count.unwrap_or(0) >= 30
             || row.repeated_failed_tool_attempt_count.unwrap_or(0) > 0
             || row.repeated_read_count.unwrap_or(0) > 0
-            || row.repeated_tasker_context_fetch_count.unwrap_or(0) > 0
+            || row.repeated_spool_context_fetch_count.unwrap_or(0) > 0
         {
             summary.inefficient_runs.push(run_from_row(row, thresholds));
         }
@@ -1516,7 +1516,7 @@ pub fn render_summary(summary: &TelemetrySummary) -> String {
         summary.efficiency.total_tool_errors,
         summary.efficiency.total_repeated_failed_tool_attempts,
         summary.efficiency.total_repeated_reads,
-        summary.efficiency.total_repeated_tasker_context_fetches,
+        summary.efficiency.total_repeated_spool_context_fetches,
         summary.efficiency.total_assistant_turns,
         summary.efficiency.total_user_turns,
         summary.efficiency.max_input_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
@@ -1556,14 +1556,14 @@ pub fn render_summary(summary: &TelemetrySummary) -> String {
             let hints = run.efficiency_hints_json.as_deref().unwrap_or("[]");
             writeln!(
                 output,
-                "  {} - {}: {} tool_calls={} tool_errors={} repeated_reads={} repeated_tasker_context_fetches={} hints={} budget_warnings={}",
+                "  {} - {}: {} tool_calls={} tool_errors={} repeated_reads={} repeated_spool_context_fetches={} hints={} budget_warnings={}",
                 run.task_identifier,
                 run.task_title,
                 run.agent_run_id,
                 run.tool_call_count.unwrap_or(0),
                 run.tool_error_count.unwrap_or(0),
                 run.repeated_read_count.unwrap_or(0),
-                run.repeated_tasker_context_fetch_count.unwrap_or(0),
+                run.repeated_spool_context_fetch_count.unwrap_or(0),
                 hints,
                 render_budget_warnings(&run.budget_status)
             )
@@ -2077,7 +2077,7 @@ pub struct TrendBucket {
     pub tool_errors: i64,
     pub repeated_failed_tool_attempts: i64,
     pub repeated_reads: i64,
-    pub repeated_tasker_context_fetches: i64,
+    pub repeated_spool_context_fetches: i64,
     pub shell_command_counts: BTreeMap<String, i64>,
     pub top_shell_command_categories: Vec<CountSummary>,
     pub assistant_turns: i64,
@@ -2100,7 +2100,7 @@ pub struct TrendBucket {
 pub struct TrendDeltas {
     pub tool_calls: i64,
     pub repeated_reads: i64,
-    pub repeated_tasker_context_fetches: i64,
+    pub repeated_spool_context_fetches: i64,
     pub total_tokens: i64,
     pub max_context_tokens: Option<i64>,
     pub transcript_bytes: i64,
@@ -2136,7 +2136,7 @@ pub struct RecentEfficiencyWindow {
     pub tool_errors: MetricSummary,
     pub repeated_failed_tool_attempts: MetricSummary,
     pub repeated_reads: MetricSummary,
-    pub repeated_tasker_context_fetches: MetricSummary,
+    pub repeated_spool_context_fetches: MetricSummary,
     pub input_tokens: MetricSummary,
     pub output_tokens: MetricSummary,
     pub total_tokens: MetricSummary,
@@ -2181,7 +2181,7 @@ pub struct WorkflowRegressionFlag {
 pub struct RecentEfficiencyDeltas {
     pub tool_calls_average: Option<f64>,
     pub repeated_reads_average: Option<f64>,
-    pub repeated_tasker_context_fetches_average: Option<f64>,
+    pub repeated_spool_context_fetches_average: Option<f64>,
     pub total_tokens_average: Option<f64>,
     pub max_context_tokens_high_water: Option<i64>,
     pub transcript_bytes_average: Option<f64>,
@@ -2200,7 +2200,7 @@ pub struct RecentEfficiencyOffender {
     pub tool_error_count: Option<i64>,
     pub repeated_failed_tool_attempt_count: Option<i64>,
     pub repeated_read_count: Option<i64>,
-    pub repeated_tasker_context_fetch_count: Option<i64>,
+    pub repeated_spool_context_fetch_count: Option<i64>,
     pub total_tokens: Option<i64>,
     pub max_context_tokens: Option<i64>,
     pub transcript_byte_size: Option<i64>,
@@ -2226,7 +2226,7 @@ pub struct WorkflowMetricsSummary {
     pub tool_call_summary: WorkflowToolCallSummary,
     pub duration_summary: WorkflowDurationSummary,
     pub repeated_read_count: i64,
-    pub repeated_tasker_context_fetch_count: i64,
+    pub repeated_spool_context_fetch_count: i64,
     pub transcript_byte_summary: MetricSummary,
     pub efficiency_hint_frequencies: BTreeMap<String, i64>,
     pub regression_report: WorkflowRegressionReport,
@@ -2374,7 +2374,7 @@ async fn load_trend_runs(pool: &SqlitePool, queue: &str) -> Result<Vec<Telemetry
             agent_run_metrics.repeated_failed_tool_attempt_count AS repeated_failed_tool_attempt_count,
             agent_run_metrics.tool_call_counts_json AS tool_call_counts_json,
             agent_run_metrics.repeated_read_count AS repeated_read_count,
-            agent_run_metrics.repeated_tasker_context_fetch_count AS repeated_tasker_context_fetch_count,
+            agent_run_metrics.repeated_spool_context_fetch_count AS repeated_spool_context_fetch_count,
             agent_run_metrics.shell_command_counts_json AS shell_command_counts_json,
             agent_run_metrics.assistant_turn_count AS assistant_turn_count,
             agent_run_metrics.user_turn_count AS user_turn_count,
@@ -2437,7 +2437,7 @@ fn build_trend_bucket<'a>(
         tool_errors: 0,
         repeated_failed_tool_attempts: 0,
         repeated_reads: 0,
-        repeated_tasker_context_fetches: 0,
+        repeated_spool_context_fetches: 0,
         shell_command_counts: BTreeMap::new(),
         top_shell_command_categories: Vec::new(),
         assistant_turns: 0,
@@ -2468,8 +2468,8 @@ fn build_trend_bucket<'a>(
         bucket.tool_errors += run.tool_error_count.unwrap_or(0);
         bucket.repeated_failed_tool_attempts += run.repeated_failed_tool_attempt_count.unwrap_or(0);
         bucket.repeated_reads += run.repeated_read_count.unwrap_or(0);
-        bucket.repeated_tasker_context_fetches +=
-            run.repeated_tasker_context_fetch_count.unwrap_or(0);
+        bucket.repeated_spool_context_fetches +=
+            run.repeated_spool_context_fetch_count.unwrap_or(0);
         merge_counts(
             &mut shell_command_counts,
             json_counts(run.shell_command_counts_json.as_deref()),
@@ -2514,8 +2514,8 @@ fn trend_deltas(before: &TrendBucket, after: &TrendBucket) -> TrendDeltas {
     TrendDeltas {
         tool_calls: after.tool_calls - before.tool_calls,
         repeated_reads: after.repeated_reads - before.repeated_reads,
-        repeated_tasker_context_fetches: after.repeated_tasker_context_fetches
-            - before.repeated_tasker_context_fetches,
+        repeated_spool_context_fetches: after.repeated_spool_context_fetches
+            - before.repeated_spool_context_fetches,
         total_tokens: after.total_tokens - before.total_tokens,
         max_context_tokens: match (before.max_context_tokens, after.max_context_tokens) {
             (Some(before), Some(after)) => Some(after - before),
@@ -2544,7 +2544,7 @@ fn trend_conclusions(
         trend_direction("repeated reads", deltas.repeated_reads),
         trend_direction(
             "repeated Spool context fetches",
-            deltas.repeated_tasker_context_fetches,
+            deltas.repeated_spool_context_fetches,
         ),
         trend_direction("token totals", deltas.total_tokens),
         match deltas.max_context_tokens {
@@ -2617,10 +2617,10 @@ pub fn render_trend_summary(summary: &TrendSummary) -> String {
         write_trend_bucket(&mut output, "after", &landing.after);
         writeln!(
             output,
-            "  deltas: tool_calls={} repeated_reads={} repeated_tasker_context_fetches={} total_tokens={} max_context={} transcript_bytes={} avg_duration={} duplicate_waste={}",
+            "  deltas: tool_calls={} repeated_reads={} repeated_spool_context_fetches={} total_tokens={} max_context={} transcript_bytes={} avg_duration={} duplicate_waste={}",
             landing.deltas.tool_calls,
             landing.deltas.repeated_reads,
-            landing.deltas.repeated_tasker_context_fetches,
+            landing.deltas.repeated_spool_context_fetches,
             landing.deltas.total_tokens,
             landing.deltas.max_context_tokens.map(|value| value.to_string()).unwrap_or_else(|| "unknown".to_string()),
             landing.deltas.transcript_bytes,
@@ -2654,7 +2654,7 @@ fn write_trend_bucket(output: &mut String, label: &str, bucket: &TrendBucket) {
         bucket.tool_calls,
         bucket.tool_errors,
         bucket.repeated_reads,
-        bucket.repeated_tasker_context_fetches
+        bucket.repeated_spool_context_fetches
     )
     .expect("write string");
     writeln!(
@@ -2773,9 +2773,9 @@ fn build_recent_efficiency_window(
                 .filter_map(|run| run.repeated_failed_tool_attempt_count),
         ),
         repeated_reads: metric_summary(runs.iter().filter_map(|run| run.repeated_read_count)),
-        repeated_tasker_context_fetches: metric_summary(
+        repeated_spool_context_fetches: metric_summary(
             runs.iter()
-                .filter_map(|run| run.repeated_tasker_context_fetch_count),
+                .filter_map(|run| run.repeated_spool_context_fetch_count),
         ),
         input_tokens: metric_summary(runs.iter().filter_map(|run| run.input_tokens)),
         output_tokens: metric_summary(runs.iter().filter_map(|run| run.output_tokens)),
@@ -2802,7 +2802,7 @@ fn row_has_metrics(run: &TelemetryRunRow) -> bool {
         || run.tool_error_count.is_some()
         || run.repeated_failed_tool_attempt_count.is_some()
         || run.repeated_read_count.is_some()
-        || run.repeated_tasker_context_fetch_count.is_some()
+        || run.repeated_spool_context_fetch_count.is_some()
         || run.input_tokens.is_some()
         || run.output_tokens.is_some()
         || run.total_tokens.is_some()
@@ -2856,9 +2856,9 @@ fn recent_efficiency_deltas(
             previous.repeated_reads.average,
             recent.repeated_reads.average,
         ),
-        repeated_tasker_context_fetches_average: delta_f64(
-            previous.repeated_tasker_context_fetches.average,
-            recent.repeated_tasker_context_fetches.average,
+        repeated_spool_context_fetches_average: delta_f64(
+            previous.repeated_spool_context_fetches.average,
+            recent.repeated_spool_context_fetches.average,
         ),
         total_tokens_average: delta_f64(previous.total_tokens.average, recent.total_tokens.average),
         max_context_tokens_high_water: match (
@@ -2896,7 +2896,7 @@ fn recent_efficiency_offender(run: &TelemetryRunRow) -> RecentEfficiencyOffender
         tool_error_count: run.tool_error_count,
         repeated_failed_tool_attempt_count: run.repeated_failed_tool_attempt_count,
         repeated_read_count: run.repeated_read_count,
-        repeated_tasker_context_fetch_count: run.repeated_tasker_context_fetch_count,
+        repeated_spool_context_fetch_count: run.repeated_spool_context_fetch_count,
         total_tokens: run.total_tokens,
         max_context_tokens: run.max_context_tokens,
         transcript_byte_size: run.transcript_byte_size,
@@ -2912,7 +2912,7 @@ fn offender_score(run: &RecentEfficiencyOffender) -> i64 {
         + run.tool_error_count.unwrap_or(0) * 10
         + run.repeated_failed_tool_attempt_count.unwrap_or(0) * 25
         + run.repeated_read_count.unwrap_or(0) * 25
-        + run.repeated_tasker_context_fetch_count.unwrap_or(0) * 25
+        + run.repeated_spool_context_fetch_count.unwrap_or(0) * 25
         + run.total_tokens.unwrap_or(0) / 1_000
         + run.max_context_tokens.unwrap_or(0) / 1_000
         + run.transcript_byte_size.unwrap_or(0) / 1_000_000
@@ -2962,10 +2962,10 @@ pub fn render_recent_efficiency_summary(summary: &RecentEfficiencySummary) -> St
         writeln!(output, "deltas recent-minus-previous:").expect("write string");
         writeln!(
             output,
-            "  avg tool_calls={} repeated_reads={} repeated_tasker_context_fetches={} total_tokens={} transcript_bytes={} duration={}",
+            "  avg tool_calls={} repeated_reads={} repeated_spool_context_fetches={} total_tokens={} transcript_bytes={} duration={}",
             display_delta_f64(deltas.tool_calls_average),
             display_delta_f64(deltas.repeated_reads_average),
-            display_delta_f64(deltas.repeated_tasker_context_fetches_average),
+            display_delta_f64(deltas.repeated_spool_context_fetches_average),
             display_delta_f64(deltas.total_tokens_average),
             display_delta_f64(deltas.transcript_bytes_average),
             display_delta_f64(deltas.duration_seconds_average),
@@ -2990,14 +2990,14 @@ pub fn render_recent_efficiency_summary(summary: &RecentEfficiencySummary) -> St
         for run in &summary.top_offenders {
             writeln!(
                 output,
-                "  {} - {}: {} outcome={} tool_calls={} repeated_reads={} repeated_tasker_context_fetches={} total_tokens={} max_context={} transcript_bytes={} duration={} budget_warnings={}",
+                "  {} - {}: {} outcome={} tool_calls={} repeated_reads={} repeated_spool_context_fetches={} total_tokens={} max_context={} transcript_bytes={} duration={} budget_warnings={}",
                 run.task_identifier,
                 run.task_title,
                 run.agent_run_id,
                 run.outcome.as_deref().unwrap_or("active"),
                 display_opt(run.tool_call_count),
                 display_opt(run.repeated_read_count),
-                display_opt(run.repeated_tasker_context_fetch_count),
+                display_opt(run.repeated_spool_context_fetch_count),
                 display_opt(run.total_tokens),
                 display_opt(run.max_context_tokens),
                 display_opt(run.transcript_byte_size),
@@ -3131,9 +3131,9 @@ pub async fn workflow_metrics_summary(
             .iter()
             .map(|run| run.repeated_read_count.unwrap_or(0))
             .sum(),
-        repeated_tasker_context_fetch_count: runs
+        repeated_spool_context_fetch_count: runs
             .iter()
-            .map(|run| run.repeated_tasker_context_fetch_count.unwrap_or(0))
+            .map(|run| run.repeated_spool_context_fetch_count.unwrap_or(0))
             .sum(),
         transcript_byte_summary: window.transcript_bytes,
         efficiency_hint_frequencies: hint_counts,
@@ -3228,7 +3228,7 @@ fn workflow_metric_values(runs: &[TelemetryRunRow], metric: &str) -> Vec<i64> {
             "total_tokens" => run.total_tokens,
             "tool_calls" => run.tool_call_count,
             "repeated_reads" => run.repeated_read_count,
-            "repeated_tasker_context_fetches" => run.repeated_tasker_context_fetch_count,
+            "repeated_spool_context_fetches" => run.repeated_spool_context_fetch_count,
             "duration_seconds" => run.duration_seconds,
             "transcript_bytes" => run.transcript_byte_size,
             _ => None,
@@ -3260,7 +3260,7 @@ fn workflow_regression_recommendations(
                 .to_string(),
         );
     }
-    if flagged("repeated_tasker_context_fetches") {
+    if flagged("repeated_spool_context_fetches") {
         recommendations.push(
             "Fetch Spool context once at run start and use Workpad Notes for concise handoff instead of repeated Spool context reads."
                 .to_string(),
@@ -3332,7 +3332,7 @@ async fn load_completed_pi_workflow_runs(
             agent_run_metrics.repeated_failed_tool_attempt_count AS repeated_failed_tool_attempt_count,
             agent_run_metrics.tool_call_counts_json AS tool_call_counts_json,
             agent_run_metrics.repeated_read_count AS repeated_read_count,
-            agent_run_metrics.repeated_tasker_context_fetch_count AS repeated_tasker_context_fetch_count,
+            agent_run_metrics.repeated_spool_context_fetch_count AS repeated_spool_context_fetch_count,
             agent_run_metrics.shell_command_counts_json AS shell_command_counts_json,
             agent_run_metrics.assistant_turn_count AS assistant_turn_count,
             agent_run_metrics.user_turn_count AS user_turn_count,
@@ -3443,7 +3443,7 @@ pub fn render_workflow_metrics_summary(summary: &WorkflowMetricsSummary) -> Stri
     writeln!(
         output,
         "repeated reads: {}; repeated Spool context fetches: {}",
-        summary.repeated_read_count, summary.repeated_tasker_context_fetch_count
+        summary.repeated_read_count, summary.repeated_spool_context_fetch_count
     )
     .expect("write string");
     writeln!(
@@ -3504,12 +3504,12 @@ fn write_recent_efficiency_window(output: &mut String, window: &RecentEfficiency
     .expect("write string");
     writeln!(
         output,
-        "  averages: tool_calls={} tool_errors={} repeated_failed_tools={} repeated_reads={} repeated_tasker_context_fetches={} total_tokens={} max_context={} transcript_bytes={} duration={}",
+        "  averages: tool_calls={} tool_errors={} repeated_failed_tools={} repeated_reads={} repeated_spool_context_fetches={} total_tokens={} max_context={} transcript_bytes={} duration={}",
         display_avg(window.tool_calls.average),
         display_avg(window.tool_errors.average),
         display_avg(window.repeated_failed_tool_attempts.average),
         display_avg(window.repeated_reads.average),
-        display_avg(window.repeated_tasker_context_fetches.average),
+        display_avg(window.repeated_spool_context_fetches.average),
         display_avg(window.total_tokens.average),
         display_avg(window.max_context_tokens.average),
         display_avg(window.transcript_bytes.average),
@@ -3518,12 +3518,12 @@ fn write_recent_efficiency_window(output: &mut String, window: &RecentEfficiency
     .expect("write string");
     writeln!(
         output,
-        "  high-water: tool_calls={} tool_errors={} repeated_failed_tools={} repeated_reads={} repeated_tasker_context_fetches={} total_tokens={} max_context={} transcript_bytes={} duration={}",
+        "  high-water: tool_calls={} tool_errors={} repeated_failed_tools={} repeated_reads={} repeated_spool_context_fetches={} total_tokens={} max_context={} transcript_bytes={} duration={}",
         display_opt(window.tool_calls.high_water),
         display_opt(window.tool_errors.high_water),
         display_opt(window.repeated_failed_tool_attempts.high_water),
         display_opt(window.repeated_reads.high_water),
-        display_opt(window.repeated_tasker_context_fetches.high_water),
+        display_opt(window.repeated_spool_context_fetches.high_water),
         display_opt(window.total_tokens.high_water),
         display_opt(window.max_context_tokens.high_water),
         display_opt(window.transcript_bytes.high_water),
@@ -3859,11 +3859,11 @@ mod tests {
             INSERT INTO agent_run_metrics (
                 agent_run_id, launcher_kind, final_status, tool_call_count, tool_error_count,
                 repeated_failed_tool_attempt_count, tool_call_counts_json, repeated_read_count,
-                repeated_tasker_context_fetch_count, shell_command_counts_json,
+                repeated_spool_context_fetch_count, shell_command_counts_json,
                 assistant_turn_count, user_turn_count, max_context_tokens, efficiency_hints_json
             ) VALUES ('run-2', 'pi', 'completed', 42, 6, 2,
                 '{"read":13,"bash":25,"edit":4}', 3, 2,
-                '{"tasker_cli":7,"cargo_build_test":3,"git":2,"search":8,"database":4,"process_supervisor":3,"text_processing":6,"package_manager":2,"miscellaneous":1,"other":5}',
+                '{"spool_cli":7,"cargo_build_test":3,"git":2,"search":8,"database":4,"process_supervisor":3,"text_processing":6,"package_manager":2,"miscellaneous":1,"other":5}',
                 9, 4, 123456,
                 '["excessive tool calls","repeated failed tool attempts","repeated file reads","repeated Spool context fetches","large context growth","validation/tool loop"]')
             "#,
@@ -3895,9 +3895,9 @@ mod tests {
         assert_eq!(summary.efficiency.tool_call_counts.get("read"), Some(&13));
         assert_eq!(summary.efficiency.tool_call_counts.get("bash"), Some(&25));
         assert_eq!(summary.efficiency.total_repeated_reads, 3);
-        assert_eq!(summary.efficiency.total_repeated_tasker_context_fetches, 2);
+        assert_eq!(summary.efficiency.total_repeated_spool_context_fetches, 2);
         assert_eq!(
-            summary.efficiency.shell_command_counts.get("tasker_cli"),
+            summary.efficiency.shell_command_counts.get("spool_cli"),
             Some(&7)
         );
         assert_eq!(summary.efficiency.max_context_tokens, Some(123456));
@@ -3962,7 +3962,7 @@ mod tests {
             max_context_tokens: None,
             transcript_byte_size: Some(200 * 1024 * 1024),
             repeated_read_count: Some(10),
-            repeated_tasker_context_fetch_count: Some(5),
+            repeated_spool_context_fetch_count: Some(5),
             duration_seconds: Some(2 * 60 * 60),
             has_proxy_metrics: true,
         });
@@ -3976,7 +3976,7 @@ mod tests {
             "total_tokens",
             "transcript_bytes",
             "repeated_reads",
-            "repeated_tasker_context_fetches",
+            "repeated_spool_context_fetches",
             "duration_seconds",
         ] {
             assert!(
@@ -4000,7 +4000,7 @@ mod tests {
             max_context_tokens: None,
             transcript_byte_size: None,
             repeated_read_count: None,
-            repeated_tasker_context_fetch_count: None,
+            repeated_spool_context_fetch_count: None,
             duration_seconds: None,
             has_proxy_metrics: false,
         });
@@ -4039,7 +4039,7 @@ mod tests {
                 INSERT INTO agent_run_metrics (
                     agent_run_id, launcher_kind, final_status, transcript_byte_size,
                     total_tokens, tool_call_count, repeated_read_count,
-                    repeated_tasker_context_fetch_count, max_context_tokens,
+                    repeated_spool_context_fetch_count, max_context_tokens,
                     efficiency_hints_json, warnings_json
                 ) VALUES (?, 'pi', 'completed', ?, ?, ?, ?, ?, ?, '[]', '[]')
                 "#,
@@ -4493,7 +4493,7 @@ mod tests {
                 90_000,
                 100_000,
                 2_000,
-                r#"{"tasker_cli":4,"search":3,"other":2}"#,
+                r#"{"spool_cli":4,"search":3,"other":2}"#,
             ),
             (
                 "before-2",
@@ -4503,7 +4503,7 @@ mod tests {
                 70_000,
                 80_000,
                 1_000,
-                r#"{"tasker_cli":2,"cargo_build_test":1}"#,
+                r#"{"spool_cli":2,"cargo_build_test":1}"#,
             ),
             (
                 "after-1",
@@ -4513,7 +4513,7 @@ mod tests {
                 40_000,
                 50_000,
                 500,
-                r#"{"tasker_cli":1,"search":1,"miscellaneous":1}"#,
+                r#"{"spool_cli":1,"search":1,"miscellaneous":1}"#,
             ),
         ] {
             sqlx::query(
@@ -4522,7 +4522,7 @@ mod tests {
                     agent_run_id, launcher_kind, final_status, transcript_byte_size,
                     input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
                     tool_call_count, tool_error_count, repeated_failed_tool_attempt_count,
-                    tool_call_counts_json, repeated_read_count, repeated_tasker_context_fetch_count,
+                    tool_call_counts_json, repeated_read_count, repeated_spool_context_fetch_count,
                     shell_command_counts_json, assistant_turn_count, user_turn_count,
                     max_context_tokens, efficiency_hints_json
                 ) VALUES (?, 'pi', 'completed', ?, 10, 5, ?, 1, 2, ?, 0, 0,
@@ -4585,8 +4585,8 @@ mod tests {
         assert_eq!(landing.before.tool_calls, 50);
         assert_eq!(landing.after.tool_calls, 15);
         assert_eq!(landing.deltas.tool_calls, -35);
-        assert_eq!(landing.before.repeated_tasker_context_fetches, 3);
-        assert_eq!(landing.after.repeated_tasker_context_fetches, 0);
+        assert_eq!(landing.before.repeated_spool_context_fetches, 3);
+        assert_eq!(landing.after.repeated_spool_context_fetches, 0);
         assert_eq!(landing.deltas.total_tokens, -120_000);
         assert_eq!(landing.deltas.max_context_tokens, Some(-50_000));
         assert_eq!(landing.before.shell_command_counts.get("other"), Some(&2));
@@ -4717,7 +4717,7 @@ mod tests {
                 INSERT INTO agent_run_metrics (
                     agent_run_id, launcher_kind, final_status, transcript_byte_size,
                     total_tokens, tool_call_count, tool_error_count, repeated_failed_tool_attempt_count,
-                    tool_call_counts_json, repeated_read_count, repeated_tasker_context_fetch_count,
+                    tool_call_counts_json, repeated_read_count, repeated_spool_context_fetch_count,
                     shell_command_counts_json, assistant_turn_count, user_turn_count,
                     max_context_tokens, efficiency_hints_json
                 ) VALUES (?, 'pi', 'completed', ?, ?, ?, 1, 0, '{}', ?, ?, '{}', 1, 1, ?, '[]')
@@ -4879,11 +4879,11 @@ mod tests {
                     agent_run_id, launcher_kind, final_status, transcript_byte_size,
                     input_tokens, output_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
                     tool_call_count, tool_error_count, repeated_failed_tool_attempt_count,
-                    tool_call_counts_json, repeated_read_count, repeated_tasker_context_fetch_count,
+                    tool_call_counts_json, repeated_read_count, repeated_spool_context_fetch_count,
                     shell_command_counts_json, assistant_turn_count, user_turn_count,
                     max_context_tokens, efficiency_hints_json
                 ) VALUES (?, ?, 'completed', 100, 1, 2, ?, 3, 4, ?, 1, 1,
-                    '{"read":2,"bash":1}', ?, ?, '{"tasker_cli":1}', 1, 1, 5000, ?)
+                    '{"read":2,"bash":1}', ?, ?, '{"spool_cli":1}', 1, 1, 5000, ?)
                 "#,
             )
             .bind(run_id)
@@ -4912,7 +4912,7 @@ mod tests {
         assert_eq!(recent.run_count, 1);
         assert_eq!(recent.tool_call_summary.tool_calls.high_water, Some(20));
         assert_eq!(recent.repeated_read_count, 2);
-        assert_eq!(recent.repeated_tasker_context_fetch_count, 3);
+        assert_eq!(recent.repeated_spool_context_fetch_count, 3);
         assert_eq!(recent.token_summary.total_tokens.high_water, Some(2000));
         assert_eq!(
             recent
@@ -5055,10 +5055,10 @@ mod tests {
                 INSERT INTO agent_run_metrics (
                     agent_run_id, launcher_kind, final_status, transcript_byte_size,
                     total_tokens, tool_call_count, tool_error_count, repeated_failed_tool_attempt_count,
-                    tool_call_counts_json, repeated_read_count, repeated_tasker_context_fetch_count,
+                    tool_call_counts_json, repeated_read_count, repeated_spool_context_fetch_count,
                     shell_command_counts_json, assistant_turn_count, user_turn_count,
                     max_context_tokens, efficiency_hints_json
-                ) VALUES (?, 'pi', 'completed', ?, ?, ?, 0, 0, '{"read":1}', ?, ?, '{"tasker_cli":1}', 1, 1, 5000, ?)
+                ) VALUES (?, 'pi', 'completed', ?, ?, ?, 0, 0, '{"read":1}', ?, ?, '{"spool_cli":1}', 1, 1, 5000, ?)
                 "#,
             )
             .bind(run_id)
@@ -5096,7 +5096,7 @@ mod tests {
         assert!(flagged_metrics.contains(&"total_tokens"));
         assert!(flagged_metrics.contains(&"tool_calls"));
         assert!(flagged_metrics.contains(&"repeated_reads"));
-        assert!(flagged_metrics.contains(&"repeated_tasker_context_fetches"));
+        assert!(flagged_metrics.contains(&"repeated_spool_context_fetches"));
         assert!(flagged_metrics.contains(&"duration_seconds"));
         assert!(flagged_metrics.contains(&"transcript_bytes"));
         assert!(summary
