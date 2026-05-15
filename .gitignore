@@ -5,5 +5,11 @@
 /.tasker/bootstrap-tasks/*
 !/.tasker/bootstrap-tasks/TEMPLATE.md
 
+/.spool/*
+!/.spool/bootstrap-tasks/
+/.spool/bootstrap-tasks/*
+!/.spool/bootstrap-tasks/TEMPLATE.md
+!/.spool/validation-commands.txt
+
 # extension deps
 /extensions/*/node_modules/

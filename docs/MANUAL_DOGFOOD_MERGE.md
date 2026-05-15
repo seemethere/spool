@@ -4,6 +4,20 @@ Manual Dogfood Merge is a temporary dogfooding escape hatch until automatic **In
 
 This workflow stays local-first. It is for reviewing completed **Local Worktrees** and integrating them into the **Main Branch** of the **Managed Source Repository** before the Delivery Adapter can do that automatically.
 
+## One-time dogfood state migration
+
+After the Tasker-to-Spool rename lands, migrate the repository dogfood state once from the old `.tasker` local state to `.spool`:
+
+```bash
+scripts/migrate-dogfood-state-to-spool.sh
+bin/spool-local queue show SPOOL
+bin/spool-local status
+```
+
+The migration script backs up any existing `.spool` config/database, copies the old SQLite Task Backend with `sqlite3 .backup`, applies pending Spool migrations, copies local Run Transcript storage, and updates the dogfood **Task Queue** to key `SPOOL`, name `Spool Dogfood`, worktree root `.spool/worktrees`, and branch template `spool/{task_identifier}`. Historical **Task Identifiers**, **Task Links**, and old `.tasker/worktrees/...` paths are preserved so completed and canceled history remains inspectable. New dogfood **Tasks** use the `SPOOL` **Task Queue Key** and new Spool local state paths.
+
+Do not run bare old `tasker` commands after migration. Use `bin/spool-local` from the **Managed Source Repository** for project dogfood reads and operator/debug mutations so commands target `.spool/config.toml` and `.spool/data/spool.db`.
+
 ## Managed Source Repository operation lock
 
 Before manually mutating the **Managed Source Repository** during a Manual Dogfood Merge window, acquire the queue-scoped operation lock so supervisors and Worker Loops pause before spawning or claiming new work:
