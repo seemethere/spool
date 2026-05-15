@@ -110,7 +110,7 @@ enum Command {
     },
     /// Open a read-only terminal Task status monitor.
     #[command(
-        after_long_help = "Terminal notes:\n  spool monitor uses raw mode and the alternate screen for interactive rendering.\n  Use --plain, or --once for a single plain snapshot, when terminal capabilities are limited.\n  Remote terminals and tmux should render normally when TERM is not dumb; if output is piped or TERM=dumb, spool monitor prints one plain snapshot instead.\n\nSmoke fallback:\n  spool monitor --queue TASKER --once --plain"
+        after_long_help = "Terminal notes:\n  spool monitor uses raw mode and the alternate screen for interactive rendering.\n  Use --plain, or --once for a single plain snapshot, when terminal capabilities are limited.\n  Remote terminals and tmux should render normally when TERM is not dumb; if output is piped or TERM=dumb, spool monitor prints one plain snapshot instead.\n\nSmoke fallback:\n  spool monitor --queue SPOOL --once --plain"
     )]
     Monitor {
         /// Optional Task Queue Key filter.

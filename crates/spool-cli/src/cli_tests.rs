@@ -114,7 +114,7 @@ fn monitor_help_documents_plain_tmux_and_remote_terminal_expectations() {
     assert!(help.contains("raw mode"));
     assert!(help.contains("Remote terminals and tmux should render normally"));
     assert!(help.contains("TERM=dumb"));
-    assert!(help.contains("spool monitor --queue TASKER --once --plain"));
+    assert!(help.contains("spool monitor --queue SPOOL --once --plain"));
 }
 
 #[test]
@@ -231,11 +231,11 @@ fn merge_inspect_guidance_includes_post_merge_batch_validation() {
 
 #[test]
 fn merge_inspect_guidance_prefers_squash_and_spool_authority() {
-    let guidance = manual_squash_integration_guidance("TASKER", "TASKER-60").join("\n");
+    let guidance = manual_squash_integration_guidance("SPOOL", "SPOOL-60").join("\n");
 
     assert!(guidance.contains("git merge --squash <task-branch>"));
     assert!(guidance.contains("Conventional Commit subject"));
-    assert!(guidance.contains("TASKER-60"));
+    assert!(guidance.contains("SPOOL-60"));
     assert!(guidance.contains("Do not use Task Branch ancestry as completion proof"));
     assert!(guidance.contains("Spool DB state, Integration Outcomes, Audit Events, and the Final Commit are authoritative"));
 }

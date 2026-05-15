@@ -2,7 +2,7 @@ import { Type } from "typebox";
 import { SpoolClient, configFromEnv } from "./client";
 import type { ExtensionAPI, SpoolToolResult } from "./types";
 
-const Identifier = Type.String({ description: "Task Identifier, such as TASKER-1" });
+const Identifier = Type.String({ description: "Task Identifier, such as SPOOL-1" });
 const CriterionStatus = Type.Union([Type.Literal("pending"), Type.Literal("satisfied"), Type.Literal("waived")]);
 const ValidationStatus = Type.Union([
   Type.Literal("pending"),

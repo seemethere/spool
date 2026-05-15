@@ -1,5 +1,8 @@
 .ref
 /target/
+
+# Historical pre-rename local state. Kept ignored only so old Tasker
+# dogfood artifacts do not become accidental source files during audits.
 /.tasker/*
 !/.tasker/bootstrap-tasks/
 /.tasker/bootstrap-tasks/*

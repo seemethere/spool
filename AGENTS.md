@@ -108,7 +108,7 @@ If the wrapper is unavailable, run Spool CLI commands from the Managed Source Re
 cargo run -p spool-cli -- --config .spool/config.toml --data-dir .spool/data <spool-args>
 ```
 
-During the one-time rename migration from the old Tasker local state, this repository may temporarily still have `.tasker/`, `bin/tasker-local`, the `tasker-cli` package, and a `TASKER` dogfood **Task Queue Key** until the code/data migration lands. Use those old names only as migration fallback paths for repository dogfooding; do not introduce new canonical docs or APIs with the old name.
+The old Tasker name may appear only in explicitly historical rename-migration context, such as `.tasker/` source data consumed by `scripts/migrate-dogfood-state-to-spool.sh`, historical SQLite migrations, or completed pre-rename dogfood records. Do not introduce new canonical docs, APIs, commands, crates, paths, examples, or queue keys with the old name.
 
 Do not run bare `spool task create`, `spool status`, `spool work`, or `spool supervise` from this repository. Bare commands can read or mutate the wrong Task Backend.
 

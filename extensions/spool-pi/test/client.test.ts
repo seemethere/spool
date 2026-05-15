@@ -19,7 +19,7 @@ beforeEach(() => {
             validation_items: [{ position: 1, description: "validation", status: "pending" }],
             workpad_note: { body: "notes" },
             task_links: [{ kind: "local_worktree", target: "/worktrees/TASK-1" }],
-            conflict_hints: [{ position: 1, target: "crates/tasker-db" }],
+            conflict_hints: [{ position: 1, target: "crates/spool-db" }],
             blocking_tasks: [],
             blocked_tasks: [{ identifier: "TASK-2", title: "Blocked", state: "ready", resolved: false }],
           },
@@ -27,8 +27,8 @@ beforeEach(() => {
           local_workflow: {},
           advisory_hints: {
             note: "Task Conflict Hints and likely files/paths are advisory scheduling/review/context planning aids only; they do not block claims and are not authoritative gates.",
-            task_conflict_hints: [{ position: 1, target: "crates/tasker-db" }],
-            likely_files_or_paths: ["crates/tasker-db"],
+            task_conflict_hints: [{ position: 1, target: "crates/spool-db" }],
+            likely_files_or_paths: ["crates/spool-db"],
           },
           agent_runs: [{
             id: "run-1",
@@ -63,23 +63,23 @@ describe("SpoolClient", () => {
   const actor = { kind: "worker_agent", id: "worker", display_name: "Worker" };
 
   it("sends auth header and fetches a task", async () => {
-    const client = new SpoolClient({ apiUrl: "http://tasker.test/", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://spool.test/", apiToken: "token" });
 
     await client.getTask("TASK-1");
 
-    expect(requests[0].url).toBe("http://tasker.test/tasks/TASK-1");
+    expect(requests[0].url).toBe("http://spool.test/tasks/TASK-1");
     expect(requests[0].init.method).toBe("GET");
     expect((requests[0].init.headers as Record<string, string>).authorization).toBe("Bearer token");
   });
 
   it("fetches the task context bundle from the narrow run-start endpoint", async () => {
-    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://spool.test", apiToken: "token" });
 
     const bundle = await client.getTaskContextBundle("TASK-1") as { advisory_hints: { likely_files_or_paths: string[] } };
 
-    expect(requests[0].url).toBe("http://tasker.test/tasks/TASK-1/context-bundle");
+    expect(requests[0].url).toBe("http://spool.test/tasks/TASK-1/context-bundle");
     expect(requests[0].init.method).toBe("GET");
-    expect(bundle.advisory_hints.likely_files_or_paths).toEqual(["crates/tasker-db"]);
+    expect(bundle.advisory_hints.likely_files_or_paths).toEqual(["crates/spool-db"]);
   });
 
   it("accepts context bundles with no advisory Task Conflict Hints", async () => {
@@ -108,7 +108,7 @@ describe("SpoolClient", () => {
         headers: { "content-type": "application/json" },
       });
     }) as typeof fetch;
-    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://spool.test", apiToken: "token" });
 
     const bundle = await client.getTaskContextBundle("TASK-1") as { advisory_hints: { task_conflict_hints: unknown[] } };
 
@@ -130,13 +130,13 @@ describe("SpoolClient", () => {
         headers: { "content-type": "application/json" },
       });
     }) as typeof fetch;
-    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://spool.test", apiToken: "token" });
 
     await expect(client.getTaskContextBundle("TASK-1")).rejects.toThrow("forbidden field raw_json");
   });
 
   it("updates workpad with actor", async () => {
-    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://spool.test", apiToken: "token" });
 
     await client.updateWorkpad("TASK-1", actor, "notes");
 
@@ -145,7 +145,7 @@ describe("SpoolClient", () => {
   });
 
   it("appends workpad text by fetching the current note before updating", async () => {
-    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://spool.test", apiToken: "token" });
 
     await client.appendWorkpad("TASK-1", actor, "new notes");
 
@@ -162,7 +162,7 @@ describe("SpoolClient", () => {
         headers: { "content-type": "application/json" },
       });
     }) as typeof fetch;
-    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://spool.test", apiToken: "token" });
 
     await client.appendWorkpad("TASK-1", actor, "new notes");
 
@@ -170,7 +170,7 @@ describe("SpoolClient", () => {
   });
 
   it("sends validated base commit when setting validation status", async () => {
-    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://spool.test", apiToken: "token" });
 
     await client.setValidationItemStatus({
       identifier: "TASK-1",
@@ -179,7 +179,7 @@ describe("SpoolClient", () => {
       validated_base_commit: "abc123",
     }, actor);
 
-    expect(requests[0].url).toBe("http://tasker.test/tasks/TASK-1/validation-items/1/status");
+    expect(requests[0].url).toBe("http://spool.test/tasks/TASK-1/validation-items/1/status");
     expect(JSON.parse(requests[0].init.body as string)).toEqual({
       actor,
       status: "passed",
@@ -189,7 +189,7 @@ describe("SpoolClient", () => {
   });
 
   it("creates child tasks through the parent task endpoint", async () => {
-    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://spool.test", apiToken: "token" });
 
     await client.createChildTask({
       parent_identifier: "TASK-1",
@@ -199,7 +199,7 @@ describe("SpoolClient", () => {
       validation_items: ["tests"],
     }, actor);
 
-    expect(requests[0].url).toBe("http://tasker.test/tasks/TASK-1/child-tasks");
+    expect(requests[0].url).toBe("http://spool.test/tasks/TASK-1/child-tasks");
     const body = JSON.parse(requests[0].init.body as string);
     expect(body.actor).toEqual(actor);
     expect(body.task.state).toBe("backlog");
@@ -207,11 +207,11 @@ describe("SpoolClient", () => {
   });
 
   it("requests transitions with an agent run id", async () => {
-    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://spool.test", apiToken: "token" });
 
     await client.requestTransition("TASK-1", "done", actor, "run-1");
 
-    expect(requests[0].url).toBe("http://tasker.test/tasks/TASK-1/transition");
+    expect(requests[0].url).toBe("http://spool.test/tasks/TASK-1/transition");
     expect(JSON.parse(requests[0].init.body as string)).toEqual({
       actor,
       to_state: "done",
@@ -220,7 +220,7 @@ describe("SpoolClient", () => {
   });
 
   it("records Review Decisions through the deterministic endpoint", async () => {
-    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://spool.test", apiToken: "token" });
     const reviewer = { kind: "review_agent", id: "reviewer", display_name: "Reviewer" };
 
     await client.recordReviewDecision({
@@ -229,7 +229,7 @@ describe("SpoolClient", () => {
       feedback: "Tighten the validation evidence.",
     }, reviewer);
 
-    expect(requests[0].url).toBe("http://tasker.test/tasks/TASK-1/review-decision");
+    expect(requests[0].url).toBe("http://spool.test/tasks/TASK-1/review-decision");
     expect(requests[0].init.method).toBe("POST");
     expect(JSON.parse(requests[0].init.body as string)).toEqual({
       actor: reviewer,
@@ -239,22 +239,22 @@ describe("SpoolClient", () => {
   });
 
   it("upserts Task Links with actor attribution through the narrow endpoint", async () => {
-    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://spool.test", apiToken: "token" });
 
     await client.upsertTaskLink("TASK-1", {
       kind: "change_artifact",
-      target: "file:///tmp/tasker.patch",
+      target: "file:///tmp/spool.patch",
       label: "Patch artifact",
       is_primary: true,
     }, actor);
 
-    expect(requests[0].url).toBe("http://tasker.test/tasks/TASK-1/links");
+    expect(requests[0].url).toBe("http://spool.test/tasks/TASK-1/links");
     expect(requests[0].init.method).toBe("POST");
     expect(JSON.parse(requests[0].init.body as string)).toEqual({
       actor,
       link: {
         kind: "change_artifact",
-        target: "file:///tmp/tasker.patch",
+        target: "file:///tmp/spool.patch",
         label: "Patch artifact",
         is_primary: true,
       },
@@ -262,7 +262,7 @@ describe("SpoolClient", () => {
   });
 
   it("defaults omitted Task Link label and primary selection in request body", async () => {
-    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://spool.test", apiToken: "token" });
 
     await client.upsertTaskLink("TASK-1", {
       kind: "chat_thread",
@@ -281,7 +281,7 @@ describe("SpoolClient", () => {
   });
 
   it("creates delegated Root Tasks through the deterministic draft endpoint", async () => {
-    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://spool.test", apiToken: "token" });
     const delegator = { kind: "delegating_agent", id: "delegator", display_name: "Delegator" };
 
     await client.createDelegatedRootTask({
@@ -293,7 +293,7 @@ describe("SpoolClient", () => {
       validation_items: ["tests"],
     }, delegator);
 
-    expect(requests[0].url).toBe("http://tasker.test/tasks/delegated-root");
+    expect(requests[0].url).toBe("http://spool.test/tasks/delegated-root");
     expect(requests[0].init.method).toBe("POST");
     expect(JSON.parse(requests[0].init.body as string)).toEqual({
       actor: delegator,
@@ -314,7 +314,7 @@ describe("SpoolClient", () => {
   });
 
   it("refines Backlog Tasks through the deterministic refinement endpoint", async () => {
-    const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+    const client = new SpoolClient({ apiUrl: "http://spool.test", apiToken: "token" });
     const delegator = { kind: "delegating_agent", id: "delegator", display_name: "Delegator" };
 
     await client.refineBacklogTask({
@@ -325,7 +325,7 @@ describe("SpoolClient", () => {
       validation_items: ["checked"],
     }, delegator);
 
-    expect(requests[0].url).toBe("http://tasker.test/tasks/TASK-1/refine");
+    expect(requests[0].url).toBe("http://spool.test/tasks/TASK-1/refine");
     expect(requests[0].init.method).toBe("POST");
     expect(JSON.parse(requests[0].init.body as string)).toEqual({
       actor: delegator,
@@ -345,10 +345,10 @@ describe("SpoolClient", () => {
   });
 
   it("writes supervisor-readable worker status reports", () => {
-    const dir = mkdtempSync(join(tmpdir(), "tasker-status-"));
+    const dir = mkdtempSync(join(tmpdir(), "spool-status-"));
     try {
       const path = join(dir, "worker.jsonl");
-      const client = new SpoolClient({ apiUrl: "http://tasker.test", apiToken: "token" });
+      const client = new SpoolClient({ apiUrl: "http://spool.test", apiToken: "token" });
 
       const report = client.reportWorkerStatus(
         { identifier: "TASK-1", status: "completion_intent", message: "handed off", agent_run_id: "run-1" },

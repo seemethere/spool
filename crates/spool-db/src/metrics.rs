@@ -1117,7 +1117,7 @@ mod shell_command_category_tests {
     #[test]
     fn classifies_common_dogfood_shell_commands_without_raw_command_storage() {
         let cases = [
-            ("bin/spool-local task show TASKER-86", "spool_cli"),
+            ("bin/spool-local task show SPOOL-86", "spool_cli"),
             (
                 "cargo test -p spool-db agent_run_metrics",
                 "cargo_build_test",

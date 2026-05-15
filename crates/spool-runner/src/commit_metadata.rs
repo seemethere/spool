@@ -51,21 +51,21 @@ mod tests {
 
     #[test]
     fn spool_commit_metadata_trailers_parse_complete_partial_and_unrelated_messages() {
-        let complete = "feat: deliver task\n\nSpool-Task: TASKER-92\nSpool-Queue: TASKER\nSpool-Agent-Run: run-123\n";
+        let complete = "feat: deliver task\n\nSpool-Task: SPOOL-92\nSpool-Queue: SPOOL\nSpool-Agent-Run: run-123\n";
         assert_eq!(
             parse_spool_commit_trailers(complete),
             SpoolCommitTrailers {
-                task_identifier: Some("TASKER-92".to_string()),
-                task_queue: Some("TASKER".to_string()),
+                task_identifier: Some("SPOOL-92".to_string()),
+                task_queue: Some("SPOOL".to_string()),
                 agent_run_id: Some("run-123".to_string()),
             }
         );
 
-        let partial = "fix: partial\n\nSpool-Task: TASKER-93\nReviewed-by: Operator\n";
+        let partial = "fix: partial\n\nSpool-Task: SPOOL-93\nReviewed-by: Operator\n";
         assert_eq!(
             parse_spool_commit_trailers(partial),
             SpoolCommitTrailers {
-                task_identifier: Some("TASKER-93".to_string()),
+                task_identifier: Some("SPOOL-93".to_string()),
                 task_queue: None,
                 agent_run_id: None,
             }
@@ -80,22 +80,22 @@ mod tests {
     #[test]
     fn generated_spool_commit_metadata_is_trailer_compatible_and_minimal() {
         let message = final_commit_message(
-            "TASKER-92",
+            "SPOOL-92",
             "Add structured Spool metadata trailers to Final Commit messages",
-            "TASKER",
+            "SPOOL",
             Some("5d019294-398e-4f89-ad70-9b434b10dadb"),
         );
 
-        assert!(message.starts_with("TASKER-92: Add structured Spool metadata trailers"));
-        assert!(message.contains("\n\nSpool-Task: TASKER-92\n"));
-        assert!(message.contains("Spool-Queue: TASKER\n"));
+        assert!(message.starts_with("SPOOL-92: Add structured Spool metadata trailers"));
+        assert!(message.contains("\n\nSpool-Task: SPOOL-92\n"));
+        assert!(message.contains("Spool-Queue: SPOOL\n"));
         assert!(message.contains("Spool-Agent-Run: 5d019294-398e-4f89-ad70-9b434b10dadb"));
         assert!(!message.contains("Workpad"));
         assert!(!message.contains("Run Transcript"));
         assert!(!message.contains("prompt"));
         assert_eq!(
             parse_spool_commit_trailers(&message).task_identifier,
-            Some("TASKER-92".to_string())
+            Some("SPOOL-92".to_string())
         );
     }
 }

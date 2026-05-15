@@ -277,7 +277,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
 
         let prompt = build_delegation_prompt(DelegationPromptContext {
-            queue_key: Some("TASKER"),
+            queue_key: Some("SPOOL"),
             refine_task_identifier: None,
             initial_intent: None,
             managed_source_repository: temp.path(),
@@ -293,7 +293,7 @@ mod tests {
         assert!(prompt.contains("Validation Items"));
         assert!(prompt.contains("Task Conflict Hints"));
         assert!(prompt.contains("Blocking Tasks"));
-        assert!(prompt.contains("Task Queue Key: TASKER"));
+        assert!(prompt.contains("Task Queue Key: SPOOL"));
         assert!(prompt.contains("spool_create_delegated_root_task"));
         assert!(prompt.contains("Root Task"));
         assert!(prompt.contains("Agent-Gated Integration"));
@@ -318,7 +318,7 @@ mod tests {
         .expect("write prompt");
 
         let prompt = build_delegation_prompt(DelegationPromptContext {
-            queue_key: Some("TASKER"),
+            queue_key: Some("SPOOL"),
             refine_task_identifier: None,
             initial_intent: None,
             managed_source_repository: temp.path(),
@@ -327,7 +327,7 @@ mod tests {
 
         assert!(prompt.starts_with("Custom Delegating Agent prompt."));
         assert!(prompt.contains("Question UI is allowed"));
-        assert!(prompt.contains("Task Queue Key: TASKER"));
+        assert!(prompt.contains("Task Queue Key: SPOOL"));
         assert!(prompt.contains("acceptance_criteria"));
         assert!(prompt.contains("validation_items"));
     }
@@ -338,13 +338,13 @@ mod tests {
 
         let prompt = build_delegation_prompt(DelegationPromptContext {
             queue_key: None,
-            refine_task_identifier: Some("TASKER-1"),
+            refine_task_identifier: Some("SPOOL-1"),
             initial_intent: None,
             managed_source_repository: temp.path(),
         })
         .expect("prompt");
 
-        assert!(prompt.contains("Refinement target: TASKER-1"));
+        assert!(prompt.contains("Refinement target: SPOOL-1"));
         assert!(prompt.contains("spool_refine_backlog_task"));
         assert!(prompt.contains("Backlog Task only"));
         assert!(prompt.contains("Do not revise active work"));
@@ -357,7 +357,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
 
         let create_prompt = build_delegation_prompt(DelegationPromptContext {
-            queue_key: Some("TASKER"),
+            queue_key: Some("SPOOL"),
             refine_task_identifier: None,
             initial_intent: Some("Investigate transcript volume regression"),
             managed_source_repository: temp.path(),
@@ -368,7 +368,7 @@ mod tests {
 
         let refine_prompt = build_delegation_prompt(DelegationPromptContext {
             queue_key: None,
-            refine_task_identifier: Some("TASKER-1"),
+            refine_task_identifier: Some("SPOOL-1"),
             initial_intent: Some("Clarify acceptance criteria"),
             managed_source_repository: temp.path(),
         })

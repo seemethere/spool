@@ -10,7 +10,7 @@ beforeEach(() => {
   requests.length = 0;
   globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     requests.push({ url: String(url), init: init ?? {} });
-    return new Response(JSON.stringify({ task: { identifier: "TASKER-999" } }), {
+    return new Response(JSON.stringify({ task: { identifier: "SPOOL-999" } }), {
       status: 201,
       headers: { "content-type": "application/json" },
     });
@@ -63,7 +63,7 @@ describe("registerSpoolExtension", () => {
     registerSpoolExtension(pi);
 
     const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool.parameters]));
-    expect(byName.spool_get_task_context_bundle.properties.identifier.description).toBe("Task Identifier, such as TASKER-1");
+    expect(byName.spool_get_task_context_bundle.properties.identifier.description).toBe("Task Identifier, such as SPOOL-1");
     expect(Object.keys(byName.spool_attach_task_link.properties).sort()).toEqual([
       "identifier",
       "is_primary",
@@ -106,7 +106,7 @@ describe("registerSpoolExtension", () => {
   });
 
   it("executes delegated Root Task creation through the extension tool with a Delegating Agent actor", async () => {
-    process.env.SPOOL_API_URL = "http://tasker.test";
+    process.env.SPOOL_API_URL = "http://spool.test";
     process.env.SPOOL_API_TOKEN = "token";
     process.env.SPOOL_ACTOR_KIND = "delegating_agent";
     process.env.SPOOL_ACTOR_ID = "delegate-session";
@@ -123,7 +123,7 @@ describe("registerSpoolExtension", () => {
     expect(createTool).toBeDefined();
 
     const result = await createTool!.execute("tool-1", {
-      queue_key: "TASKER",
+      queue_key: "SPOOL",
       title: "Delegate through extension",
       brief: "Task Brief from a human-present pi session.",
       priority: "urgent",
@@ -136,8 +136,8 @@ describe("registerSpoolExtension", () => {
       validation_items: ["Fake-extension test observes the delegated-root API call."],
     }, new AbortController().signal);
 
-    expect(result.details).toEqual({ task: { identifier: "TASKER-999" } });
-    expect(requests[0].url).toBe("http://tasker.test/tasks/delegated-root");
+    expect(result.details).toEqual({ task: { identifier: "SPOOL-999" } });
+    expect(requests[0].url).toBe("http://spool.test/tasks/delegated-root");
     expect(requests[0].init.method).toBe("POST");
     expect((requests[0].init.headers as Record<string, string>).authorization).toBe("Bearer token");
     expect(JSON.parse(requests[0].init.body as string)).toEqual({
@@ -147,7 +147,7 @@ describe("registerSpoolExtension", () => {
         display_name: "Delegation Session",
       },
       draft: {
-        queue_key: "TASKER",
+        queue_key: "SPOOL",
         title: "Delegate through extension",
         brief: "Task Brief from a human-present pi session.",
         priority: "urgent",
@@ -163,7 +163,7 @@ describe("registerSpoolExtension", () => {
   });
 
   it("executes Task Link attachment through the extension tool with the configured actor", async () => {
-    process.env.SPOOL_API_URL = "http://tasker.test";
+    process.env.SPOOL_API_URL = "http://spool.test";
     process.env.SPOOL_API_TOKEN = "token";
     process.env.SPOOL_ACTOR_ID = "worker-1";
     process.env.SPOOL_ACTOR_DISPLAY_NAME = "Worker One";
@@ -179,15 +179,15 @@ describe("registerSpoolExtension", () => {
     expect(linkTool).toBeDefined();
 
     const result = await linkTool!.execute("tool-1", {
-      identifier: "TASKER-999",
+      identifier: "SPOOL-999",
       kind: "review_artifact",
       target: "file:///tmp/review.md",
       label: "Review artifact",
       is_primary: true,
     }, new AbortController().signal);
 
-    expect(result.details).toEqual({ task: { identifier: "TASKER-999" } });
-    expect(requests[0].url).toBe("http://tasker.test/tasks/TASKER-999/links");
+    expect(result.details).toEqual({ task: { identifier: "SPOOL-999" } });
+    expect(requests[0].url).toBe("http://spool.test/tasks/SPOOL-999/links");
     expect(requests[0].init.method).toBe("POST");
     expect(JSON.parse(requests[0].init.body as string)).toEqual({
       actor: {
