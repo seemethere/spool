@@ -131,7 +131,10 @@ pub fn router(app_version: impl Into<String>, pool: SqlitePool) -> Router {
         .route("/queues/{key}/claim-next", post(claim_next))
         .route("/tasks/bootstrap", post(create_task))
         .route("/tasks/delegated-root", post(create_delegated_root_task))
-        .route("/tasks/{identifier}", get(get_task))
+        .route(
+            "/tasks/{identifier}",
+            get(get_task).post(post_task_identifier),
+        )
         .route("/tasks/{identifier}/refine", post(refine_backlog_task))
         .route(
             "/tasks/{identifier}/context-bundle",
@@ -228,6 +231,29 @@ async fn create_delegated_root_task(
     State(state): State<ServerState>,
     headers: HeaderMap,
     Json(request): Json<CreateDelegatedRootTaskRequest>,
+) -> Result<(StatusCode, Json<spool_db::TaskDetail>), (StatusCode, Json<ErrorResponse>)> {
+    create_delegated_root_task_with_request(state, headers, request).await
+}
+
+async fn post_task_identifier(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+    Json(request): Json<CreateDelegatedRootTaskRequest>,
+) -> Result<(StatusCode, Json<spool_db::TaskDetail>), (StatusCode, Json<ErrorResponse>)> {
+    if identifier != "delegated-root" {
+        return Err(error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            format!("POST /tasks/{identifier} is not supported"),
+        ));
+    }
+    create_delegated_root_task_with_request(state, headers, request).await
+}
+
+async fn create_delegated_root_task_with_request(
+    state: ServerState,
+    headers: HeaderMap,
+    request: CreateDelegatedRootTaskRequest,
 ) -> Result<(StatusCode, Json<spool_db::TaskDetail>), (StatusCode, Json<ErrorResponse>)> {
     require_auth(&state.pool, &headers).await?;
     spool_db::create_delegated_root_task(&state.pool, &request.draft, &request.actor)
@@ -1258,6 +1284,18 @@ mod tests {
             .unwrap();
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
 
+        let unsupported_post = app
+            .clone()
+            .oneshot(create_delegated_root_task_request_at(
+                "/tasks/not-delegated-root",
+                "TASK",
+                "Wrong path",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unsupported_post.status(), StatusCode::METHOD_NOT_ALLOWED);
+
         let backlog = app
             .clone()
             .oneshot(create_backlog_task_request("TASK", "Refine me", &token))
@@ -2109,6 +2147,15 @@ mod tests {
         title: &str,
         token: &str,
     ) -> Request<Body> {
+        create_delegated_root_task_request_at("/tasks/delegated-root", queue_key, title, token)
+    }
+
+    fn create_delegated_root_task_request_at(
+        uri: &str,
+        queue_key: &str,
+        title: &str,
+        token: &str,
+    ) -> Request<Body> {
         let request = serde_json::json!({
             "actor": {
                 "kind": "delegating_agent",
@@ -2132,7 +2179,7 @@ mod tests {
 
         Request::builder()
             .method("POST")
-            .uri("/tasks/delegated-root")
+            .uri(uri)
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {token}"))
             .body(Body::from(request.to_string()))
