@@ -75,7 +75,7 @@ export SPOOL_ACTOR_DISPLAY_NAME="Local Delegating Agent"
 
 ## 5. Create the first Root Task through a Delegation Session
 
-Preferred intake is a human-present **Delegation Session** in pi with the **Spool Pi Extension** loaded. Ask the **Delegating Agent** to run a one-question-at-a-time **Delegation Interview** and create one **Root Task** with `spool_create_delegated_root_task`.
+Preferred intake is a human-present **Delegation Session** in pi with the **Spool Pi Extension** loaded. Ask the **Delegating Agent** to run a one-question-at-a-time **Delegation Interview** and create one **Root Task** with `spool_create_delegated_root_task`. For a step-by-step example, see `docs/TASK_DELEGATION_SESSION_TUTORIAL.md`.
 
 A good first Task has:
 

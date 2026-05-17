@@ -51,7 +51,7 @@ Use `is_primary: true` only for the main handoff artifact a finishing or reviewi
 
 ## Dogfood delegation usage
 
-Preferred ordinary dogfood intake happens inside a human-present pi session: clarify intent with the Delegating Agent, then call `spool_create_delegated_root_task` with structured fields such as:
+Preferred ordinary dogfood intake happens inside a human-present pi session: clarify intent with the Delegating Agent, then call `spool_create_delegated_root_task` with structured fields. See `docs/TASK_DELEGATION_SESSION_TUTORIAL.md` for a beginner-facing walkthrough. A concise payload looks like:
 
 ```json
 {

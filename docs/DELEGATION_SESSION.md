@@ -4,6 +4,8 @@ The preferred dogfood **Delegation Session** is an ordinary human-present pi ses
 
 The first implementation is local-first and CLI-first. It does not add a web UI, custom workflow fields, external tracker sync, GitHub requirements, or direct human task forms. The deterministic Spool API helpers should be implemented separately from the Pi-backed interactive session so they can be tested without launching pi.
 
+For a beginner-facing walkthrough of creating a first structured Root Task, see `docs/TASK_DELEGATION_SESSION_TUTORIAL.md`.
+
 ## Extension-native dogfood path
 
 Use this path for ordinary Spool dogfooding instead of writing a bootstrap file or relying on the CLI to orchestrate a Pi RPC interview loop:
