@@ -35,7 +35,7 @@ Run from the repository root:
 spool init --config .spool/config.toml --data-dir .spool/data
 ```
 
-`spool init` creates local config, a local data directory, the SQLite Task Backend, and an API token. Treat `.spool/config.toml`, `.spool/data/`, API tokens, **Run Transcripts**, and **Launcher Session Data** as local operator state unless your repository has a deliberate policy for sharing sanitized examples.
+`spool init` creates local config, a local data directory, the SQLite Task Backend, and an API token. Treat `.spool/config.toml`, `.spool/data/`, API tokens, **Run Transcripts**, **Launcher Session Data**, and **Local Worktrees** as local Operator state unless your repository has a deliberate policy for sharing sanitized examples. See [Repository-local Spool state hygiene](REPOSITORY_LOCAL_STATE.md) for artifact expectations, cleanup commands, and `.gitignore` guidance.
 
 ## 3. Create a Task Queue for Local Worktree Delivery
 
