@@ -62,3 +62,57 @@ If you choose to version **Prompt Overrides** under `.spool/prompts/`, review th
 - If a repository-local `.spool/config.toml` exists but is not the active config, Spool warns for read-only commands and refuses unsafe mutating commands unless the Operator explicitly selects a config or data/database override.
 - Do not use a **Local Worktree** or **Task Branch** to migrate the shared project database with unintegrated code; `spool db migrate` is an explicit Operator path intended for the trusted **Managed Source Repository** **Main Branch** by default.
 - Do not paste raw **Run Transcripts**, raw **Launcher Session Data**, prompt bodies, tool arguments, API tokens, or large logs into commits, docs, Workpad handoffs, or external telemetry.
+
+## Pre-publication checklist
+
+Before publishing a Spool repository publicly, the **Operator** should do one final local hygiene pass. This is repository release guidance, not a new Spool workflow, and it does not require GitHub, Linear, pull requests, or hosted services.
+
+1. Inspect the source tree and ignored files before packaging or pushing:
+
+   ```bash
+   git status --short --ignored
+   git ls-files --others --ignored --exclude-standard
+   git diff --check
+   git log --oneline --decorate --max-count=20
+   ```
+
+   Confirm that only intentional source files are tracked. Do not publish `.spool/`, historical `.tasker/` state, `.spool/data/spool.db`, other local databases, API tokens, **Run Transcript** directories, raw **Launcher Session Data** artifacts, `.spool/worktrees/`, Task Branch scratch state, `target/`, `.spool/data/cargo-target/`, per-worktree build outputs, or `node_modules/`.
+
+2. Run the existing Spool cleanup dry-runs for repository-local artifacts, then decide whether to delete only verified-safe candidates:
+
+   ```bash
+   spool cleanup runs --config .spool/config.toml --data-dir .spool/data
+   spool cleanup local-worktrees --queue APP --config .spool/config.toml --data-dir .spool/data
+   spool cleanup cargo-targets --queue APP --config .spool/config.toml --data-dir .spool/data
+   ```
+
+   These are Operator cleanup commands. They default to dry-run reporting; pass `--delete` only after reviewing the reported paths.
+
+3. Check for stale rename residue, local paths, and accidentally documented secrets before release:
+
+   ```bash
+   rg -n "tasker|\.tasker|extensions/tasker-pi|spool\.db|api[_-]?token|SPOOL_API_TOKEN|BEGIN (RSA|OPENSSH|PRIVATE) KEY" README.md docs crates extensions scripts .gitignore
+   rg -n "github.com[:/]seemethere/tasker|/Users/|\.spool/data|runs/[0-9a-f-]+" README.md docs crates extensions scripts .gitignore
+   ```
+
+   Any remaining matches should be intentional historical migration context, local-state warnings, or sanitized examples. Do not paste raw transcript bodies or launcher payloads into the repository to explain a release issue.
+
+4. Verify package and extension metadata without relying on hosted services:
+
+   ```bash
+   cargo metadata --format-version 1 --no-deps
+   bun install --cwd extensions/spool-pi
+   bun run --cwd extensions/spool-pi build
+   bun test --cwd extensions/spool-pi
+   ```
+
+   Review `extensions/spool-pi/package.json`, its `files` list, license, repository metadata, and README so package setup matches the public source tree and does not include local-only artifacts.
+
+5. Run the repository's normal deterministic validation from a clean checkout or clean **Managed Source Repository**:
+
+   ```bash
+   cargo fmt --all -- --check
+   cargo test --workspace
+   ```
+
+   If you keep a curated `.spool/validation-commands.txt`, run those commands too. Keep validation evidence as concise command results; do not commit local Task Backend data, Run Transcripts, raw logs, or secrets as proof.

@@ -58,6 +58,8 @@ Use those documents when changing Spool behavior or public terminology.
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for local development expectations and [`SECURITY.md`](SECURITY.md) for vulnerability reporting guidance.
 
+Before publishing or packaging a public copy, use the pre-publication checklist in [`docs/REPOSITORY_LOCAL_STATE.md`](docs/REPOSITORY_LOCAL_STATE.md#pre-publication-checklist) to keep local Spool state, Run Transcripts, worktrees, build artifacts, and dependency caches out of the release.
+
 ## License
 
 Spool is licensed under the MIT License. See [`LICENSE`](LICENSE).
