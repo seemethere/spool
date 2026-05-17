@@ -6,6 +6,10 @@
 # File-backed Task Creation accepts only backlog or ready as initial Task States; omit state to default to ready.
 # Ordinary Spool dogfood Tasks should keep review_required false so they use Agent-Gated Integration.
 # Set review_required true only when the Task or Operator explicitly requires Human Review.
+# For related Task batches, decide before filing whether each Task is parallel-ready or sequenced.
+# Use conflict_hints only for advisory overlap; they do not block claims.
+# Use blocking_task_identifiers for true same-queue ordering dependencies.
+# Creation order, parent/child lineage, and Workpad Note text are not dependencies.
 title: Replace with a concise Task outcome
 priority: normal
 state: ready
