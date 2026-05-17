@@ -131,24 +131,47 @@ Unattended Worker Sessions cannot stop to ask the human questions. If the Task i
 
 ## 8. Inspect the result
 
-Use this order after the Worker Loop exits:
+After a **Worker Loop** exits, inspect from the most authoritative Spool state toward progressively more detailed local debugging artifacts. This order helps decide whether the Task is ready for **Agent-Gated Integration**, needs **Rework**, or needs operator recovery without dumping raw transcripts.
 
-```bash
-spool status --config .spool/config.toml --data-dir .spool/data
-spool task show <task_identifier> --config .spool/config.toml --data-dir .spool/data
-spool run show <agent_run_id> --config .spool/config.toml --data-dir .spool/data
-```
+1. Start with queue-level attention and current **Task State**:
 
-Then inspect the **Local Worktree** and **Task Branch** recorded as **Task Links**:
+   ```bash
+   spool status --config .spool/config.toml --data-dir .spool/data
+   spool task show <task_identifier> --config .spool/config.toml --data-dir .spool/data
+   ```
 
-```bash
-cd <local_worktree_path>
-git status --short
-git diff --stat <main-branch>...HEAD
-git log --oneline <main-branch>..HEAD
-```
+   **Task State** and the structured gate statuses are the first source of truth. A Task in **In Progress** may still have an active or stuck **Agent Run**; a Task in **Rework** needs another Worker Agent pass or explicit operator handling; a Task in **Integrating** is in delivery; a Task in **Done** is complete in Spool.
 
-Authoritative completion gates live in structured **Acceptance Criteria** and **Validation Items**. The **Workpad Note** is narrative handoff context. **Run Transcripts** and **Launcher Session Data** are local debugging artifacts; do not paste raw transcripts, prompt bodies, secrets, or large logs into commit messages or docs.
+2. Read the structured **Acceptance Criteria** and **Validation Items** in `spool task show`. These are authoritative completion gates: every Acceptance Criterion must be `satisfied` or `waived`, and every Validation Item must be `passed` or `waived`, before ordinary Agent-Gated Integration should proceed. **Workpad Note** checkboxes or prose can explain this state, but Spool does not treat Markdown as authoritative gate state.
+
+3. Read the **Workpad Note** for narrative handoff context: what changed, which commands ran, known risks, follow-up Task candidates, and any efficiency notes from the Worker Agent. Use it to understand intent and evidence, not to override structured requirements.
+
+4. Inspect **Task Links** to find delivery references, especially the **Local Worktree** path and **Task Branch**. Task Links are references to artifacts; they do not replace the Task Brief, structured requirements, or validation status.
+
+5. Inspect the **Local Worktree** and **Task Branch** recorded as Task Links:
+
+   ```bash
+   cd <local_worktree_path>
+   git status --short
+   git diff --stat <main-branch>...HEAD
+   git log --oneline <main-branch>..HEAD
+   ```
+
+   The Local Worktree diff and Task Commits show the repository changes that delivery will integrate. Before requesting or trusting Integrating, the Local Worktree should be clean and intended changes should be committed on the Task Branch.
+
+6. Inspect the latest **Agent Run** outcome and concise launcher metadata:
+
+   ```bash
+   spool run show <agent_run_id> --config .spool/config.toml --data-dir .spool/data
+   ```
+
+   Prefer the latest completed Agent Run for handoff evidence, but scan earlier failed or expired runs when warnings remain unexplained. `spool run show` should be enough for normal diagnosis: outcome, failure reason, timing, local Run Transcript path, and normalized **Launcher Session Data** or efficiency summaries. Open the saved **Run Transcript** only when the summary is insufficient to explain a failure.
+
+7. If the Task reached **Integrating** or **Done**, inspect the latest **Integration Outcome** through `spool task show`, `spool status`, `spool run show`, or the temporary merge helpers when applicable. Integration Outcomes record whether Local Worktree Delivery succeeded, produced no changes, found a work-change failure such as a dirty worktree or merge conflict, or hit a retryable operational failure. For the target path, the Delivery Adapter records the Integration Outcome and moves the Task to Done, Rework, or retry-in-Integrating as appropriate.
+
+Authoritative Spool data is structured: **Task State**, **Acceptance Criteria**, **Validation Items**, **Agent Runs**, **Integration Outcomes**, and Audit Events. Narrative and reference surfaces are still important but different: the **Task Brief** explains the request, the **Workpad Note** is handoff context, and **Task Links** point to artifacts such as the Local Worktree and Task Branch. Debugging artifacts are local by default: **Run Transcripts**, raw **Launcher Session Data**, prompt bodies, tool arguments, secrets, and large raw logs must not be pasted into Workpad Notes, commit messages, documentation, or external systems unless an Operator intentionally creates a sanitized diagnostic excerpt.
+
+For current dogfooding, **Manual Dogfood Merge** may still be used as a temporary escape hatch when automatic Integrating is unavailable; see `docs/MANUAL_DOGFOOD_MERGE.md` for the longer operator checklist. The target Local Worktree Delivery behavior remains the Agent-Gated Integration path in the next section.
 
 ## 9. Integrate through the target path
 
