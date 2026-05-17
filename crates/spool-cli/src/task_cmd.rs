@@ -1,5 +1,6 @@
 use super::*;
 use crate::merge_cmd::{preflight_integrating_transition, validation_base_commit_for_status};
+use std::collections::{HashMap, HashSet};
 
 pub(crate) async fn task(
     paths: &SpoolPaths,
@@ -43,6 +44,7 @@ pub(crate) async fn task(
                 }
             };
             let parsed = bootstrap::parse_bootstrap_task_file_with_warnings(&queue, &file)?;
+            bootstrap::reject_batch_only_fields(&parsed, "task create --from-file")?;
             for warning in &parsed.warnings {
                 eprintln!("warning: {warning}");
             }
@@ -54,6 +56,47 @@ pub(crate) async fn task(
             println!("state: {}", detail.task.state);
         }
         TaskCommand::Lint { .. } => unreachable!("lint returns before opening the Task Backend"),
+        TaskCommand::Batch { command } => match command {
+            TaskBatchCommand::Lint { queue, from_files } => {
+                let batch = validate_task_batch(&pool, &queue, &from_files).await?;
+                println!("valid file-backed Task batch");
+                println!("queue: {queue}");
+                println!("tasks: {}", batch.items.len());
+                print_batch_plan(&batch);
+            }
+            TaskBatchCommand::Create {
+                queue,
+                from_files,
+                actor,
+            } => {
+                let mut batch = validate_task_batch(&pool, &queue, &from_files).await?;
+                println!("creating file-backed Task batch");
+                print_batch_plan(&batch);
+                let actor = spool_db::Actor::operator(actor);
+                let mut created_by_key: HashMap<String, String> = HashMap::new();
+                for index in batch.creation_order {
+                    let item = &mut batch.items[index];
+                    for key in &item.blocking_task_keys {
+                        let identifier = created_by_key.get(key).with_context(|| {
+                            format!("same-batch Blocking Task {key} was not created")
+                        })?;
+                        item.task.blocking_task_identifiers.push(identifier.clone());
+                    }
+                    let detail = spool_db::create_task(&pool, &item.task, &actor).await?;
+                    println!(
+                        "created Task: {}{}",
+                        detail.task.identifier,
+                        item.batch_key
+                            .as_ref()
+                            .map(|key| format!(" (batch_key: {key})"))
+                            .unwrap_or_default()
+                    );
+                    if let Some(key) = &item.batch_key {
+                        created_by_key.insert(key.clone(), detail.task.identifier);
+                    }
+                }
+            }
+        },
         TaskCommand::Show { identifier } => {
             let detail = spool_db::get_task_detail(&pool, &identifier)
                 .await?
@@ -305,4 +348,194 @@ pub(crate) async fn task(
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct BatchItem {
+    source: PathBuf,
+    task: spool_db::CreateTask,
+    batch_key: Option<String>,
+    blocking_task_keys: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ValidatedTaskBatch {
+    items: Vec<BatchItem>,
+    creation_order: Vec<usize>,
+}
+
+async fn validate_task_batch(
+    pool: &sqlx::SqlitePool,
+    queue: &str,
+    from_files: &[PathBuf],
+) -> Result<ValidatedTaskBatch> {
+    if from_files.is_empty() {
+        anyhow::bail!("task batch requires at least one --from-file");
+    }
+    spool_db::get_task_queue(pool, queue)
+        .await?
+        .with_context(|| format!("Task Queue {queue} not found"))?;
+
+    let mut items = Vec::new();
+    for file in from_files {
+        let parsed = bootstrap::parse_bootstrap_task_file_with_warnings(queue, file)?;
+        spool_db::validate_create_task(&parsed.task)?;
+        for warning in &parsed.warnings {
+            eprintln!("warning: {}: {warning}", file.display());
+        }
+        items.push(BatchItem {
+            source: file.clone(),
+            task: parsed.task,
+            batch_key: parsed.batch_key.map(|key| key.trim().to_string()),
+            blocking_task_keys: parsed
+                .blocking_task_keys
+                .into_iter()
+                .map(|key| key.trim().to_string())
+                .collect(),
+        });
+    }
+
+    let mut key_to_index = HashMap::new();
+    for (index, item) in items.iter().enumerate() {
+        if let Some(key) = &item.batch_key {
+            if key.is_empty() {
+                anyhow::bail!("{}: batch_key must not be blank", item.source.display());
+            }
+            if let Some(previous) = key_to_index.insert(key.clone(), index) {
+                anyhow::bail!(
+                    "duplicate batch_key {key} in {} and {}",
+                    items[previous].source.display(),
+                    item.source.display()
+                );
+            }
+        }
+    }
+
+    for item in &items {
+        for identifier in &item.task.blocking_task_identifiers {
+            let detail = spool_db::get_task_detail(pool, identifier)
+                .await?
+                .with_context(|| {
+                    format!(
+                        "{}: existing Blocking Task {identifier} not found",
+                        item.source.display()
+                    )
+                })?;
+            if detail.task.task_queue_key != queue {
+                anyhow::bail!(
+                    "{}: existing Blocking Task {identifier} must be in Task Queue {queue}",
+                    item.source.display()
+                );
+            }
+        }
+        for key in &item.blocking_task_keys {
+            if key.is_empty() {
+                anyhow::bail!(
+                    "{}: blocking_task_keys must not contain blanks",
+                    item.source.display()
+                );
+            }
+            if !key_to_index.contains_key(key) {
+                anyhow::bail!(
+                    "{}: same-batch Blocking Task key {key} not found",
+                    item.source.display()
+                );
+            }
+        }
+    }
+
+    let creation_order = topological_creation_order(&items, &key_to_index)?;
+    Ok(ValidatedTaskBatch {
+        items,
+        creation_order,
+    })
+}
+
+fn topological_creation_order(
+    items: &[BatchItem],
+    key_to_index: &HashMap<String, usize>,
+) -> Result<Vec<usize>> {
+    fn visit(
+        index: usize,
+        items: &[BatchItem],
+        key_to_index: &HashMap<String, usize>,
+        visiting: &mut HashSet<usize>,
+        visited: &mut HashSet<usize>,
+        order: &mut Vec<usize>,
+        stack: &mut Vec<String>,
+    ) -> Result<()> {
+        if visited.contains(&index) {
+            return Ok(());
+        }
+        if !visiting.insert(index) {
+            let current = display_batch_node(&items[index]);
+            stack.push(current.clone());
+            anyhow::bail!(
+                "cycle in same-batch Blocking Task graph: {}",
+                stack.join(" blocks ")
+            );
+        }
+        stack.push(display_batch_node(&items[index]));
+        for key in &items[index].blocking_task_keys {
+            let dependency_index = key_to_index[key];
+            visit(
+                dependency_index,
+                items,
+                key_to_index,
+                visiting,
+                visited,
+                order,
+                stack,
+            )?;
+        }
+        stack.pop();
+        visiting.remove(&index);
+        visited.insert(index);
+        order.push(index);
+        Ok(())
+    }
+
+    let mut order = Vec::new();
+    let mut visited = HashSet::new();
+    for index in 0..items.len() {
+        visit(
+            index,
+            items,
+            key_to_index,
+            &mut HashSet::new(),
+            &mut visited,
+            &mut order,
+            &mut Vec::new(),
+        )?;
+    }
+    Ok(order)
+}
+
+fn display_batch_node(item: &BatchItem) -> String {
+    item.batch_key
+        .clone()
+        .unwrap_or_else(|| item.source.display().to_string())
+}
+
+fn print_batch_plan(batch: &ValidatedTaskBatch) {
+    println!("dependency direction: blocked Task -> Blocking Task");
+    println!("creation order: blockers before blocked Tasks");
+    for index in &batch.creation_order {
+        let item = &batch.items[*index];
+        let key = item.batch_key.as_deref().unwrap_or("<none>");
+        let existing = if item.task.blocking_task_identifiers.is_empty() {
+            "<none>".to_string()
+        } else {
+            item.task.blocking_task_identifiers.join(", ")
+        };
+        let same_batch = if item.blocking_task_keys.is_empty() {
+            "<none>".to_string()
+        } else {
+            item.blocking_task_keys.join(", ")
+        };
+        println!(
+            "- {} (batch_key: {key}) blocks-on existing: {existing}; same-batch: {same_batch}",
+            item.task.title
+        );
+    }
 }

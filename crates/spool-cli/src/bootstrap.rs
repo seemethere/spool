@@ -5,6 +5,9 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 struct BootstrapFrontMatter {
+    /// Optional same-batch reference key for dependency-aware multi-file creation.
+    #[serde(default, alias = "local_id", alias = "batch_id")]
+    batch_key: Option<String>,
     title: String,
     priority: Option<String>,
     state: Option<String>,
@@ -15,6 +18,8 @@ struct BootstrapFrontMatter {
     conflict_hints: Option<Vec<String>>,
     #[serde(default, alias = "blocking_tasks", alias = "blockers")]
     blocking_task_identifiers: Option<Vec<String>>,
+    #[serde(default, alias = "blocking_batch_keys", alias = "blocking_local_ids")]
+    blocking_task_keys: Option<Vec<String>>,
     review_required: Option<bool>,
 }
 
@@ -24,7 +29,9 @@ pub fn parse_bootstrap_task_file(queue_key: &str, file: &Path) -> Result<spool_d
 }
 
 pub fn lint_bootstrap_task_file(file: &Path) -> Result<spool_db::CreateTask> {
-    let input = parse_bootstrap_task_file_with_warnings("__lint__", file)?.task;
+    let parsed = parse_bootstrap_task_file_with_warnings("__lint__", file)?;
+    reject_batch_only_fields(&parsed, "task lint --file")?;
+    let input = parsed.task;
     spool_db::validate_create_task(&input)?;
     Ok(input)
 }
@@ -50,6 +57,8 @@ pub fn parse_bootstrap_task(
 #[derive(Debug, PartialEq, Eq)]
 pub struct ParsedBootstrapTask {
     pub task: spool_db::CreateTask,
+    pub batch_key: Option<String>,
+    pub blocking_task_keys: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -104,8 +113,19 @@ pub fn parse_bootstrap_task_with_warnings(
             conflict_hints: front_matter.conflict_hints.unwrap_or_default(),
             blocking_task_identifiers: front_matter.blocking_task_identifiers.unwrap_or_default(),
         },
+        batch_key: front_matter.batch_key,
+        blocking_task_keys: front_matter.blocking_task_keys.unwrap_or_default(),
         warnings,
     })
+}
+
+pub fn reject_batch_only_fields(parsed: &ParsedBootstrapTask, command: &str) -> Result<()> {
+    if parsed.batch_key.is_some() || !parsed.blocking_task_keys.is_empty() {
+        anyhow::bail!(
+            "{command} does not accept batch-only fields batch_key or blocking_task_keys; use task batch lint/create --from-file for dependency-aware multi-file Task Creation"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]

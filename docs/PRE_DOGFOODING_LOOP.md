@@ -29,6 +29,7 @@ For each **Implementation Slice**:
 - Each slice proposal should include intent, likely files touched, and proposed **Slice Acceptance Checks**.
 - For **File-backed Task Creation**, prefer `spool task create --queue <key> --from-file task.md` and start from the canonical template at `.spool/bootstrap-tasks/TEMPLATE.md` so front matter uses valid values for `priority`, `state`, **Acceptance Criteria**, **Validation Items**, tags, review requirement, blockers, and advisory `conflict_hints`. The older `spool task create --bootstrap --queue <key> --file task.md` spelling remains a compatibility path for the temporary dogfooding escape hatch.
 - Before filing a batch of related dogfood **Tasks**, classify each relationship as either parallel-ready or sequenced. Parallel-ready Tasks may share `conflict_hints` when they touch overlapping files or documentation areas. Sequenced work must use `blocking_task_identifiers` or another explicit same-queue **Blocking Task** relationship so Spool excludes the dependent **Task** from normal agent pickup until the blocker is **Done**.
+- For dependency-aware multi-file **File-backed Task Creation**, use `spool task batch lint --queue <key> --from-file first.md --from-file second.md` before mutation. Give each same-batch Task a unique `batch_key`, and put that key in another file's `blocking_task_keys` when the latter Task is blocked by the former. Use `blocking_task_identifiers` only for already-existing same-queue **Blocking Tasks**. The batch output states dependency direction as `blocked Task -> Blocking Task`, validates missing references and cycles before creation, and creates blockers before blocked Tasks. To keep a related batch from being claimed while still drafting or reviewing it, set `state: backlog`; move Tasks to Ready after the batch graph is correct.
 - During dogfooding, Delegating Agents should put likely file paths or documentation areas in structured file-backed `conflict_hints` (aliases: `anticipated_touched_files`, `touched_files`) when creating parallel-ready Tasks. Recommended hotspot names include `crates/spool-db`, `crates/spool-cli`, `worker-loop`, `local-worktree-delivery`, `spool-pi-extension`, `telemetry`, `monitor`, `docs`, and `migrations`; prefer concrete repository paths when known. Operators should inspect `spool status`, `spool monitor --plain`, or `spool task show <task_identifier>` for advisory overlap before starting parallel batches. These hints are a coordination aid only; they do not block claims and are not a full dependency planner. Creation order, shared `conflict_hints`, parent/**Child Task** lineage, and **Workpad Note** or **Task Brief** text also do not block claims; use explicit **Blocking Tasks** for true ordering dependencies.
 - Operators can repair an existing **Blocking Task** relationship without raw SQL through `spool task blocker add <blocked_task_identifier> <blocking_task_identifier>`, `spool task blocker remove <blocked_task_identifier> <blocking_task_identifier>`, and `spool task blocker list <task_identifier>`. This tooling is for explicit same-queue **Blocking Tasks** only; it is not a generic dependency planner and does not treat **Child Tasks**, **Task Links**, creation order, advisory `conflict_hints`, or narrative notes as blockers.
 - Prefer small, reviewable changes over whole-milestone batches.
@@ -38,6 +39,57 @@ For each **Implementation Slice**:
 - If a slice discovers extra work that changes scope, architecture, workflow meaning, or acceptance checks, pause and ask whether to expand, split, or defer the work.
 - During an **Approved Slice Sequence**, stop for human input when scope, architecture, security, persistence semantics, task lifecycle, delivery behavior, launcher behavior, or unresolved check failures exceed the approved plan.
 - Small local fixes that preserve the approved scope may remain inside the current slice.
+
+### File-backed batch examples
+
+Sequenced batch: `api.md` can be created before `cli.md`, but `cli.md` will not be eligible for normal agent pickup until the `api` Task reaches **Done** because it records an explicit same-batch **Blocking Task** relationship.
+
+```yaml
+# api.md front matter excerpt
+batch_key: api
+title: Add API helper
+blocking_task_keys: []
+```
+
+```yaml
+# cli.md front matter excerpt
+batch_key: cli
+title: Wire CLI to API helper
+blocking_task_keys:
+  - api
+```
+
+```bash
+spool task batch lint --queue SPOOL --from-file cli.md --from-file api.md
+spool task batch create --queue SPOOL --from-file cli.md --from-file api.md
+```
+
+Parallel-ready batch: Tasks may share `conflict_hints` or use different hints, but no dependency is recorded unless `blocking_task_identifiers` or `blocking_task_keys` says so. Use `state: backlog` when you want to stage a reviewed batch before making it claimable.
+
+```yaml
+# docs.md front matter excerpt
+batch_key: docs
+title: Update documentation
+state: backlog
+conflict_hints:
+  - docs
+blocking_task_keys: []
+```
+
+```yaml
+# tests.md front matter excerpt
+batch_key: tests
+title: Add deterministic tests
+state: backlog
+conflict_hints:
+  - crates/spool-cli
+blocking_task_keys: []
+```
+
+```bash
+spool task batch lint --queue SPOOL --from-file docs.md --from-file tests.md
+spool task batch create --queue SPOOL --from-file docs.md --from-file tests.md
+```
 
 ## Subagent Review Loop
 

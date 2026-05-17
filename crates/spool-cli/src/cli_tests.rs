@@ -106,6 +106,39 @@ fn task_blocker_parses_repair_shapes_and_documents_scope() {
 }
 
 #[test]
+fn task_batch_parses_dependency_aware_shape() {
+    let cli = Cli::try_parse_from([
+        "spool",
+        "task",
+        "batch",
+        "create",
+        "--queue",
+        "TASK",
+        "--from-file",
+        "a.md",
+        "--from-file",
+        "b.md",
+    ])
+    .expect("parse batch create command");
+
+    match cli.command.expect("command") {
+        Command::Task {
+            command:
+                TaskCommand::Batch {
+                    command:
+                        TaskBatchCommand::Create {
+                            queue, from_files, ..
+                        },
+                },
+        } => {
+            assert_eq!(queue, "TASK");
+            assert_eq!(from_files.len(), 2);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
+#[test]
 fn delegate_parses_create_and_refine_shapes() {
     let create = Cli::try_parse_from([
         "spool",
@@ -2358,6 +2391,296 @@ async fn file_backed_create_accepts_from_file_without_bootstrap_flag() {
 }
 
 #[tokio::test]
+async fn single_file_create_rejects_batch_only_dependency_fields() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = SpoolPaths::resolve(temp.path(), PathOverrides::default());
+    init(&paths, false).await.expect("init");
+    let repo = temp.path().join("repo");
+    init_git_repo(&repo);
+    queue(
+        &paths,
+        false,
+        QueueCommand::Create {
+            key: "TASK".to_string(),
+            name: "Spool".to_string(),
+            managed_source_repository: repo,
+            main_branch: "main".to_string(),
+            worktree_root: temp.path().join("worktrees"),
+            branch_template: "spool/{task_identifier}".to_string(),
+            done_worktree_retention: false,
+            queue_concurrency_limit: None,
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect("create queue");
+
+    let task_file = temp.path().join("task.md");
+    fs::write(
+        &task_file,
+        "---\nbatch_key: blocked\ntitle: Batch-only fields\nblocking_task_keys:\n  - foundation\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\n---\nBrief\n",
+    )
+    .expect("write task file");
+
+    let error = task(
+        &paths,
+        false,
+        TaskCommand::Create {
+            bootstrap: false,
+            queue: "TASK".to_string(),
+            from_file: Some(task_file),
+            file: None,
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect_err("single-file create rejects batch fields");
+
+    assert!(error.to_string().contains("batch-only fields"));
+}
+
+#[tokio::test]
+async fn task_batch_lint_and_create_resolve_same_batch_blockers() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = SpoolPaths::resolve(temp.path(), PathOverrides::default());
+    init(&paths, false).await.expect("init");
+    let repo = temp.path().join("repo");
+    init_git_repo(&repo);
+    queue(
+        &paths,
+        false,
+        QueueCommand::Create {
+            key: "TASK".to_string(),
+            name: "Spool".to_string(),
+            managed_source_repository: repo,
+            main_branch: "main".to_string(),
+            worktree_root: temp.path().join("worktrees"),
+            branch_template: "spool/{task_identifier}".to_string(),
+            done_worktree_retention: false,
+            queue_concurrency_limit: None,
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect("create queue");
+
+    let first = temp.path().join("first.md");
+    fs::write(
+        &first,
+        "---\nbatch_key: foundation\ntitle: Foundation\nacceptance_criteria:\n  - Foundation works\nvalidation_items:\n  - Foundation tests pass\n---\nBrief\n",
+    )
+    .expect("write first");
+    let second = temp.path().join("second.md");
+    fs::write(
+        &second,
+        "---\nbatch_key: dependent\ntitle: Dependent\nblocking_task_keys:\n  - foundation\nacceptance_criteria:\n  - Dependent works\nvalidation_items:\n  - Dependent tests pass\n---\nBrief\n",
+    )
+    .expect("write second");
+
+    task(
+        &paths,
+        false,
+        TaskCommand::Batch {
+            command: TaskBatchCommand::Lint {
+                queue: "TASK".to_string(),
+                from_files: vec![second.clone(), first.clone()],
+            },
+        },
+    )
+    .await
+    .expect("lint batch");
+
+    task(
+        &paths,
+        false,
+        TaskCommand::Batch {
+            command: TaskBatchCommand::Create {
+                queue: "TASK".to_string(),
+                from_files: vec![second, first],
+                actor: "tester".to_string(),
+            },
+        },
+    )
+    .await
+    .expect("create batch");
+
+    let pool = spool_db::connect(&paths.db_path).await.expect("connect");
+    let first = spool_db::get_task_detail(&pool, "TASK-1")
+        .await
+        .expect("get first")
+        .expect("first task");
+    let second = spool_db::get_task_detail(&pool, "TASK-2")
+        .await
+        .expect("get second")
+        .expect("second task");
+    assert_eq!(first.task.title, "Foundation");
+    assert_eq!(second.task.title, "Dependent");
+    assert_eq!(second.blocking_tasks[0].identifier, "TASK-1");
+}
+
+#[tokio::test]
+async fn task_batch_create_rejects_missing_blocker_without_partial_create() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = SpoolPaths::resolve(temp.path(), PathOverrides::default());
+    init(&paths, false).await.expect("init");
+    let repo = temp.path().join("repo");
+    init_git_repo(&repo);
+    queue(
+        &paths,
+        false,
+        QueueCommand::Create {
+            key: "TASK".to_string(),
+            name: "Spool".to_string(),
+            managed_source_repository: repo,
+            main_branch: "main".to_string(),
+            worktree_root: temp.path().join("worktrees"),
+            branch_template: "spool/{task_identifier}".to_string(),
+            done_worktree_retention: false,
+            queue_concurrency_limit: None,
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect("create queue");
+
+    let task_file = temp.path().join("blocked.md");
+    fs::write(
+        &task_file,
+        "---\nbatch_key: blocked\ntitle: Blocked\nblocking_task_keys:\n  - missing\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\n---\nBrief\n",
+    )
+    .expect("write task");
+
+    let error = task(
+        &paths,
+        false,
+        TaskCommand::Batch {
+            command: TaskBatchCommand::Create {
+                queue: "TASK".to_string(),
+                from_files: vec![task_file],
+                actor: "tester".to_string(),
+            },
+        },
+    )
+    .await
+    .expect_err("missing blocker fails");
+
+    assert!(error
+        .to_string()
+        .contains("same-batch Blocking Task key missing not found"));
+    let pool = spool_db::connect(&paths.db_path).await.expect("connect");
+    assert!(spool_db::get_task_detail(&pool, "TASK-1")
+        .await
+        .expect("get task")
+        .is_none());
+}
+
+#[tokio::test]
+async fn task_batch_lint_rejects_missing_existing_blocker_identifier() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = SpoolPaths::resolve(temp.path(), PathOverrides::default());
+    init(&paths, false).await.expect("init");
+    let repo = temp.path().join("repo");
+    init_git_repo(&repo);
+    queue(
+        &paths,
+        false,
+        QueueCommand::Create {
+            key: "TASK".to_string(),
+            name: "Spool".to_string(),
+            managed_source_repository: repo,
+            main_branch: "main".to_string(),
+            worktree_root: temp.path().join("worktrees"),
+            branch_template: "spool/{task_identifier}".to_string(),
+            done_worktree_retention: false,
+            queue_concurrency_limit: None,
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect("create queue");
+
+    let task_file = temp.path().join("blocked.md");
+    fs::write(
+        &task_file,
+        "---\nbatch_key: blocked\ntitle: Blocked\nblocking_task_identifiers:\n  - TASK-404\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\n---\nBrief\n",
+    )
+    .expect("write task");
+
+    let error = task(
+        &paths,
+        false,
+        TaskCommand::Batch {
+            command: TaskBatchCommand::Lint {
+                queue: "TASK".to_string(),
+                from_files: vec![task_file],
+            },
+        },
+    )
+    .await
+    .expect_err("missing existing blocker fails");
+
+    assert!(error
+        .to_string()
+        .contains("existing Blocking Task TASK-404 not found"));
+}
+
+#[tokio::test]
+async fn task_batch_lint_rejects_cycles() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = SpoolPaths::resolve(temp.path(), PathOverrides::default());
+    init(&paths, false).await.expect("init");
+    let repo = temp.path().join("repo");
+    init_git_repo(&repo);
+    queue(
+        &paths,
+        false,
+        QueueCommand::Create {
+            key: "TASK".to_string(),
+            name: "Spool".to_string(),
+            managed_source_repository: repo,
+            main_branch: "main".to_string(),
+            worktree_root: temp.path().join("worktrees"),
+            branch_template: "spool/{task_identifier}".to_string(),
+            done_worktree_retention: false,
+            queue_concurrency_limit: None,
+            actor: "tester".to_string(),
+        },
+    )
+    .await
+    .expect("create queue");
+
+    let a = temp.path().join("a.md");
+    fs::write(
+        &a,
+        "---\nbatch_key: a\ntitle: A\nblocking_task_keys:\n  - b\nacceptance_criteria:\n  - A works\nvalidation_items:\n  - A tests pass\n---\nBrief\n",
+    )
+    .expect("write a");
+    let b = temp.path().join("b.md");
+    fs::write(
+        &b,
+        "---\nbatch_key: b\ntitle: B\nblocking_task_keys:\n  - a\nacceptance_criteria:\n  - B works\nvalidation_items:\n  - B tests pass\n---\nBrief\n",
+    )
+    .expect("write b");
+
+    let error = task(
+        &paths,
+        false,
+        TaskCommand::Batch {
+            command: TaskBatchCommand::Lint {
+                queue: "TASK".to_string(),
+                from_files: vec![a, b],
+            },
+        },
+    )
+    .await
+    .expect_err("cycle fails");
+
+    assert!(error
+        .to_string()
+        .contains("cycle in same-batch Blocking Task graph"));
+}
+
+#[tokio::test]
 async fn file_compatibility_flag_still_requires_bootstrap() {
     let temp = tempfile::tempdir().expect("tempdir");
     let paths = SpoolPaths::resolve(temp.path(), PathOverrides::default());
@@ -2458,6 +2781,22 @@ fn bootstrap_lint_fails_for_invalid_priority_and_missing_required_fields() {
         .to_string()
         .contains("failed to parse YAML front matter"));
     assert!(error.to_string().contains("missing field `title`"));
+}
+
+#[test]
+fn bootstrap_lint_rejects_batch_only_dependency_fields() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let task_file = temp.path().join("task.md");
+    fs::write(
+        &task_file,
+        "---\nbatch_key: blocked\ntitle: Batch-only fields\nblocking_task_keys:\n  - foundation\nacceptance_criteria:\n  - It works\nvalidation_items:\n  - Tests pass\n---\nBrief\n",
+    )
+    .expect("write task file");
+
+    let error = bootstrap::lint_bootstrap_task_file(&task_file)
+        .expect_err("single-file lint rejects batch-only fields");
+
+    assert!(error.to_string().contains("batch-only fields"));
 }
 
 #[tokio::test]

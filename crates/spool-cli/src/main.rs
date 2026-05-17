@@ -359,6 +359,11 @@ enum TaskCommand {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Dependency-aware multi-file Task Creation.
+    Batch {
+        #[command(subcommand)]
+        command: TaskBatchCommand,
+    },
     /// Show a Task by Task Identifier.
     Show { identifier: String },
     /// Retry recovery: move a resolved failed, canceled, or stuck Task back to Ready.
@@ -437,6 +442,31 @@ enum TaskCommand {
     },
     /// Show Audit Events for a Task.
     Audit { identifier: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskBatchCommand {
+    /// Validate a group of file-backed Task definitions as one dependency graph.
+    Lint {
+        /// Task Queue Key for the Task definitions.
+        #[arg(long)]
+        queue: String,
+        /// File-backed Task definitions to validate together.
+        #[arg(long = "from-file", value_name = "FILE", required = true)]
+        from_files: Vec<PathBuf>,
+    },
+    /// Create a validated group of file-backed Task definitions.
+    Create {
+        /// Task Queue Key for the new Tasks.
+        #[arg(long)]
+        queue: String,
+        /// File-backed Task definitions to create together.
+        #[arg(long = "from-file", value_name = "FILE", required = true)]
+        from_files: Vec<PathBuf>,
+        /// Operator actor display name for audit attribution.
+        #[arg(long, default_value = "local-operator")]
+        actor: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1159,6 +1189,11 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
         },
         Some(Command::Task { command }) => match command {
             TaskCommand::Create { queue, .. } => Some(queue.clone()),
+            TaskCommand::Batch { command } => match command {
+                TaskBatchCommand::Lint { queue, .. } | TaskBatchCommand::Create { queue, .. } => {
+                    Some(queue.clone())
+                }
+            },
             TaskCommand::Retry { identifier, .. }
             | TaskCommand::Transition { identifier, .. }
             | TaskCommand::ReviewDecision { identifier, .. }

@@ -9,6 +9,9 @@
 # For related Task batches, decide before filing whether each Task is parallel-ready or sequenced.
 # Use conflict_hints only for advisory overlap; they do not block claims.
 # Use blocking_task_identifiers for true same-queue ordering dependencies.
+# In batch creation, set batch_key on each new Task and use blocking_task_keys
+# to reference another Task in the same batch before it has an identifier.
+# Those batch-only fields are rejected by single-file create/lint.
 # Creation order, parent/child lineage, and Workpad Note text are not dependencies.
 title: Replace with a concise Task outcome
 priority: normal
