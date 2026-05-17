@@ -1924,6 +1924,73 @@ async fn blocking_tasks_are_recorded_and_reject_cross_queue_and_cycles() {
 }
 
 #[tokio::test]
+async fn operator_can_add_and_remove_blocking_task_relationships_with_audit_events() {
+    let (_temp, pool) = migrated_pool().await;
+    let actor = Actor::operator("tester");
+    create_task_queue(&pool, &sample_queue("TASK", "Spool"), &actor)
+        .await
+        .expect("create queue");
+    create_task_queue(&pool, &sample_queue("OTHER", "Other"), &actor)
+        .await
+        .expect("create other queue");
+    create_task(&pool, &sample_task("TASK", "Blocking"), &actor)
+        .await
+        .expect("create blocking task");
+    create_task(&pool, &sample_task("TASK", "Blocked"), &actor)
+        .await
+        .expect("create blocked task");
+    create_task(&pool, &sample_task("OTHER", "Other"), &actor)
+        .await
+        .expect("create other task");
+
+    let detail = add_blocking_task_relationship(&pool, "task-2", " task-1 ", &actor)
+        .await
+        .expect("add blocker");
+    assert_eq!(detail.task.identifier, "TASK-2");
+    assert_eq!(detail.blocking_tasks.len(), 1);
+    assert_eq!(detail.blocking_tasks[0].identifier, "TASK-1");
+    assert!(!detail.blocking_tasks[0].resolved);
+
+    let duplicate = add_blocking_task_relationship(&pool, "TASK-2", "TASK-1", &actor)
+        .await
+        .expect_err("duplicate blocker rejected");
+    assert!(duplicate.to_string().contains("already exists"));
+
+    let cross_queue = add_blocking_task_relationship(&pool, "TASK-2", "OTHER-1", &actor)
+        .await
+        .expect_err("cross queue blocker rejected");
+    assert!(cross_queue.to_string().contains("same Task Queue"));
+
+    let cycle = add_blocking_task_relationship(&pool, "TASK-1", "TASK-2", &actor)
+        .await
+        .expect_err("cycle rejected");
+    assert!(cycle.to_string().contains("cycle"));
+
+    let removed = remove_blocking_task_relationship(&pool, "TASK-2", "TASK-1", &actor)
+        .await
+        .expect("remove blocker");
+    assert!(removed.blocking_tasks.is_empty());
+
+    let missing = remove_blocking_task_relationship(&pool, "TASK-2", "TASK-1", &actor)
+        .await
+        .expect_err("missing relationship rejected");
+    assert!(missing.to_string().contains("not found"));
+
+    let events = list_task_audit_events(&pool, "TASK-2")
+        .await
+        .expect("audit events");
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "task.blocking_task.added"
+            && event.actor_display_name == "tester"
+            && event.payload_json.contains("TASK-1")));
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "task.blocking_task.removed"
+            && event.actor_kind == "operator"));
+}
+
+#[tokio::test]
 async fn claim_next_skips_blocked_tasks_until_blocking_tasks_are_done() {
     let (_temp, pool) = migrated_pool().await;
     let actor = Actor::operator("tester");

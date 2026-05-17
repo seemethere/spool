@@ -46,6 +46,66 @@ fn task_create_parses_preferred_from_file_shape() {
 }
 
 #[test]
+fn task_blocker_parses_repair_shapes_and_documents_scope() {
+    let add = Cli::try_parse_from(["spool", "task", "blocker", "add", "TASK-2", "TASK-1"])
+        .expect("parse blocker add");
+    match add.command.expect("command") {
+        Command::Task {
+            command:
+                TaskCommand::Blocker {
+                    command:
+                        BlockerCommand::Add {
+                            identifier,
+                            blocking_identifier,
+                            ..
+                        },
+                },
+        } => {
+            assert_eq!(identifier, "TASK-2");
+            assert_eq!(blocking_identifier, "TASK-1");
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let remove = Cli::try_parse_from([
+        "spool", "task", "blocker", "remove", "TASK-2", "TASK-1", "--actor", "ops",
+    ])
+    .expect("parse blocker remove");
+    match remove.command.expect("command") {
+        Command::Task {
+            command:
+                TaskCommand::Blocker {
+                    command: BlockerCommand::Remove { actor, .. },
+                },
+        } => assert_eq!(actor, "ops"),
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let list = Cli::try_parse_from(["spool", "task", "blocker", "list", "TASK-2"])
+        .expect("parse blocker list");
+    assert!(matches!(
+        list.command.expect("command"),
+        Command::Task {
+            command: TaskCommand::Blocker {
+                command: BlockerCommand::List { .. }
+            }
+        }
+    ));
+
+    let mut command = Cli::command();
+    let task = command.find_subcommand_mut("task").expect("task command");
+    let blocker = task
+        .find_subcommand_mut("blocker")
+        .expect("blocker command");
+    let help = blocker.render_long_help().to_string();
+    assert!(help.contains("explicit same-queue dependencies"));
+    assert!(help.contains("Parent/Child Task lineage"));
+    assert!(help.contains("Task Links"));
+    assert!(help.contains("creation order"));
+    assert!(help.contains("Task Conflict Hints"));
+}
+
+#[test]
 fn delegate_parses_create_and_refine_shapes() {
     let create = Cli::try_parse_from([
         "spool",
@@ -1718,6 +1778,116 @@ printf '%s\n' "$SPOOL_ACTOR_KIND:$SPOOL_ACTOR_ID" >> "{capture}"
     assert!(captured.contains("spool_refine_backlog_task"));
     assert!(captured.contains("Clarify acceptance criteria"));
     assert!(captured.contains("delegating_agent:delegator"));
+}
+
+#[tokio::test]
+async fn task_blocker_commands_mutate_relationships_and_surface_validation_errors() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let paths = SpoolPaths::resolve(temp.path().join("home"), PathOverrides::default());
+    init(&paths, false).await.expect("init");
+    let pool = open_pool(&paths, false).await.expect("pool");
+    let actor = spool_db::Actor::operator("tester");
+    spool_db::create_task_queue(
+        &pool,
+        &spool_db::CreateTaskQueue {
+            key: "TASK".to_string(),
+            name: "Spool".to_string(),
+            managed_source_repository: temp.path().join("repo").display().to_string(),
+            main_branch: "main".to_string(),
+            worktree_root: temp.path().join("worktrees").display().to_string(),
+            branch_template: "spool/{task_identifier}".to_string(),
+            done_worktree_retention: false,
+            queue_concurrency_limit: None,
+        },
+        &actor,
+    )
+    .await
+    .expect("queue");
+    for title in ["Blocking", "Blocked"] {
+        spool_db::create_task(
+            &pool,
+            &spool_db::CreateTask {
+                queue_key: "TASK".to_string(),
+                title: title.to_string(),
+                brief: "Brief".to_string(),
+                priority: "normal".to_string(),
+                state: "ready".to_string(),
+                review_required: false,
+                acceptance_criteria: vec!["accepted".to_string()],
+                validation_items: vec!["validated".to_string()],
+                tags: vec![],
+                conflict_hints: vec![],
+                blocking_task_identifiers: vec![],
+            },
+            &actor,
+        )
+        .await
+        .expect("task");
+    }
+
+    task(
+        &paths,
+        false,
+        TaskCommand::Blocker {
+            command: BlockerCommand::Add {
+                identifier: "TASK-2".to_string(),
+                blocking_identifier: "TASK-1".to_string(),
+                actor: "operator".to_string(),
+            },
+        },
+    )
+    .await
+    .expect("add blocker");
+    task(
+        &paths,
+        false,
+        TaskCommand::Blocker {
+            command: BlockerCommand::List {
+                identifier: "TASK-2".to_string(),
+            },
+        },
+    )
+    .await
+    .expect("list blockers");
+    let detail = spool_db::get_task_detail(&pool, "TASK-2")
+        .await
+        .expect("detail")
+        .expect("task");
+    assert_eq!(detail.blocking_tasks[0].identifier, "TASK-1");
+
+    let duplicate = task(
+        &paths,
+        false,
+        TaskCommand::Blocker {
+            command: BlockerCommand::Add {
+                identifier: "TASK-2".to_string(),
+                blocking_identifier: "TASK-1".to_string(),
+                actor: "operator".to_string(),
+            },
+        },
+    )
+    .await
+    .expect_err("duplicate rejected");
+    assert!(duplicate.to_string().contains("already exists"));
+
+    task(
+        &paths,
+        false,
+        TaskCommand::Blocker {
+            command: BlockerCommand::Remove {
+                identifier: "TASK-2".to_string(),
+                blocking_identifier: "TASK-1".to_string(),
+                actor: "operator".to_string(),
+            },
+        },
+    )
+    .await
+    .expect("remove blocker");
+    let detail = spool_db::get_task_detail(&pool, "TASK-2")
+        .await
+        .expect("detail")
+        .expect("task");
+    assert!(detail.blocking_tasks.is_empty());
 }
 
 #[tokio::test]

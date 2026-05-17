@@ -340,6 +340,134 @@ pub async fn create_child_task(
         .with_context(|| format!("created Child Task {child_identifier} was not found"))
 }
 
+pub async fn add_blocking_task_relationship(
+    pool: &SqlitePool,
+    blocked_task_identifier: &str,
+    blocking_task_identifier: &str,
+    actor: &Actor,
+) -> Result<TaskDetail> {
+    validate_actor(actor)?;
+    let blocked_task_identifier = blocked_task_identifier.trim().to_ascii_uppercase();
+    let blocking_task_identifier = blocking_task_identifier.trim().to_ascii_uppercase();
+    ensure_not_blank("Blocked Task Identifier", &blocked_task_identifier)?;
+    ensure_not_blank("Blocking Task Identifier", &blocking_task_identifier)?;
+
+    let mut tx = pool.begin().await.context("failed to begin transaction")?;
+    let blocked_task =
+        load_task_for_blocker_repair(&mut tx, &blocked_task_identifier, "Blocked").await?;
+    let blocking_task =
+        load_task_for_blocker_repair(&mut tx, &blocking_task_identifier, "Blocking").await?;
+
+    if blocked_task.task_queue_id != blocking_task.task_queue_id {
+        anyhow::bail!("Blocking Tasks must be in the same Task Queue as the Blocked Task");
+    }
+    if blocked_task.id == blocking_task.id {
+        anyhow::bail!("Task cannot block itself");
+    }
+
+    ensure_no_blocking_cycle(&mut tx, &blocking_task.id, &blocked_task.id).await?;
+
+    let existing: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_relationships WHERE source_task_id = ? AND target_task_id = ? AND relationship_kind = 'blocks'",
+    )
+    .bind(&blocking_task.id)
+    .bind(&blocked_task.id)
+    .fetch_one(&mut *tx)
+    .await
+    .context("failed to check existing Blocking Task relationship")?;
+    if existing > 0 {
+        anyhow::bail!(
+            "Blocking Task relationship already exists: {} blocks {}",
+            blocking_task.identifier,
+            blocked_task.identifier
+        );
+    }
+
+    sqlx::query("INSERT INTO task_relationships (id, source_task_id, target_task_id, relationship_kind) VALUES (?, ?, ?, 'blocks')")
+        .bind(Uuid::new_v4().to_string())
+        .bind(&blocking_task.id)
+        .bind(&blocked_task.id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to create Blocking Task relationship")?;
+
+    append_audit_event_in_tx(
+        &mut tx,
+        actor,
+        "task.blocking_task.added",
+        "task",
+        &blocked_task.id,
+        serde_json::json!({
+            "blocked_task_identifier": blocked_task.identifier,
+            "blocking_task_identifier": blocking_task.identifier,
+        }),
+    )
+    .await?;
+
+    tx.commit().await.context("failed to commit transaction")?;
+    get_task_detail(pool, &blocked_task_identifier)
+        .await?
+        .with_context(|| format!("Task {blocked_task_identifier} not found after blocker add"))
+}
+
+pub async fn remove_blocking_task_relationship(
+    pool: &SqlitePool,
+    blocked_task_identifier: &str,
+    blocking_task_identifier: &str,
+    actor: &Actor,
+) -> Result<TaskDetail> {
+    validate_actor(actor)?;
+    let blocked_task_identifier = blocked_task_identifier.trim().to_ascii_uppercase();
+    let blocking_task_identifier = blocking_task_identifier.trim().to_ascii_uppercase();
+    ensure_not_blank("Blocked Task Identifier", &blocked_task_identifier)?;
+    ensure_not_blank("Blocking Task Identifier", &blocking_task_identifier)?;
+
+    let mut tx = pool.begin().await.context("failed to begin transaction")?;
+    let blocked_task =
+        load_task_for_blocker_repair(&mut tx, &blocked_task_identifier, "Blocked").await?;
+    let blocking_task =
+        load_task_for_blocker_repair(&mut tx, &blocking_task_identifier, "Blocking").await?;
+
+    if blocked_task.task_queue_id != blocking_task.task_queue_id {
+        anyhow::bail!("Blocking Tasks must be in the same Task Queue as the Blocked Task");
+    }
+
+    let deleted = sqlx::query(
+        "DELETE FROM task_relationships WHERE source_task_id = ? AND target_task_id = ? AND relationship_kind = 'blocks'",
+    )
+    .bind(&blocking_task.id)
+    .bind(&blocked_task.id)
+    .execute(&mut *tx)
+    .await
+    .context("failed to remove Blocking Task relationship")?
+    .rows_affected();
+    if deleted == 0 {
+        anyhow::bail!(
+            "Blocking Task relationship not found: {} does not block {}",
+            blocking_task.identifier,
+            blocked_task.identifier
+        );
+    }
+
+    append_audit_event_in_tx(
+        &mut tx,
+        actor,
+        "task.blocking_task.removed",
+        "task",
+        &blocked_task.id,
+        serde_json::json!({
+            "blocked_task_identifier": blocked_task.identifier,
+            "blocking_task_identifier": blocking_task.identifier,
+        }),
+    )
+    .await?;
+
+    tx.commit().await.context("failed to commit transaction")?;
+    get_task_detail(pool, &blocked_task_identifier)
+        .await?
+        .with_context(|| format!("Task {blocked_task_identifier} not found after blocker remove"))
+}
+
 pub async fn refine_backlog_task(
     pool: &SqlitePool,
     identifier: &str,
@@ -998,6 +1126,28 @@ pub(crate) fn normalized_task_identifiers(identifiers: &[String]) -> Vec<String>
         }
     }
     normalized
+}
+
+async fn load_task_for_blocker_repair(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    identifier: &str,
+    role: &str,
+) -> Result<Task> {
+    sqlx::query_as::<_, Task>(
+        r#"
+        SELECT tasks.id, tasks.task_queue_id, task_queues.key AS task_queue_key, tasks.identifier,
+               tasks.sequence, tasks.title, tasks.brief, tasks.priority, tasks.state,
+               tasks.review_required, tasks.validated_base_commit, tasks.created_at, tasks.updated_at
+        FROM tasks
+        JOIN task_queues ON task_queues.id = tasks.task_queue_id
+        WHERE tasks.identifier = ?
+        "#,
+    )
+    .bind(identifier)
+    .fetch_optional(&mut **tx)
+    .await
+    .with_context(|| format!("failed to load {role} Task {identifier}"))?
+    .with_context(|| format!("{role} Task {identifier} not found"))
 }
 
 async fn create_blocking_relationships(

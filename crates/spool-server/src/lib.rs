@@ -71,6 +71,11 @@ pub struct UpsertTaskLinkRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct BlockingTaskRelationshipRequest {
+    pub actor: spool_db::Actor,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct UpdateRequirementStatusRequest {
     pub actor: spool_db::Actor,
     pub status: String,
@@ -141,6 +146,10 @@ pub fn router(app_version: impl Into<String>, pool: SqlitePool) -> Router {
             get(get_task_context_bundle),
         )
         .route("/tasks/{identifier}/child-tasks", post(create_child_task))
+        .route(
+            "/tasks/{identifier}/blocking-tasks/{blocking_identifier}",
+            post(add_blocking_task_relationship).delete(remove_blocking_task_relationship),
+        )
         .route(
             "/tasks/{identifier}/workpad",
             axum::routing::put(update_workpad),
@@ -274,6 +283,44 @@ async fn create_child_task(
         .await
         .map(|task| (StatusCode::CREATED, Json(task)))
         .map_err(task_mutation_error)
+}
+
+async fn add_blocking_task_relationship(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path((identifier, blocking_identifier)): Path<(String, String)>,
+    Json(request): Json<BlockingTaskRelationshipRequest>,
+) -> Result<Json<spool_db::TaskDetail>, (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    require_operator(&request.actor)?;
+    spool_db::add_blocking_task_relationship(
+        &state.pool,
+        &identifier,
+        &blocking_identifier,
+        &request.actor,
+    )
+    .await
+    .map(Json)
+    .map_err(task_mutation_error)
+}
+
+async fn remove_blocking_task_relationship(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Path((identifier, blocking_identifier)): Path<(String, String)>,
+    Json(request): Json<BlockingTaskRelationshipRequest>,
+) -> Result<Json<spool_db::TaskDetail>, (StatusCode, Json<ErrorResponse>)> {
+    require_auth(&state.pool, &headers).await?;
+    require_operator(&request.actor)?;
+    spool_db::remove_blocking_task_relationship(
+        &state.pool,
+        &identifier,
+        &blocking_identifier,
+        &request.actor,
+    )
+    .await
+    .map(Json)
+    .map_err(task_mutation_error)
 }
 
 async fn refine_backlog_task(
@@ -722,6 +769,11 @@ fn task_mutation_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>
         || message.contains("State Transition")
         || message.contains("Review Decision")
         || message.contains("already in requested")
+        || message.contains("already exists")
+        || message.contains("same Task Queue")
+        || message.contains("block itself")
+        || message.contains("would create a cycle")
+        || message.contains("does not block")
         || message.contains("pass gates")
         || message.contains("Ready Tasks require")
         || message.contains("must be positive")
@@ -892,6 +944,97 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn blocking_task_relationship_endpoints_add_remove_and_validate_actor() {
+        let (_temp, pool, token) = migrated_pool().await;
+        let app = router("test-version", pool.clone());
+
+        assert_eq!(
+            app.clone()
+                .oneshot(create_queue_request("TASK", "Spool", "operator", &token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(create_task_request("TASK", "Blocking", "operator", &token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(create_task_request("TASK", "Blocked", "operator", &token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+
+        let forbidden = app
+            .clone()
+            .oneshot(blocking_task_relationship_request(
+                "POST",
+                "TASK-2",
+                "TASK-1",
+                "worker_agent",
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let add = app
+            .clone()
+            .oneshot(blocking_task_relationship_request(
+                "POST", "TASK-2", "TASK-1", "operator", &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(add.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(add.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["blocking_tasks"][0]["identifier"], "TASK-1");
+
+        let duplicate = app
+            .clone()
+            .oneshot(blocking_task_relationship_request(
+                "POST", "TASK-2", "TASK-1", "operator", &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
+
+        let remove = app
+            .clone()
+            .oneshot(blocking_task_relationship_request(
+                "DELETE", "TASK-2", "TASK-1", "operator", &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(remove.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(remove.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["blocking_tasks"].as_array().unwrap().is_empty());
+
+        let events = spool_db::list_task_audit_events(&pool, "TASK-2")
+            .await
+            .expect("audit events");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "task.blocking_task.added"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "task.blocking_task.removed"));
     }
 
     #[tokio::test]
@@ -2089,6 +2232,32 @@ mod tests {
         Request::builder()
             .method("POST")
             .uri(format!("/tasks/{parent_identifier}/child-tasks"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(request.to_string()))
+            .unwrap()
+    }
+
+    fn blocking_task_relationship_request(
+        method: &str,
+        identifier: &str,
+        blocking_identifier: &str,
+        actor_kind: &str,
+        token: &str,
+    ) -> Request<Body> {
+        let request = serde_json::json!({
+            "actor": {
+                "kind": actor_kind,
+                "id": "tester",
+                "display_name": "tester"
+            }
+        });
+
+        Request::builder()
+            .method(method)
+            .uri(format!(
+                "/tasks/{identifier}/blocking-tasks/{blocking_identifier}"
+            ))
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {token}"))
             .body(Body::from(request.to_string()))

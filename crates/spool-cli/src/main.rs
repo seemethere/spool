@@ -427,8 +427,45 @@ enum TaskCommand {
         #[command(subcommand)]
         command: WorkpadCommand,
     },
+    /// Repair explicit Blocking Task relationships.
+    #[command(
+        after_long_help = "Blocking Tasks are explicit same-queue dependencies that must reach Done before a Blocked Task can complete. Parent/Child Task lineage, Task Links, creation order, Workpad Note text, and advisory Task Conflict Hints do not block claims or completion gates."
+    )]
+    Blocker {
+        #[command(subcommand)]
+        command: BlockerCommand,
+    },
     /// Show Audit Events for a Task.
     Audit { identifier: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum BlockerCommand {
+    /// Add a same-queue Blocking Task relationship.
+    Add {
+        /// Blocked Task Identifier.
+        identifier: String,
+        /// Blocking Task Identifier.
+        blocking_identifier: String,
+        /// Operator actor display name for audit attribution.
+        #[arg(long, default_value = "local-operator")]
+        actor: String,
+    },
+    /// Remove an explicit Blocking Task relationship.
+    Remove {
+        /// Blocked Task Identifier.
+        identifier: String,
+        /// Blocking Task Identifier.
+        blocking_identifier: String,
+        /// Operator actor display name for audit attribution.
+        #[arg(long, default_value = "local-operator")]
+        actor: String,
+    },
+    /// List Blocking Tasks for a Task.
+    List {
+        /// Task Identifier.
+        identifier: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1130,6 +1167,7 @@ fn command_queue_key(command: &Option<Command>) -> Option<String> {
                 requirement_command_queue_key(command)
             }
             TaskCommand::Workpad { command } => workpad_command_queue_key(command),
+            TaskCommand::Blocker { command } => blocker_command_queue_key(command),
             TaskCommand::Lint { .. } | TaskCommand::Show { .. } => None,
         },
         Some(
@@ -1182,6 +1220,14 @@ fn requirement_command_queue_key(command: &RequirementCommand) -> Option<String>
 fn workpad_command_queue_key(command: &WorkpadCommand) -> Option<String> {
     match command {
         WorkpadCommand::Set { identifier, .. } => queue_key_from_task_identifier(identifier),
+    }
+}
+
+fn blocker_command_queue_key(command: &BlockerCommand) -> Option<String> {
+    match command {
+        BlockerCommand::Add { identifier, .. }
+        | BlockerCommand::Remove { identifier, .. }
+        | BlockerCommand::List { identifier } => queue_key_from_task_identifier(identifier),
     }
 }
 

@@ -230,6 +230,65 @@ pub(crate) async fn task(
                 println!("updated Workpad Note for Task {}", detail.task.identifier);
             }
         },
+        TaskCommand::Blocker { command } => match command {
+            BlockerCommand::Add {
+                identifier,
+                blocking_identifier,
+                actor,
+            } => {
+                let detail = spool_db::add_blocking_task_relationship(
+                    &pool,
+                    &identifier,
+                    &blocking_identifier,
+                    &spool_db::Actor::operator(actor),
+                )
+                .await?;
+                println!(
+                    "added Blocking Task {} to Task {}",
+                    blocking_identifier.trim().to_ascii_uppercase(),
+                    detail.task.identifier
+                );
+            }
+            BlockerCommand::Remove {
+                identifier,
+                blocking_identifier,
+                actor,
+            } => {
+                let detail = spool_db::remove_blocking_task_relationship(
+                    &pool,
+                    &identifier,
+                    &blocking_identifier,
+                    &spool_db::Actor::operator(actor),
+                )
+                .await?;
+                println!(
+                    "removed Blocking Task {} from Task {}",
+                    blocking_identifier.trim().to_ascii_uppercase(),
+                    detail.task.identifier
+                );
+            }
+            BlockerCommand::List { identifier } => {
+                let detail = spool_db::get_task_detail(&pool, &identifier)
+                    .await?
+                    .with_context(|| format!("Task {identifier} not found"))?;
+                if detail.blocking_tasks.is_empty() {
+                    println!("Blocking Tasks: none");
+                } else {
+                    println!("Blocking Tasks:");
+                    for task in detail.blocking_tasks {
+                        let status = if task.resolved {
+                            "resolved"
+                        } else {
+                            "unresolved"
+                        };
+                        println!(
+                            "  {} [{}] {} ({status})",
+                            task.identifier, task.state, task.title
+                        );
+                    }
+                }
+            }
+        },
         TaskCommand::Audit { identifier } => {
             let events = spool_db::list_task_audit_events(&pool, &identifier).await?;
             for event in events {

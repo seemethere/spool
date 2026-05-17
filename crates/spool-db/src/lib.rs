@@ -55,8 +55,8 @@ pub use task_draft::{
     create_delegated_root_task, validate_delegation_task_draft, DelegationTaskDraft,
 };
 pub use tasks::{
-    create_child_task, create_task, get_task_context_bundle, get_task_detail, refine_backlog_task,
-    upsert_task_link,
+    add_blocking_task_relationship, create_child_task, create_task, get_task_context_bundle,
+    get_task_detail, refine_backlog_task, remove_blocking_task_relationship, upsert_task_link,
 };
 pub use transitions::transition_task_state;
 pub use validation::validate_create_task;
