@@ -12,6 +12,8 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT"
+description = "A local-first Task Backend for agent-driven development."
+readme = "README.md"
 repository = "https://github.com/seemethere/spool"
 
 [workspace.dependencies]
