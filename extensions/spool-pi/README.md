@@ -2,6 +2,38 @@
 
 Minimal pi extension tools for Worker Agents and human-present Delegation Sessions to update Spool through the HTTP Spool API.
 
+The package is intentionally kept private for current dogfooding. It is not
+published to npm yet; local checkouts load the TypeScript extension directly
+from this repository. The package metadata still includes version, license,
+repository, and description fields so public readers can understand the package
+boundary and so a future publication decision has an explicit starting point.
+
+## Fresh checkout setup and validation
+
+From a fresh repository checkout, install the extension dependencies before
+running tests or TypeScript validation:
+
+```sh
+cd extensions/spool-pi
+bun install
+bun test
+bun run build
+```
+
+`bun install` reads the committed `bun.lock` and installs the `typebox`,
+`typescript`, and Bun type dependencies used by the tests and `tsc --noEmit`
+build check. The build step type-checks the TypeScript extension; it does not
+emit JavaScript because pi loads the extension source declared in
+`package.json` under the `pi.extensions` field.
+
+## Package status
+
+- Package name: `@spool/pi-extension`
+- Runtime: TypeScript pi extension loaded by pi, not shared Rust code
+- Spool boundary: communicates with the Spool Service through the HTTP Spool API
+- Publication status: private/local-only for dogfooding; npm publication is a
+  future open-source packaging decision, not part of the current v1 path
+
 ## Configuration
 
 Set these environment variables before loading the extension:

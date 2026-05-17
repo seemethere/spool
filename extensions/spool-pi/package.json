@@ -1,7 +1,28 @@
 {
   "name": "@spool/pi-extension",
+  "version": "0.1.0",
   "private": true,
+  "description": "TypeScript pi extension exposing narrow Spool workflow tools over the HTTP Spool API.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/seemethere/tasker.git",
+    "directory": "extensions/spool-pi"
+  },
   "type": "module",
+  "files": [
+    "src",
+    "README.md",
+    "package.json",
+    "tsconfig.json"
+  ],
+  "keywords": [
+    "spool",
+    "pi",
+    "pi-extension",
+    "task-backend",
+    "agent-workflow"
+  ],
   "scripts": {
     "build": "tsc --noEmit",
     "test": "bun test"
@@ -14,6 +35,8 @@
     "typescript": "^5.9.3"
   },
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   }
 }
