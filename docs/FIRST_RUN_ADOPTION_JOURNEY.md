@@ -1,6 +1,6 @@
 # First-run Spool adoption journey for an existing local repository
 
-This planning note maps the first successful journey for a developer adopting Spool in an existing local repository. It distinguishes discovery findings from implementation work; it does not require product behavior changes by itself.
+This planning note maps the first successful journey for a developer adopting Spool in an existing local repository. It distinguishes discovery findings from implementation work; it does not require product behavior changes by itself. New adopters should start with the canonical quickstart in `docs/FIRST_RUN_QUICKSTART.md`; this document remains the discovery map behind it.
 
 ## Scope and assumptions
 
