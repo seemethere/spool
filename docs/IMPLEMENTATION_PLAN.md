@@ -25,21 +25,22 @@ Do not expand this slice into a web UI, Linear-compatible facade, GitHub-depende
 - Prefer deterministic tests with temp SQLite databases, temp Git repositories, fake **Agent Launchers**, and fake **Delivery Adapter** outcomes.
 - Keep real pi end-to-end tests opt-in.
 
-## Proposed workspace layout
+## Current workspace layout
 
 ```text
 Cargo.toml
 crates/
-  spool-core/        # domain enums, transition/gate logic, shared API structs
-  spool-db/          # SQLite migrations, repository methods, explicit transactions
-  spool-server/      # axum router and HTTP handlers
-  spool-worker/      # Worker Loop, Symphony Integration boundary, launchers, delivery adapters
-  spool-cli/         # clap binary: init, serve, queue, task, work, status, run
+  spool-cli/         # clap binary: init, serve, queue, task, work, status, run, review, delegate, merge, cleanup
+  spool-config/      # local configuration loading and active data-directory resolution
+  spool-db/          # SQLite migrations, repository methods, explicit transactions, transition/gate persistence
+  spool-runner/      # runner-side Worker Loop, Agent Launchers, Local Worktree Delivery, and integration helpers
+  spool-server/      # axum Spool Service router and HTTP handlers
+  spool-symphony/    # Symphony-specific integration boundary outside the core Spool API
 extensions/
-  spool-pi/          # TypeScript Spool Pi Extension
+  spool-pi/          # TypeScript Spool Pi Extension that talks to the HTTP Spool API
 ```
 
-The Rust crates can start small, but keep domain logic out of HTTP handlers so the CLI, service, and tests use the same behavior.
+Earlier planning sketches split shared domain logic into a separate core crate and used a worker crate name. The current implementation keeps that behavior in the existing crates above; do not reintroduce planned-only crate names unless a future ADR deliberately changes the crate boundary. Keep domain logic out of HTTP handlers so the CLI, service, runner, and tests use the same behavior.
 
 ## Persistence plan
 
@@ -271,10 +272,11 @@ After this milestone, create real file-backed **Tasks** for the remaining milest
 
 ## Full v1 follow-up after dogfooding
 
+Some dogfood-era items have landed as initial slices, including `spool delegate`, `spool review`, telemetry summaries, cleanup commands, and runner-side `spool merge integrate` for already-**Integrating** Tasks. Remaining full-v1 work should build on those commands rather than describing them as absent.
+
 - Complete Agent-Gated **Integrating** polish beyond the first dogfood slice, including automatic Worker Loop invocation after a Worker Agent transitions to **Integrating** while still holding the **Claim Lease**.
-- Add `spool delegate` and the Pi-backed **Delegation Session**.
-- Add `spool review` and **Review Session** support.
+- Polish the Pi-backed **Delegation Session** and **Review Session** flows based on dogfood use.
 - Expand the **Spool Pi Extension** with Task Links and richer transition/update tools.
-- Add metrics export derived from **Audit Events**, **Agent Runs**, **Launcher Session Data**, and **Integration Outcomes**.
+- Add richer metrics export derived from **Audit Events**, **Agent Runs**, **Launcher Session Data**, and **Integration Outcomes**.
 - Add transcript pruning/export commands.
 - Revisit worker concurrency beyond the single-worker dogfooding path.
