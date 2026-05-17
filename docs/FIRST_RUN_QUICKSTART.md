@@ -177,6 +177,8 @@ For current dogfooding, **Manual Dogfood Merge** may still be used as a temporar
 
 For ordinary local-first queues, the default review policy is **Agent-Gated Integration**. When all Acceptance Criteria are satisfied or waived and all Validation Items are passed or waived, the Worker Agent may request **Integrating** without a human review step unless the Task or queue requires **Human Review**.
 
+If the review terms are new, read `docs/REVIEW_AND_INTEGRATION_LANES.md` before adding process. Advisory **Subagent Review Loop** feedback, **Human Review** with a recorded **Review Decision**, local Git inspection, **Agent-Gated Integration**, **Integrating**, and temporary **Manual Dogfood Merge** are separate lanes. Human approval or advisory feedback does not waive failed **Acceptance Criteria** or **Validation Items**.
+
 Target delivery path:
 
 1. Task enters **Integrating**.
