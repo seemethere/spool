@@ -147,7 +147,18 @@ cargo run -p spool-cli -- --config .spool/config.toml --data-dir .spool/data mer
 
 Use `spool task retry` instead when failed or stuck agent work should return to **Ready**. Use **Rework** for work-change failures unless an operator has explicitly verified a forced delivery retry is safe.
 
-For the remaining fully manual path, from the **Managed Source Repository**, inspect the **Task Branch** against the **Main Branch** and prefer the planned v1 shape: a squash-style **Local Merge** that produces one **Final Commit** with a concise Conventional Commit subject and canonical Spool Git trailers:
+For the remaining fully manual path, from the **Managed Source Repository**, inspect the **Task Branch** against the **Main Branch** and prefer the planned v1 shape: a squash-style **Local Merge** that produces one **Final Commit** with a concise Conventional Commit subject, a compact `Task context` body, and canonical Spool Git trailers. The body should be deterministic, bounded, and derived from safe structured **Task** data: a short **Task Brief** excerpt plus a small number of **Acceptance Criteria** and **Validation Items**. Keep Spool records authoritative; the commit message is only a Git-history aid.
+
+Example body shape:
+
+```text
+Task context:
+- Brief: <bounded Task Brief excerpt>
+- Acceptance 1: <Acceptance Criterion>
+- Validation 1: <Validation Item>
+```
+
+Keep the trailer block last so `git interpret-trailers --parse` can read it:
 
 ```text
 Spool-Task: <task-identifier>
@@ -155,7 +166,7 @@ Spool-Queue: <task-queue-key>
 Spool-Agent-Run: <agent-run-id>
 ```
 
-`Spool-Agent-Run` may be omitted when the relevant **Agent Run** is unknown. Do not paste raw **Workpad Notes**, **Run Transcripts**, prompt text, secrets, or large free-form **Task** data into the **Final Commit** message.
+`Spool-Agent-Run` may be omitted when the relevant **Agent Run** is unknown. Do not paste raw **Workpad Notes**, **Run Transcripts**, raw **Launcher Session Data** payloads, prompt text, secrets, large free-form **Task** data, or unrelated **Task Queue** data into the **Final Commit** message.
 
 Example operator-side squash integration:
 
@@ -163,7 +174,12 @@ Example operator-side squash integration:
 git switch <main-branch>
 git merge --squash <task-branch>
 git commit -m "docs: update manual merge guidance" \
-  -m "Spool-Task: SPOOL-60
+  -m "Task context:
+- Brief: Clarify the temporary Manual Dogfood Merge path for local-first operator integrations.
+- Acceptance 1: Manual Dogfood Merge guidance describes the richer Final Commit message shape.
+- Validation 1: Documentation review confirms GitHub and pull requests are not required.
+
+Spool-Task: SPOOL-60
 Spool-Queue: SPOOL
 Spool-Agent-Run: 5d019294-398e-4f89-ad70-9b434b10dadb"
 ```

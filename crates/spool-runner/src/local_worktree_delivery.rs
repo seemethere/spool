@@ -303,12 +303,7 @@ impl<'a> LocalWorktreeIntegrationAdapter<'a> {
             });
         }
 
-        let message = commit_metadata::final_commit_message(
-            &self.task.task.identifier,
-            &self.task.task.title,
-            &self.task.task.task_queue_key,
-            self.agent_run_id,
-        );
+        let message = commit_metadata::final_commit_message_for_task(self.task, self.agent_run_id);
         let parsed_trailers = commit_metadata::parse_spool_commit_trailers(&message);
         debug_assert_eq!(
             parsed_trailers.task_identifier.as_deref(),
@@ -890,7 +885,10 @@ mod integration_tests {
         .expect("show final commit message");
         assert!(commit_message.contains("Spool-Task: TASK-1"));
         assert!(commit_message.contains("Spool-Queue: TASK"));
-        assert!(!commit_message.contains("Brief"));
+        assert!(commit_message.contains("Task context:\n"));
+        assert!(commit_message.contains("- Brief: Brief"));
+        assert!(commit_message.contains("- Acceptance 1: accepted"));
+        assert!(commit_message.contains("- Validation 1: validated"));
         assert!(!commit_message.contains("Workpad"));
         assert_eq!(
             commit_metadata::parse_spool_commit_trailers(&commit_message),
